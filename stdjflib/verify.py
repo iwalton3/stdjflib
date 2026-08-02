@@ -14,6 +14,7 @@ thing.
 from __future__ import annotations
 
 import concurrent.futures as futures
+import dataclasses
 import json
 import os
 
@@ -177,10 +178,9 @@ def _check_artwork(path: str, kind: str, cfg) -> list[str]:
     return []
 
 
-def check_artwork(cfg, libraries) -> tuple[int, list[str]]:
-    """Probe the artwork under each library folder. Returns (checked, problems)."""
+def check_artwork(cfg, libraries, report) -> int:
+    """Probe the artwork under each library folder. Returns how many it read."""
     targets: list[tuple[str, str]] = []
-    problems: list[str] = []
     for library in libraries:
         found = []
         for folder, _dirs, files in os.walk(cfg.path(library)):
@@ -191,40 +191,58 @@ def check_artwork(cfg, libraries) -> tuple[int, list[str]]:
         found.sort()
         if len(found) > ARTWORK_SAMPLE:
             step = len(found) // ARTWORK_SAMPLE
-            problems.append(
-                f"{library}: {len(found)} images, probing every {step}th "
-                f"({ARTWORK_SAMPLE} of them) — this is a note, not a fault")
+            report.notes.append(
+                f"{library}: {ARTWORK_SAMPLE} of {len(found)} images probed, "
+                f"1 in {step}")
             found = found[::step][:ARTWORK_SAMPLE]
         targets += found
 
     if not targets:
-        return 0, problems
+        return 0
     with futures.ThreadPoolExecutor(cfg.workers * 2) as pool:
         for issues in pool.map(lambda t: _check_artwork(t[0], t[1], cfg),
                                targets):
-            problems.extend(issues)
-    return len(targets), problems
+            report.problems.extend(issues)
+    return len(targets)
 
 
-def run(cfg) -> tuple[int, int, list[str]]:
-    """Verify the library at cfg.root. Returns (files, images, problems)."""
+@dataclasses.dataclass
+class Report:
+    """What a verify run found.
+
+    Notes are kept apart from problems because they decide the exit code, and
+    a sampled bulk library or a hardware-encoded build is not a fault — a
+    `build && verify` that failed on either would be a broken gate, not a
+    strict one.
+    """
+
+    files: int = 0
+    images: int = 0
+    problems: list = dataclasses.field(default_factory=list)
+    notes: list = dataclasses.field(default_factory=list)
+
+
+def run(cfg) -> Report:
+    """Verify the library at cfg.root."""
+    report = Report()
     manifest_path = cfg.path(config.MANIFEST)
     if not os.path.exists(manifest_path):
-        return 0, 0, [f"no manifest at {manifest_path} — "
-                      f"was this built by stdjflib?"]
+        report.problems.append(
+            f"no manifest at {manifest_path} — was this built by stdjflib?")
+        return report
     with open(manifest_path, encoding="utf-8") as fh:
         manifest = json.load(fh)
 
-    problems: list[str] = []
+    problems = report.problems
     if manifest.get("build_version") != config.BUILD_VERSION:
         problems.append(
             f"manifest was written by build version "
             f"{manifest.get('build_version')}, this is {config.BUILD_VERSION} "
             f"— rebuild before trusting the result")
     if manifest.get("hwaccel"):
-        problems.append(
-            f"built with {manifest['hwaccel']} hardware encoding, so it is not "
-            f"byte-identical to a software build (this is a note, not a fault)")
+        report.notes.append(
+            f"built with {manifest['hwaccel']} hardware encoding, so it is "
+            f"not byte-identical to a software build")
 
     by_key = {r.key: r for r in recipes.all_recipes()}
     paths = {i["key"]: i["path"] for i in manifest.get("items", [])}
@@ -249,8 +267,7 @@ def run(cfg) -> tuple[int, int, list[str]]:
     # this invocation's: `verify` is usually run without the --bulk the build
     # had, and a library that is on disk should be checked whether or not
     # today's arguments would have produced it.
-    images, image_problems = check_artwork(
-        cfg, manifest.get("libraries") or cfg.libraries())
-    problems += image_problems
-
-    return checked, images, problems
+    report.images = check_artwork(
+        cfg, manifest.get("libraries") or cfg.libraries(), report)
+    report.files = checked
+    return report

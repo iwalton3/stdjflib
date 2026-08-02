@@ -361,15 +361,17 @@ def cmd_artwork(args) -> int:
 
 def cmd_verify(args) -> int:
     cfg = _config_from(args)
-    checked, images, problems = verify.run(cfg)
-    print(f"re-probed {checked} generated files against their recipes "
-          f"and {images} images against the shape their type calls for")
-    if not problems:
+    report = verify.run(cfg)
+    print(f"re-probed {report.files} generated files against their recipes "
+          f"and {report.images} images against the shape their type calls for")
+    for note in report.notes:
+        print(f"  note: {note}")
+    if not report.problems:
         print("no problems")
         return 0
-    print(f"{len(problems)} problem(s):")
-    for p in problems:
-        print(f"  {p}")
+    print(f"{len(report.problems)} problem(s):")
+    for problem in report.problems:
+        print(f"  {problem}")
     return 1
 
 
