@@ -81,6 +81,14 @@ returns 0 on plenty of partial failures. The ProRes recipe originally declared
 `yuv420p` and ffmpeg silently produced `yuv422p10le`, which only `verify`
 caught.
 
+**Server state never lives beside the library.** `config.runtime_dir()` puts
+the server's data, the dotnet artifacts and the faketvsource log under the
+system temp directory, keyed by a SHA-256 of the library root so two libraries
+cannot share one database. The library root is routinely a network mount —
+sshfs here — and SQLite over sshfs corrupts while `dotnet build` over it is
+unusable. Only `.stdjflib/cache/`, the manifest and ATTRIBUTION stay next to
+the library, because those are worth keeping and a rebuild needs them.
+
 **The licence gate is two-sided.** `ALLOWED_LICENCES` is the catalog's claim;
 `archive_licence()` is what the item says right now. Both have to pass. Do not
 add an NC or ND licence to the allowed set — those cannot be redistributed

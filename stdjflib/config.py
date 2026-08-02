@@ -8,8 +8,10 @@ the network.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
 import shutil
+import tempfile
 
 # Tiers are cumulative: "standard" builds everything marked minimal + standard.
 # Order matters — `tier_includes` compares by index.
@@ -65,6 +67,34 @@ STATE_DIR = ".stdjflib"
 CACHE_DIR = os.path.join(STATE_DIR, "cache")
 MANIFEST = os.path.join(STATE_DIR, "manifest.json")
 ATTRIBUTION = os.path.join(STATE_DIR, "ATTRIBUTION.md")
+
+
+def runtime_dir(root: str, name: str) -> str:
+    """Local scratch for a server instance built from the library at `root`.
+
+    Server state, build artifacts and faketvsource logs do not belong beside
+    the library. The library is frequently on a network mount — sshfs, NFS —
+    and SQLite over one of those is slow at best and corrupt at worst, while
+    `dotnet build` over sshfs is unusable. None of it is worth keeping either:
+    the instances are disposable and `--fresh` exists to delete them.
+
+    The path is derived from `root` rather than fixed, so two libraries do not
+    end up sharing one server's database, and stable across runs, so a second
+    `serve` reuses the same state and the same build. It is under the system
+    temp directory, so a reboot takes it — which costs a Jellyfin rebuild and
+    a factory-fresh server, both of which are cheap and both of which are
+    states worth passing through anyway.
+
+    Pass `--state` / `--artifacts` to override.
+    """
+    root = os.path.abspath(root)
+    tag = hashlib.sha256(root.encode("utf-8", "surrogateescape")).hexdigest()[:8]
+    # /tmp is shared, so the per-user directory is made narrow before anything
+    # is written into it — otherwise another user could get there first.
+    base = os.path.join(tempfile.gettempdir(), f"stdjflib-{os.getuid()}")
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    return os.path.join(base, f"{os.path.basename(root) or 'library'}-{tag}", name)
+
 
 # Bumped when a change makes previously built output stale. `verify` warns when
 # the manifest on disk was written by a different build version.

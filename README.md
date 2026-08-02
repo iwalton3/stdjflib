@@ -195,6 +195,13 @@ as root has root-owned `obj/` directories, and an in-tree build then dies with
 directory gives a factory-fresh server, which is the state most worth being
 able to reach on demand.
 
+The server's state, its build and the container's config live under the system
+temp directory, not beside the library — the path is derived from the library
+root, printed on start, and overridable with `--state` and `--artifacts`. A
+library often sits on a network mount, and neither SQLite nor `dotnet build`
+tolerates one; the instances are disposable in any case, which is what
+`--fresh` is for. A reboot costs a rebuild and a factory-fresh server.
+
 The web UI is optional and off unless a built `jellyfin-web/dist` is found —
 a client talks to the API, and building the web UI needs an npm toolchain that
 has nothing to do with testing one.

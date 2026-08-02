@@ -10,6 +10,7 @@ import pathlib
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from unittest import mock
 
 from stdjflib import catalog, config, fetch, generate, nfo, recipes
 
@@ -194,6 +195,26 @@ class TestConfig(unittest.TestCase):
     def test_tier_inclusion(self):
         self.assertTrue(config.tier_includes("full", "minimal"))
         self.assertFalse(config.tier_includes("minimal", "full"))
+
+    def test_runtime_dir_is_off_the_library(self):
+        """Server state must not land on the library's mount."""
+        # gettempdir() caches, so the env var is not what to patch here.
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tempfile, "tempdir", tmp):
+                path = config.runtime_dir("/mnt/sshfs/qa", "jellyfin")
+        self.assertTrue(path.startswith(tmp + os.sep), path)
+        self.assertTrue(path.endswith(os.sep + "jellyfin"), path)
+
+    def test_runtime_dir_is_stable_and_per_library(self):
+        """Stable so a second serve reuses the build; distinct so two
+        libraries never share one server database."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(tempfile, "tempdir", tmp):
+                one = config.runtime_dir("/srv/qa", "jellyfin")
+                again = config.runtime_dir("/srv/qa/", "jellyfin")
+                other = config.runtime_dir("/srv/qa-two", "jellyfin")
+        self.assertEqual(one, again)
+        self.assertNotEqual(one, other)
 
     def test_temp_path_keeps_the_extension(self):
         """ffmpeg picks its muxer from the extension when -f is absent."""

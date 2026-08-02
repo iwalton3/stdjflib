@@ -115,8 +115,11 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--source", default=os.path.expanduser("~/Desktop/jellyfin"),
                    help="path to a Jellyfin source checkout")
     s.add_argument("--state", default=None,
-                   help="where the server keeps its data (default: "
-                        "<root>/.stdjflib/jellyfin). Delete it for a fresh server.")
+                   help="where the server keeps its data (default: a "
+                        "per-library directory under the system temp dir, "
+                        "printed on start — the library itself is often on a "
+                        "network mount, which SQLite does not survive). "
+                        "Delete it for a fresh server.")
     s.add_argument("--port", type=int, default=jfserver.DEFAULT_PORT)
     s.add_argument("--no-build", action="store_true",
                    help="use the existing build instead of compiling")
@@ -149,7 +152,8 @@ def _parser() -> argparse.ArgumentParser:
     ct.add_argument("--port", type=int, default=8096)
     ct.add_argument("--state", default=None,
                     help="host directory for the server's config and cache "
-                         "(default: <root>/.stdjflib/container)")
+                         "(default: a per-library directory under the system "
+                         "temp dir, printed on start)")
     ct.add_argument("--fresh", action="store_true",
                     help="delete the server state first")
     ct.add_argument("--no-pull", action="store_true",
@@ -387,7 +391,7 @@ def _provision_kwargs(args) -> dict:
 
 def cmd_provision(args) -> int:
     root = os.path.abspath(args.root)
-    state = os.path.join(root, config.STATE_DIR, "faketv")
+    state = config.runtime_dir(root, "faketv")
     fake = None
     try:
         # A server elsewhere cannot reach 127.0.0.1 here, so make the operator
@@ -417,8 +421,7 @@ def cmd_provision(args) -> int:
 
 def cmd_serve(args) -> int:
     root = os.path.abspath(args.root)
-    state = os.path.abspath(
-        args.state or os.path.join(root, config.STATE_DIR, "jellyfin"))
+    state = os.path.abspath(args.state or config.runtime_dir(root, "jellyfin"))
     artifacts = os.path.abspath(args.artifacts or state + "-build")
 
     if args.fresh and os.path.isdir(state):
@@ -531,8 +534,7 @@ def cmd_accounts(_args) -> int:
 
 def cmd_container(args) -> int:
     root = os.path.abspath(args.root)
-    state = os.path.abspath(
-        args.state or os.path.join(root, config.STATE_DIR, "container"))
+    state = os.path.abspath(args.state or config.runtime_dir(root, "container"))
     try:
         runtime = container.pick_runtime(args.runtime)
     except container.ContainerError as exc:
