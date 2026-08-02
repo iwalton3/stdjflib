@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (55 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (102 tests,
 well under a second, no ffmpeg). To try it for real, build the minimal tier —
 it downloads nothing and takes about 80 seconds on a 16-core machine:
 
@@ -45,6 +45,7 @@ filter or muxer problem.
 | `stdjflib/jfapi.py` | the Jellyfin API client |
 | `stdjflib/jfserver.py` | building and running a server from source |
 | `stdjflib/provision.py` | library options, the test accounts, setup |
+| `stdjflib/container.py` | running the official image under podman/docker |
 | `stdjflib/cli.py` | argument parsing and the subcommands |
 
 Adding a test case usually means adding one `Recipe` to `recipes.py` and
@@ -106,8 +107,9 @@ plus resume plus `attempts=5` is the whole mechanism — keep all three. Do not
 
 ## Jellyfin server gotchas
 
-All of these were read out of `../jellyfin` and then confirmed against a
-running 12.0 server. Each one fails *silently* — the call succeeds and the
+All of these were read out of `../jellyfin` and then confirmed against both a
+source build (12.0) and the official container image (10.11). Each fails
+*silently* — the call succeeds and the
 setting simply has no effect.
 
 **The auth token goes inside the `Authorization` header.** `X-Emby-Token` is
@@ -144,6 +146,15 @@ the default user record; without it the POST has nothing to rename.
 a checkout that was ever built as root has root-owned ones (42 in the tree this
 was written against). It fails with "Permission denied" and a temp-file path
 that explains nothing. `--artifacts-path` keeps every output elsewhere.
+
+**The container's media path is not the host's.** Inside the container the
+library lives at `/media`, and `provision(media_root=...)` must be told so.
+Sending the host path creates the libraries without error and scans them to
+zero items, which reads as a Jellyfin fault. `Container.check_library_visible`
+runs before provisioning for the same reason — a mount the container cannot
+traverse should fail loudly and early, not look like an empty library. FUSE
+mounts are the usual culprit; rootless podman handles sshfs here, rootful
+Docker may not see it at all if the mount postdates the daemon.
 
 **`wait_until_up` must require a real payload.** A socket that accepts and
 closes — a previous server still shutting down on the same port — reads as an

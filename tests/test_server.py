@@ -192,3 +192,74 @@ class TestServerRunner(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestContainer(unittest.TestCase):
+    """Argument construction for the podman/docker path. No runtime needed."""
+
+    def _box(self, **kw):
+        from stdjflib import container
+
+        return container.Container("/lib", "/state", runtime="podman", **kw)
+
+    def test_media_is_mounted_read_only(self):
+        argv = self._box().argv()
+        media = [a for a in argv if a.startswith("/lib:")]
+        self.assertEqual(len(media), 1)
+        self.assertIn("ro", media[0].split(":")[-1])
+
+    def test_config_and_cache_are_writable(self):
+        argv = self._box().argv()
+        for host, dest in (("/state/config", "/config"),
+                           ("/state/cache", "/cache")):
+            match = [a for a in argv if a.startswith(host + ":")]
+            with self.subTest(dest):
+                self.assertEqual(len(match), 1)
+                self.assertIn(dest, match[0])
+                self.assertNotIn("ro", match[0].split(":")[-1].split(","))
+
+    def test_media_root_is_the_container_path_not_ours(self):
+        """Provisioning must send the server its own path; ours scans to zero."""
+        from stdjflib import container
+
+        box = self._box()
+        self.assertEqual(box.media_root, container.MEDIA_MOUNT)
+        self.assertNotEqual(box.media_root, box.library)
+
+    def test_port_mapping_is_published(self):
+        argv = self._box(port=9000).argv()
+        self.assertIn("9000:8096", argv)
+
+    def test_extra_args_land_before_the_image(self):
+        """Anything after the image name is passed to the entrypoint instead."""
+        from stdjflib import container
+
+        argv = self._box(extra_args=("--memory", "2g")).argv()
+        self.assertLess(argv.index("--memory"), argv.index(container.DEFAULT_IMAGE))
+        self.assertEqual(argv[-1], container.DEFAULT_IMAGE)
+
+    def test_runs_detached(self):
+        self.assertIn("-d", self._box().argv())
+
+    def test_runtime_selection(self):
+        from stdjflib import container
+
+        with self.assertRaises(container.ContainerError):
+            container.pick_runtime("definitely-not-installed")
+
+    def test_selinux_suffix_only_when_enforcing(self):
+        """`:z` is harmless without SELinux but its absence is fatal with it."""
+        from stdjflib import container
+
+        original = container.selinux_enabled
+        try:
+            container.selinux_enabled = lambda: False
+            self.assertEqual(container._mount("/a", "/b"), "/a:/b")
+            self.assertEqual(container._mount("/a", "/b", read_only=True),
+                             "/a:/b:ro")
+            container.selinux_enabled = lambda: True
+            self.assertEqual(container._mount("/a", "/b"), "/a:/b:z")
+            self.assertEqual(container._mount("/a", "/b", read_only=True),
+                             "/a:/b:ro,z")
+        finally:
+            container.selinux_enabled = original

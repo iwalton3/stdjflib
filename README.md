@@ -176,6 +176,7 @@ version would cost.
 ```sh
 ./stdjflib.py serve /srv/qa-library          # build Jellyfin, run it, set it up
 ./stdjflib.py serve /srv/qa-library --fresh  # ...from a factory-fresh server
+./stdjflib.py container /srv/qa-library      # or run the official image instead
 ./stdjflib.py provision /srv/qa-library --server http://host:8096
 ./stdjflib.py accounts                       # what each test account is for
 ```
@@ -197,6 +198,41 @@ able to reach on demand.
 The web UI is optional and off unless a built `jellyfin-web/dist` is found —
 a client talks to the API, and building the web UI needs an npm toolchain that
 has nothing to do with testing one.
+
+### In a container instead
+
+```sh
+./stdjflib.py container /srv/qa-library                     # podman or docker
+./stdjflib.py container /srv/qa-library --runtime docker
+./stdjflib.py container /srv/qa-library --keep-running      # set up, then return
+./stdjflib.py container-stop
+```
+
+Runs the official `jellyfin/jellyfin` image with the library bind-mounted
+read-only at `/media`, then provisions it exactly as `serve` does. Podman and
+Docker take the same arguments for all of this, so `--runtime` only chooses the
+binary; Docker generally needs root on a stock install, podman does not.
+
+Between this and `serve` you get both major versions for free — the image is
+Jellyfin 10.11 stable, a source build of `master` is 12.0, and the provisioning
+works unchanged against both.
+
+**The server's path is not your path.** Inside the container the library is at
+`/media`, and that is what gets sent when the libraries are created. Getting
+this wrong is quiet: the libraries are created without complaint and then scan
+to nothing. `provision --media-root` exposes the same knob for a server running
+somewhere else entirely.
+
+**Bind mounts are checked before anything is provisioned.** The container is
+asked to list `/media` first, and an empty or unreadable mount stops the run
+with an explanation. This matters most for FUSE filesystems — sshfs, rclone,
+network mounts — where whether it works depends on the runtime, the rootless
+mapping, and whether the mount was made with `allow_other`. Rootless podman
+reads an sshfs mount here without complaint; rootful Docker may not see it at
+all if the mount was made after the daemon started, because it never enters the
+daemon's mount namespace. If the check fails, build a library on local disk
+(`stdjflib build /var/tmp/qa --tier minimal --bulk 30` takes about 40 seconds)
+and point at that instead.
 
 ### The test accounts
 
@@ -296,7 +332,7 @@ be checked mechanically. A QA library is not worth a copyright argument.
 python3 -m unittest discover -s tests -t .
 ```
 
-55 tests, well under a second, no ffmpeg required. They cover the matrix's
+102 tests, well under a second, no ffmpeg or server required. They cover the matrix's
 internal consistency, the licence rules, NFO output and determinism, ffmpeg
 argument assembly, and the VobSub encoder — including a round-trip of the RLE
 against an independent reference decoder written in the test, which is the only

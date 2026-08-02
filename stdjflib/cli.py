@@ -8,8 +8,8 @@ import shutil
 import sys
 import time
 
-from . import (build, catalog, config, fetch, ff, jfserver, provision,
-               recipes, verify)
+from . import (build, catalog, config, container, fetch, ff, jfserver,
+               provision, recipes, verify)
 from .jfapi import Jellyfin
 
 DEFAULT_ROOT = os.environ.get("STDJFLIB_ROOT", "")
@@ -120,6 +120,32 @@ def _parser() -> argparse.ArgumentParser:
     pr.add_argument("--media-root", default=None,
                     help="path the *server* sees the library at, when that "
                          "differs from this machine's (containers, remote mounts)")
+
+    ct = server_args(sub.add_parser(
+        "container", help="run Jellyfin in a container, then set it up"))
+    ct.add_argument("--runtime", choices=container.RUNTIMES, default=None,
+                    help="podman or docker (default: whichever is on PATH)")
+    ct.add_argument("--image", default=container.DEFAULT_IMAGE)
+    ct.add_argument("--name", default=container.DEFAULT_NAME)
+    ct.add_argument("--port", type=int, default=8096)
+    ct.add_argument("--state", default=None,
+                    help="host directory for the server's config and cache "
+                         "(default: <root>/.stdjflib/container)")
+    ct.add_argument("--fresh", action="store_true",
+                    help="delete the server state first")
+    ct.add_argument("--no-pull", action="store_true",
+                    help="use the local image without checking for a newer one")
+    ct.add_argument("--keep-running", action="store_true",
+                    help="leave the container up and return, instead of "
+                         "following it until Ctrl-C")
+    ct.add_argument("--arg", action="append", default=[], dest="extra_args",
+                    metavar="ARG",
+                    help="extra argument for the container runtime; repeatable")
+
+    st = sub.add_parser("container-stop",
+                        help="stop and remove the QA container")
+    st.add_argument("--runtime", choices=container.RUNTIMES, default=None)
+    st.add_argument("--name", default=container.DEFAULT_NAME)
 
     sub.add_parser("accounts",
                    help="list the test accounts and what each one is for")
@@ -290,7 +316,8 @@ def main(argv=None) -> int:
         "build": cmd_build, "verify": cmd_verify, "list": cmd_list,
         "doctor": cmd_doctor, "clean": cmd_clean,
         "serve": cmd_serve, "provision": cmd_provision,
-        "accounts": cmd_accounts,
+        "accounts": cmd_accounts, "container": cmd_container,
+        "container-stop": cmd_container_stop,
     }[args.command]
     try:
         return handler(args)
@@ -420,4 +447,101 @@ def cmd_accounts(_args) -> int:
             if line:
                 print(f"    {line}.")
         print()
+    return 0
+
+
+def cmd_container(args) -> int:
+    root = os.path.abspath(args.root)
+    state = os.path.abspath(
+        args.state or os.path.join(root, config.STATE_DIR, "container"))
+    try:
+        runtime = container.pick_runtime(args.runtime)
+    except container.ContainerError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    if args.fresh and os.path.isdir(state):
+        print(f"Removing {state}")
+        shutil.rmtree(state)
+
+    box = container.Container(root, state, runtime=runtime, image=args.image,
+                              name=args.name, port=args.port,
+                              extra_args=tuple(args.extra_args),
+                              verbose=args.verbose)
+    # Flushed, because stderr is unbuffered and stdout is not when piped —
+    # without this a runtime error appears above the header that explains it.
+    print(f"Jellyfin in {runtime}", flush=True)
+    print(f"  image {args.image}", flush=True)
+    print(f"  state {state}", flush=True)
+    print(f"  media {root} -> {box.media_root} (read-only)", flush=True)
+
+    try:
+        if not args.no_pull:
+            print("  pulling", flush=True)
+            box.pull()
+
+        # Prove the mount before provisioning: a library the container cannot
+        # read is created without complaint and then scans to nothing, which
+        # looks like a Jellyfin fault rather than a mount one.
+        ok, detail = box.check_library_visible()
+        if not ok:
+            print(f"\nThe container cannot read the library.\n  {detail}",
+                  file=sys.stderr)
+            return 1
+        print(f"  visible: {detail}", flush=True)
+
+        print("Starting the container", flush=True)
+        box.start()
+    except container.ContainerError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 1
+
+    try:
+        jf = Jellyfin(box.url)
+        try:
+            # The server must be told its own path to the media, not ours.
+            provision.provision(jf, root, media_root=box.media_root,
+                                still_alive=box.alive,
+                                **_provision_kwargs(args))
+        except Exception:
+            if not box.alive():
+                print("\nThe container exited. Last of its log:\n",
+                      file=sys.stderr)
+                print(box.logs(), file=sys.stderr)
+            raise
+        _print_connection(box.url, args.password)
+
+        if args.keep_running:
+            print(f"\nContainer {box.name} left running.")
+            print(f"  logs  {runtime} logs -f {box.name}")
+            print(f"  stop  ./stdjflib.py container-stop --runtime {runtime}")
+            return 0
+        print(f"\nFollowing {box.name}. Ctrl-C to stop and remove it.")
+        while box.alive():
+            time.sleep(2)
+        print("\nThe container exited. Last of its log:\n")
+        print(box.logs())
+        return 1
+    except KeyboardInterrupt:
+        print("\nStopping.")
+        return 0
+    finally:
+        if not args.keep_running:
+            box.stop()
+            box.remove()
+
+
+def cmd_container_stop(args) -> int:
+    try:
+        runtime = container.pick_runtime(args.runtime)
+    except container.ContainerError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    box = container.Container(".", ".", runtime=runtime, name=args.name)
+    if not box.exists():
+        print(f"No container named {args.name}")
+        return 0
+    box.stop()
+    box.remove()
+    print(f"Stopped and removed {args.name}")
     return 0
