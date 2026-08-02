@@ -1,0 +1,181 @@
+# stdjflib
+
+Builds a standard Jellyfin QA library — generated media plus licence-checked
+downloads — so a Jellyfin client can be tested against a stable, reproducible
+library rather than someone's personal collection.
+
+Read `README.md` first; it covers what this is and how to run it. This file is
+about working on the code.
+
+## Ground rules
+
+Python standard library plus `ffmpeg`. Nothing else. This is a test tool; a
+dependency that can rugpull is worse than a few hundred lines of code. Two
+things that look like they need a package do not: image work goes through
+ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
+(`vobsub.py`).
+
+Run the tests with `python3 -m unittest discover -s tests -t .` (55 tests,
+well under a second, no ffmpeg). To try it for real, build the minimal tier —
+it downloads nothing and takes about 80 seconds on a 16-core machine:
+
+```sh
+./stdjflib.py build /tmp/qa --tier minimal && ./stdjflib.py verify /tmp/qa --tier minimal
+```
+
+`-v` prints every ffmpeg command line, which is the fastest way to debug a
+filter or muxer problem.
+
+## Layout
+
+| File | What lives there |
+| --- | --- |
+| `stdjflib/config.py` | tiers, `BuildConfig`, library folders, font selection |
+| `stdjflib/recipes.py` | the declarative codec/container matrix — **add coverage here** |
+| `stdjflib/generate.py` | Recipe → ffmpeg invocation → file |
+| `stdjflib/vobsub.py` | the hand-written VobSub (.idx/.sub) encoder |
+| `stdjflib/subs.py` | subtitle sample text and the SRT/ASS/VTT writers |
+| `stdjflib/catalog.py` | what gets downloaded, and under what licence |
+| `stdjflib/fetch.py` | resumable downloads, the licence gate, unzip |
+| `stdjflib/libraries.py` | per-library-type builders and the path conventions |
+| `stdjflib/nfo.py` | Kodi-dialect NFO writers |
+| `stdjflib/artwork.py` | posters, backdrops, logos, drawn by ffmpeg |
+| `stdjflib/build.py` | orchestration, manifest, ATTRIBUTION, library README |
+| `stdjflib/verify.py` | re-probe everything and compare against the recipes |
+| `stdjflib/cli.py` | argument parsing and the subcommands |
+
+Adding a test case usually means adding one `Recipe` to `recipes.py` and
+nothing else: `generate.py` reads the dataclass, `libraries.py` decides the
+filename, `nfo.py` writes the metadata, `verify.py` checks the result.
+
+Jellyfin's own resolvers are at `../jellyfin/` — `Emby.Naming/` for the path
+conventions (`Video/VideoResolver.cs`, `TV/EpisodeResolver.cs`) and
+`MediaBrowser.XbmcMetadata/` for the NFO dialect. When in doubt about what
+Jellyfin accepts, read it there rather than guessing.
+
+## Invariants worth not breaking
+
+**Every NFO sets `<lockdata>true`.** Without it Jellyfin queries TMDB and
+friends on scan, and what the client sees then depends on the network, on the
+day, and on whatever a stranger last edited. That single field is what makes
+this a test fixture instead of a pile of files.
+
+**Nothing may depend on wall-clock time or `hash()`.** Dates derive from
+`config.EPOCH`; anything that needs a stable pseudo-random value derives it
+from the item's key with SHA-256. Python salts string hashing per process, so
+`hash("x")` differs between runs of the same program — it looks deterministic
+in a single session and is not.
+
+**The codec-matrix files are never hardware-encoded.** `--hwaccel` is opt-in
+per file (`generate.build(..., allow_hw=True)`) and `libraries.py` asks for it
+only on the large ones. Which encoder produced a matrix file is part of what
+that file tests, and NVENC output is not byte-identical to libx264.
+
+**`verify` must actually re-probe.** A build exiting 0 is not evidence: ffmpeg
+returns 0 on plenty of partial failures. The ProRes recipe originally declared
+`yuv420p` and ffmpeg silently produced `yuv422p10le`, which only `verify`
+caught.
+
+**The licence gate is two-sided.** `ALLOWED_LICENCES` is the catalog's claim;
+`archive_licence()` is what the item says right now. Both have to pass. Do not
+add an NC or ND licence to the allowed set — those cannot be redistributed
+freely, which is the whole question being answered.
+
+**Bulk items share media and never share artwork.** That split is the whole
+design of the `build_bulk_*` functions. Media is hard-linked from a twelve-clip
+pool in the cache, because a bulk item exists to be listed rather than played
+and a thousand encodes would buy nothing. Artwork is per item, because a
+thousand identical posters would never evict anything from a thumbnail cache —
+which is one of the main things a library that size is for. Do not "optimise"
+by sharing posters, and do not "fix" the shared media by giving every item its
+own encode.
+
+**Logo artwork is deliberately hostile.** Transparent PNGs, some white ink and
+some black, so no single background colour renders them all. A client that
+composites logos badly is supposed to fail here. Do not make them all opaque.
+
+**A truncated download raises no exception.** The server ends the body early
+and `read()` just returns empty, so without the explicit
+`got != Content-Length` check the build happily muxes a 7% file. This is not
+hypothetical: the first real run lost Sintel at exactly that point. The check
+plus resume plus `attempts=5` is the whole mechanism — keep all three. Do not
+"simplify" it by trusting `urlopen` to raise.
+
+## ffmpeg gotchas, all learned the hard way
+
+**The muxer for `.mkv` is `matroska`.** `-f mkv` fails with "Requested output
+format 'mkv' is not known" — which says nothing about muxers and sends you
+looking at the inputs. `MUXERS` in `generate.py` maps every extension whose
+muxer name differs.
+
+**Temp files must keep the real extension.** ffmpeg picks its muxer from the
+extension when `-f` is absent, so writing to `album.flac.part` fails with
+"Error opening output files: Invalid argument". `ff.temp_path` returns a hidden
+sibling with the extension intact. This cost two libraries silently building
+nothing.
+
+**Text goes through files, never the filter string.** Labels are written to a
+file and read with `textfile=`, so a title containing `:` or `%` cannot corrupt
+the filter graph. The whole graph is passed with `-filter_complex_script` for
+the same reason — argv escaping and filter escaping do not compose.
+
+**drawtext needs an explicit `fontfile=`.** Without one it takes whatever
+freetype picks, which usually has no CJK — and these labels name audio tracks
+in their own language, so the Japanese one renders as tofu boxes while
+everything else looks perfect. `config.find_font()` prefers a CJK-capable font
+for exactly this reason, and `font_for_lang()` asks fontconfig per script where
+the language is known.
+
+**`-attach` must come after every `-i`.** Put an input after it and ffmpeg
+fails with "Error opening input files: Invalid argument", blaming the input.
+
+**Encoder channel limits are not discoverable from the encoder list.** ffmpeg's
+`eac3` and `truehd` encoders both refuse 7.1 — they report "Specified channel
+layout '7.1' is not supported" and then fail the conversion with a generic -22
+several lines later. `MAX_CHANNELS` in `generate.py` catches this at recipe
+level with a message that names the actual problem; `test_recipes.py` checks
+every recipe against it.
+
+**ffmpeg cannot encode text subtitles into bitmap ones.** This is why
+`vobsub.py` exists. Once a VobSub exists it is a bitmap source, so dvbsub and
+xsub are reachable from it by normal transcoding — that is how those recipes
+are built.
+
+**A transparent background needs `format=rgba` *and* `-pix_fmt rgba`.** The
+`color` source negotiates its own pixel format, so `black@0` alone gets
+flattened onto opaque black silently — and the result looks fine, which is how
+it goes unnoticed.
+
+**`testsrc2` draws its own counter in the top-left.** Labels are offset below
+it rather than over it.
+
+## VobSub, specifically
+
+The one place with real binary-format risk. A wrong nibble produces a file that
+still parses and renders garbage, so `test_subs.py` round-trips the RLE through
+an independent reference decoder written in the test rather than asserting on
+byte patterns. Keep that test honest — do not reimplement it by calling the
+encoder.
+
+Points that were not obvious:
+
+- Run length picks the code width: 1 nibble for 1-3, 2 for 4-15, 3 for 16-63,
+  4 for 64-255, value always `(count << 2) | colour`. The boundaries are the
+  bugs; `test_emit_widths` pins all four.
+- Each row is padded to a whole byte.
+- A rasterised line of text is 2-4 KB, so **splitting across sectors is the
+  normal path, not an edge case**. Only the first PES packet carries a PTS;
+  every packet repeats the substream id.
+- The terminal control sequence points at itself. That is how a decoder knows
+  it has reached the end.
+
+## Deliberately not implemented
+
+- **PGS subtitles.** ffmpeg can decode `hdmv_pgs_subtitle` but not encode it,
+  and unlike VobSub the format is not worth hand-writing for one test case.
+  VobSub reaches the same burn-in code path in Jellyfin.
+- **Dolby Vision.** No encoder exists outside licensed tooling.
+- **Checksums in the catalog.** Sizes are recorded for estimating a build, but
+  completeness is checked against the `Content-Length` of the actual request.
+  Treating a recorded size as a checksum makes the tool fail whenever a mirror
+  re-encodes something by a few hundred bytes, which is not corruption.
