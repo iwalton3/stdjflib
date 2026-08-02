@@ -180,6 +180,16 @@ FULL_TIER_MOVIES = [
 
 # The 24 Tears of Steel translations. `lang` is the ISO 639-2 code Jellyfin
 # wants in the sidecar filename; the source filenames use their own scheme.
+#
+# Four of these are malformed, and they are kept on purpose. Both Portuguese
+# files write their cue timings with a single dash (`00:00:23,000 -> ...`)
+# where SubRip requires `-->`, and both Chinese files omit the cue index line
+# and truncate the end timestamp to whole seconds. ffprobe rejects all four
+# with "Invalid data found when processing input", and Jellyfin drops them —
+# which is correct behaviour, and worth having something in the library that
+# provokes it. A client should show the twenty that parse and not break over
+# the four that do not. This is genuine community-contributed breakage, not
+# something introduced here.
 TOS_SUBTITLES = [
     ("TOS-en.srt", "eng", "English"),
     ("TOS-de.srt", "deu", "Deutsch"),

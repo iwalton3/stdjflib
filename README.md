@@ -82,7 +82,7 @@ hear.
 | Tier | Downloads | Library | Items | Generate | What it adds |
 | --- | --- | --- | --- | --- | --- |
 | `minimal` | none | 0.3 GB | 172 | ~40 s | generated media only — the CI tier, works offline |
-| `standard` | 2.4 GB | 3.7 GB | 216 | ~2.5 min | the Blender open movies, 24 real subtitle languages, public-domain shorts |
+| `standard` | 2.4 GB | 3.7 GB | 216 | ~2.5 min | the Blender open movies, 24 real subtitle files, public-domain shorts |
 | `full` | 3.4 GB | 8.4 GB | 4737 | ~4 min | 4K, 60 fps, stereoscopic 3D, MPEG-2 and Cinepak derivatives, 8K, and the six `Bulk *` libraries |
 
 Measured on a 16-core machine. "Library" excludes the download cache, which
@@ -109,8 +109,10 @@ Opus 2.0/5.1 · Vorbis · MP3 · MP2 · ALAC · PCM 16/24-bit · mono
 **Subtitles** SRT, ASS and WebVTT embedded and as sidecars · ASS with styling,
 positioning, karaoke and an attached font · MP4 timed text · **VobSub and DVB
 bitmap subtitles** · forced and default flags · nine scripts including two
-right-to-left · and, from Tears of Steel, twenty-four real translations
-including Hebrew, Persian, Japanese and Greek
+right-to-left · and, from Tears of Steel, twenty-four real community
+translations including Hebrew, Persian, Japanese and Greek — **four of which
+are malformed upstream** and are kept deliberately, because a sidecar the
+server refuses to parse is a case worth having
 
 **Colour and motion** HDR10 with mastering metadata · HLG · BT.709 SDR ·
 23.976 / 24 / 25 / 29.97 / 30 / 50 / 59.94 / 60 / 120 fps · true interlaced
@@ -168,6 +170,72 @@ that links, their size is irrelevant; on one that does not, it is the only
 thing that matters. Expect roughly 100 MB of bulk media where linking works
 and around 250 MB where it does not, rather than the several GB the naive
 version would cost.
+
+## Running a server against it
+
+```sh
+./stdjflib.py serve /srv/qa-library          # build Jellyfin, run it, set it up
+./stdjflib.py serve /srv/qa-library --fresh  # ...from a factory-fresh server
+./stdjflib.py provision /srv/qa-library --server http://host:8096
+./stdjflib.py accounts                       # what each test account is for
+```
+
+`serve` compiles Jellyfin from a source checkout (`--source`, default
+`~/Desktop/jellyfin`), runs it against a disposable state directory, completes
+the first-run wizard, creates a library per folder, creates the test accounts,
+triggers a scan and waits for it. Roughly 30 seconds to build and a few minutes
+to scan 4,700 items. `provision` does everything except the running, against a
+server you already have.
+
+Nothing is written into the Jellyfin checkout — the build goes to a separate
+`--artifacts-path`. That is not just tidiness: a checkout that was ever built
+as root has root-owned `obj/` directories, and an in-tree build then dies with
+"Permission denied" on a path that does not explain itself. Deleting the state
+directory gives a factory-fresh server, which is the state most worth being
+able to reach on demand.
+
+The web UI is optional and off unless a built `jellyfin-web/dist` is found —
+a client talks to the API, and building the web UI needs an npm toolchain that
+has nothing to do with testing one.
+
+### The test accounts
+
+Twelve, each reaching a client path that is otherwise tedious to set up by
+hand. Password `stdjflib` throughout, except where the point is not having one.
+
+| Account | What it makes reachable |
+| --- | --- |
+| `qa-admin` | administrator — dashboard, tasks, library management |
+| `qa-user` | everything allowed; the control |
+| `qa-nopassword` | no password at all, as home setups often have |
+| `qa-restricted` | only Movies and Shows; the rest must be *absent*, not merely unplayable |
+| `qa-notranscode` | transcoding and remuxing refused — finds the spinner where an error belongs |
+| `qa-nodownload` | downloads and sync refused |
+| `qa-noplayback` | can browse, cannot play — separates "can list" from "can play" |
+| `qa-kid` | parental cap plus unrated blocked, so most of the library vanishes; empty rows and empty libraries |
+| `qa-nosyncplay` | SyncPlay refused |
+| `qa-onesession` | one session; a second login must evict the first |
+| `qa-hidden` | not in the public user list, but can still sign in by name |
+| `qa-disabled` | authentication must fail cleanly, not hang |
+
+### Two things that fail silently
+
+Both were found by reading the server source and confirmed against a running
+one, and both look like they work if you do not check.
+
+**`LibraryOptions.EnableInternetProviders` does nothing.** It is in the DTO and
+referenced nowhere else in the server. What actually gates a remote provider is
+a `TypeOptions` entry with an empty `MetadataFetchers` array — and the check is
+"does this library have a TypeOptions", so a type with *no* entry falls back to
+the server defaults, which have the internet providers on.
+
+**Per-library options cannot reach every item.** A `MusicArtist` is derived
+from tags rather than a folder, so it has no library path, so its options come
+back null, and `ProviderManager` then allows every provider through by design.
+The first run of this leaked live MusicBrainz lookups for every artist despite
+the per-library switch being set correctly. Closing it needs the *server-wide*
+`MetadataOptions` to list each remote provider as disabled as well. Both layers
+are applied; either alone is insufficient.
 
 ## Bitmap subtitles
 

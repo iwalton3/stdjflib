@@ -6,8 +6,11 @@ import argparse
 import os
 import shutil
 import sys
+import time
 
-from . import build, catalog, config, fetch, ff, recipes, verify
+from . import (build, catalog, config, fetch, ff, jfserver, provision,
+               recipes, verify)
+from .jfapi import Jellyfin
 
 DEFAULT_ROOT = os.environ.get("STDJFLIB_ROOT", "")
 
@@ -71,6 +74,55 @@ def _parser() -> argparse.ArgumentParser:
                    help="also delete the download cache")
     c.add_argument("--yes", action="store_true",
                    help="skip the confirmation prompt")
+
+    def server_args(sp):
+        sp.add_argument("root", nargs="?" if DEFAULT_ROOT else None,
+                        default=DEFAULT_ROOT or None,
+                        help="the built library (or set STDJFLIB_ROOT)")
+        sp.add_argument("--password", default=provision.DEFAULT_PASSWORD,
+                        help="password for the QA accounts")
+        sp.add_argument("--no-scan", action="store_true",
+                        help="do not trigger a library scan")
+        sp.add_argument("--replace-libraries", action="store_true",
+                        help="delete and recreate libraries that already exist")
+        sp.add_argument("--chapter-images", action="store_true",
+                        help="extract chapter images during the scan (slow)")
+        sp.add_argument("--trickplay", action="store_true",
+                        help="generate trickplay tiles during the scan (very slow)")
+        sp.add_argument("--server-name", default="stdjflib QA",
+                        help="the name the server reports")
+        sp.add_argument("-v", "--verbose", action="store_true",
+                        help="show the build output")
+        return sp
+
+    s = server_args(sub.add_parser(
+        "serve", help="build and run Jellyfin from source, then set it up"))
+    s.add_argument("--source", default=os.path.expanduser("~/Desktop/jellyfin"),
+                   help="path to a Jellyfin source checkout")
+    s.add_argument("--state", default=None,
+                   help="where the server keeps its data (default: "
+                        "<root>/.stdjflib/jellyfin). Delete it for a fresh server.")
+    s.add_argument("--port", type=int, default=jfserver.DEFAULT_PORT)
+    s.add_argument("--no-build", action="store_true",
+                   help="use the existing build instead of compiling")
+    s.add_argument("--artifacts", default=None,
+                   help="build output directory (default: alongside --state). "
+                        "Never inside the Jellyfin checkout.")
+    s.add_argument("--fresh", action="store_true",
+                   help="delete the server state first, for a factory-fresh run")
+    s.add_argument("--stop-after-setup", action="store_true",
+                   help="shut the server down once it is provisioned")
+
+    pr = server_args(sub.add_parser(
+        "provision", help="set up an already-running Jellyfin server"))
+    pr.add_argument("--server", default="http://127.0.0.1:8096",
+                    help="base URL of the running server")
+    pr.add_argument("--media-root", default=None,
+                    help="path the *server* sees the library at, when that "
+                         "differs from this machine's (containers, remote mounts)")
+
+    sub.add_parser("accounts",
+                   help="list the test accounts and what each one is for")
     return p
 
 
@@ -237,9 +289,135 @@ def main(argv=None) -> int:
     handler = {
         "build": cmd_build, "verify": cmd_verify, "list": cmd_list,
         "doctor": cmd_doctor, "clean": cmd_clean,
+        "serve": cmd_serve, "provision": cmd_provision,
+        "accounts": cmd_accounts,
     }[args.command]
     try:
         return handler(args)
     except KeyboardInterrupt:
         print("\ninterrupted — rerun to resume", file=sys.stderr)
         return 130
+
+
+def _provision_kwargs(args) -> dict:
+    return {
+        "password": args.password,
+        "chapter_images": args.chapter_images,
+        "trickplay": args.trickplay,
+        "replace": args.replace_libraries,
+        "scan": not args.no_scan,
+        "server_name": args.server_name,
+    }
+
+
+def cmd_provision(args) -> int:
+    root = os.path.abspath(args.root)
+    jf = Jellyfin(args.server)
+    provision.provision(jf, root, media_root=args.media_root,
+                        **_provision_kwargs(args))
+    _print_connection(args.server, args.password)
+    return 0
+
+
+def cmd_serve(args) -> int:
+    root = os.path.abspath(args.root)
+    state = os.path.abspath(
+        args.state or os.path.join(root, config.STATE_DIR, "jellyfin"))
+    artifacts = os.path.abspath(args.artifacts or state + "-build")
+
+    if args.fresh and os.path.isdir(state):
+        print(f"Removing {state}")
+        shutil.rmtree(state)
+
+    if jfserver.port_in_use(args.port):
+        # A server we just stopped can hold the port for a moment; give it a
+        # few seconds before declaring the port taken.
+        print(f"Port {args.port} is busy; waiting for it to free")
+        for _ in range(10):
+            time.sleep(1)
+            if not jfserver.port_in_use(args.port):
+                break
+        else:
+            print(f"Something is still listening on port {args.port}. "
+                  f"Stop it, or pass --port.", file=sys.stderr)
+            return 1
+
+    dll = jfserver.dll_path(artifacts)
+    if args.no_build:
+        if not os.path.exists(dll):
+            print(f"No build at {dll}; drop --no-build to compile it.",
+                  file=sys.stderr)
+            return 1
+    else:
+        print(f"Building Jellyfin from {args.source}")
+        print(f"  output -> {artifacts}  (nothing is written into the checkout)")
+        try:
+            dll = jfserver.build(args.source, artifacts, verbose=args.verbose)
+        except RuntimeError as exc:
+            print(f"\n{exc}", file=sys.stderr)
+            return 1
+
+    web = jfserver.find_web_client(args.source)
+    instance = jfserver.Instance(dll, state, port=args.port, web_dir=web,
+                                 ffmpeg=shutil.which("ffmpeg"),
+                                 verbose=args.verbose)
+    print(f"Starting the server on {instance.url}")
+    print(f"  state {state}")
+    print(f"  web   {web or 'not built, running --nowebclient'}")
+    if not web:
+        print("        (the API is all a client needs; build jellyfin-web "
+              "only if you want the browser UI)")
+    instance.start()
+
+    try:
+        jf = Jellyfin(instance.url)
+        try:
+            provision.provision(jf, root, still_alive=instance.alive,
+                                **_provision_kwargs(args))
+        except Exception:
+            if not instance.alive():
+                print("\nThe server exited. Last of its log:\n",
+                      file=sys.stderr)
+                print(instance.log_tail(), file=sys.stderr)
+            raise
+        _print_connection(instance.url, args.password)
+
+        if args.stop_after_setup:
+            print("\nStopping the server (--stop-after-setup).")
+            return 0
+        print(f"\nServer log: {instance.log_path}")
+        print("Ctrl-C to stop.")
+        while instance.alive():
+            time.sleep(1)
+        print("\nThe server exited on its own. Last of its log:\n")
+        print(instance.log_tail())
+        return 1
+    except KeyboardInterrupt:
+        print("\nStopping.")
+        return 0
+    finally:
+        instance.stop()
+
+
+def _print_connection(url: str, password: str) -> None:
+    print()
+    print(f"  Server    {url}")
+    print(f"  Sign in   {provision.ACCOUNTS[0]['name']} / {password}")
+    print(f"  Accounts  {len(provision.ACCOUNTS)} — `stdjflib accounts` "
+          f"explains what each is for")
+
+
+def cmd_accounts(_args) -> int:
+    print(f"{len(provision.ACCOUNTS)} test accounts, created by "
+          f"`stdjflib serve` / `stdjflib provision`.")
+    print(f"Default password: {provision.DEFAULT_PASSWORD}")
+    print()
+    for account in provision.ACCOUNTS:
+        password = account["password"] or "(none)"
+        print(f"{account['name']}  [{password}]")
+        for line in account["why"].split(". "):
+            line = line.strip().rstrip(".")
+            if line:
+                print(f"    {line}.")
+        print()
+    return 0

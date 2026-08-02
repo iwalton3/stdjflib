@@ -42,6 +42,9 @@ filter or muxer problem.
 | `stdjflib/artwork.py` | posters, backdrops, logos, drawn by ffmpeg |
 | `stdjflib/build.py` | orchestration, manifest, ATTRIBUTION, library README |
 | `stdjflib/verify.py` | re-probe everything and compare against the recipes |
+| `stdjflib/jfapi.py` | the Jellyfin API client |
+| `stdjflib/jfserver.py` | building and running a server from source |
+| `stdjflib/provision.py` | library options, the test accounts, setup |
 | `stdjflib/cli.py` | argument parsing and the subcommands |
 
 Adding a test case usually means adding one `Recipe` to `recipes.py` and
@@ -100,6 +103,52 @@ and `read()` just returns empty, so without the explicit
 hypothetical: the first real run lost Sintel at exactly that point. The check
 plus resume plus `attempts=5` is the whole mechanism — keep all three. Do not
 "simplify" it by trusting `urlopen` to raise.
+
+## Jellyfin server gotchas
+
+All of these were read out of `../jellyfin` and then confirmed against a
+running 12.0 server. Each one fails *silently* — the call succeeds and the
+setting simply has no effect.
+
+**The auth token goes inside the `Authorization` header.** `X-Emby-Token` is
+still read by `AuthorizationContext`, but only as a fallback when the
+Authorization header carries no token — and on 12.0 a request with
+`X-Emby-Token` and a token-less Authorization header comes back 401. Measured:
+token-in-Authorization 200, `X-Emby-Token` 401 with or without the other
+header.
+
+**`LibraryOptions.EnableInternetProviders` is vestigial.** It exists in the DTO
+and is referenced nowhere else in the server. Setting it false changes nothing.
+`provision.library_options` sets it anyway, for honesty, and does the real work
+with `TypeOptions`.
+
+**An empty `MetadataFetchers` disables remote fetchers; a missing `TypeOptions`
+enables them.** `BaseItemManager.IsMetadataFetcherEnabled` branches on
+`libraryTypeOptions is not null`, so a type with no entry falls through to the
+server-wide defaults. Hence an entry for every type in `ITEM_TYPES`. Local
+providers never reach that check — `CanRefreshMetadata` returns early for
+anything that is not an `IRemoteMetadataProvider` — which is why the NFO reader
+still runs.
+
+**Per-library options do not cover items with no path.** A `MusicArtist` comes
+from tags, has no folder, so `GetLibraryOptions` returns null and
+`ProviderManager` deliberately allows every provider through. This is not
+hypothetical: the first working run leaked live MusicBrainz lookups for every
+artist. The fix is the server-wide `MetadataOptions`, which is the other branch
+of the same check. **Both layers are required**; do not remove either.
+
+**The wizard needs `GET /Startup/User` before the POST.** The GET initialises
+the default user record; without it the POST has nothing to rename.
+
+**Never build inside the Jellyfin checkout.** `dotnet build` writes `obj/`, and
+a checkout that was ever built as root has root-owned ones (42 in the tree this
+was written against). It fails with "Permission denied" and a temp-file path
+that explains nothing. `--artifacts-path` keeps every output elsewhere.
+
+**`wait_until_up` must require a real payload.** A socket that accepts and
+closes — a previous server still shutting down on the same port — reads as an
+empty body, and treating that as "up" makes the next call fail with a
+connection error pointing nowhere near the cause.
 
 ## ffmpeg gotchas, all learned the hard way
 
