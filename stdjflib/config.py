@@ -125,6 +125,11 @@ class BuildConfig:
     keep_cache: bool = True
     hwaccel: str | None = None  # None | "nvenc" — see `hw_encoder`
     bulk: int = 0               # items per bulk library; 0 builds none
+    # Redraw the images and leave the media alone. Every builder still runs,
+    # so the artwork lands in exactly the places a build would put it —
+    # including image types added since the library was built, which a pass
+    # over the files on disk could never discover.
+    artwork_only: bool = False
 
     def __post_init__(self):
         if self.tier not in TIERS:

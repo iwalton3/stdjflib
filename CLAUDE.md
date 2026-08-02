@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (112 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (132 tests,
 well under a second, no ffmpeg). To try it for real, build the minimal tier —
 it downloads nothing and takes about 80 seconds on a 16-core machine:
 
@@ -39,7 +39,7 @@ filter or muxer problem.
 | `stdjflib/fetch.py` | resumable downloads, the licence gate, unzip |
 | `stdjflib/libraries.py` | per-library-type builders and the path conventions |
 | `stdjflib/nfo.py` | Kodi-dialect NFO writers |
-| `stdjflib/artwork.py` | posters, backdrops, logos, drawn by ffmpeg |
+| `stdjflib/artwork.py` | one shape per Jellyfin image type, drawn by ffmpeg |
 | `stdjflib/build.py` | orchestration, manifest, ATTRIBUTION, library README |
 | `stdjflib/verify.py` | re-probe everything and compare against the recipes |
 | `stdjflib/jfapi.py` | the Jellyfin API client |
@@ -106,6 +106,37 @@ own encode.
 **Logo artwork is deliberately hostile.** Transparent PNGs, some white ink and
 some black, so no single background colour renders them all. A client that
 composites logos badly is supposed to fail here. Do not make them all opaque.
+
+**An image's aspect ratio is the test, not its decoration.** jellyfin-web
+takes a row's *median* `PrimaryImageAspectRatio`, snaps it onto 2:3, 16:9, 1:1
+or 4:3, and shapes every card in the row from the result — so a poster that is
+secretly 16:9 does not look wrong on its own, it reshapes the row and hides
+the layout bug being hunted. `artwork.SPECS` is the table; `verify` re-probes
+every image and compares. The same ImageType is a different shape depending on
+what owns it: Primary is 2:3 for a movie, 1:1 for an album or artist, and 16:9
+for an episode. Album art is square — do not "fix" it back to a poster.
+
+**The three artwork naming schemes disagree, and the disagreements are the
+server's.** In an item's folder, Thumb is `landscape.jpg` and music's Primary
+is `folder.jpg`; beside a loose file, Backdrop is `<name>-fanart.jpg` because
+`<name>-backdrop` is only matched for an item in its own folder, and an
+episode still is `<name>-thumb.jpg` exactly — `EpisodeLocalImageProvider` has
+its own list, `landscape` is not on it, and it registers the file as
+**Primary**. Seasons are `season01-poster.jpg` in the *series* folder, with
+season zero spelled `season-specials-`. All of it is read out of
+`MediaBrowser.LocalMetadata/Images/`; `verify._ARTWORK_STEMS` deliberately
+spells the mapping out a second time rather than inverting `artwork.py`'s
+tables, because a check that inherits its expectations from the thing it
+checks is not a check. `test_artwork.py` ties the two together.
+
+**`artwork` regenerates by running the builders, not by walking the files.**
+`cfg.artwork_only` switches the media steps off (`_emit`, `_link_or_copy`,
+`_audio_track`, `_write_epub`, the downloads and the manifest write) and lets
+everything else run. That is what lets a redraw add an image type the library
+was built without — a pass over what is on disk can only refresh what is
+already there. Embedded album art is re-muxed with `-c:a copy`; re-encoding
+the audio to change a cover would make the library differ from everyone
+else's.
 
 **A truncated download raises no exception.** The server ends the body early
 and `read()` just returns empty, so without the explicit

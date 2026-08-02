@@ -58,12 +58,24 @@ def _text(parent: ET.Element, tag: str, value) -> None:
 
 def _write(root: ET.Element, path: str) -> str:
     ET.indent(root, space="  ")
+    payload = (b'<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
+               + ET.tostring(root, encoding="utf-8") + b"\n")
+
+    # Identical output is the *normal* case: nothing here depends on the
+    # clock, so a rebuild produces the same bytes. Writing them anyway would
+    # move every mtime, and Jellyfin refreshes metadata off mtimes — so a
+    # rerun that changed nothing would still cost a full rescan.
+    try:
+        with open(path, "rb") as fh:
+            if fh.read() == payload:
+                return path
+    except OSError:
+        pass
+
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".part"
     with open(tmp, "wb") as fh:
-        fh.write(b'<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n')
-        fh.write(ET.tostring(root, encoding="utf-8"))
-        fh.write(b"\n")
+        fh.write(payload)
     os.replace(tmp, path)
     return path
 

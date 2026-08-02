@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import shutil
 import sys
@@ -60,6 +61,16 @@ def _parser() -> argparse.ArgumentParser:
                          f"search, sort). Defaults to {config.DEFAULT_BULK} at "
                          f"the full tier and 0 below it; --bulk 0 disables, "
                          f"and any N overrides either way."))
+
+    a = common(sub.add_parser(
+        "artwork",
+        help="redraw every image in a library that is already built"))
+    a.add_argument("--bulk", type=int, default=None, metavar="N",
+                   help="items per Bulk * library (default: whatever the "
+                        "manifest says was built)")
+    # Tier and bulk come from the manifest unless they are given, so a redraw
+    # cannot quietly cover less of the library than is on disk.
+    a.set_defaults(tier=None)
 
     common(sub.add_parser("verify", help="check a built library against its manifest"))
 
@@ -320,10 +331,39 @@ def cmd_build(args) -> int:
     return 0
 
 
+def cmd_artwork(args) -> int:
+    """Redraw the images of an existing library, in place.
+
+    Every builder runs, with the media steps switched off. That is the point:
+    the artwork lands wherever a build would have put it, including image
+    types added since this library was built — which a pass over the files on
+    disk could not discover, because those files are not there yet.
+    """
+    root = os.path.abspath(args.root)
+    previous = build.read_manifest(root)
+    if not previous:
+        print(f"no manifest under {root} — is this a stdjflib library?",
+              file=sys.stderr)
+        return 1
+    if args.tier is None:
+        args.tier = previous.get("tier", "standard")
+    if args.bulk is None:
+        args.bulk = previous.get("bulk", 0)
+
+    cfg = dataclasses.replace(_config_from(args), artwork_only=True)
+    if not cfg.font_file:
+        print("no font found, so there is nothing to draw with — pass --font",
+              file=sys.stderr)
+        return 1
+    build.run(cfg)
+    return 0
+
+
 def cmd_verify(args) -> int:
     cfg = _config_from(args)
-    checked, problems = verify.run(cfg)
-    print(f"verified {checked} generated files against their recipes")
+    checked, images, problems = verify.run(cfg)
+    print(f"re-probed {checked} generated files against their recipes "
+          f"and {images} images against the shape their type calls for")
     if not problems:
         print("no problems")
         return 0
@@ -337,6 +377,7 @@ def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     handler = {
         "build": cmd_build, "verify": cmd_verify, "list": cmd_list,
+        "artwork": cmd_artwork,
         "doctor": cmd_doctor, "clean": cmd_clean,
         "serve": cmd_serve, "provision": cmd_provision,
         "accounts": cmd_accounts, "container": cmd_container,

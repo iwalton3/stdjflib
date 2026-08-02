@@ -41,6 +41,12 @@ def fetch_sources(cfg) -> dict:
     if not sources:
         return {}
 
+    if cfg.artwork_only:
+        # Redrawing artwork is not a reason to go to the network. Whatever is
+        # already in the cache is what the films were placed from.
+        return {src.key: cfg.cache(src.cache_name) for src in sources
+                if os.path.exists(cfg.cache(src.cache_name))}
+
     total = catalog.estimated_bytes(cfg.tier)
     _say(f"  {len(sources)} source files, about {fetch.human(total)}")
     got: dict[str, str] = {}
@@ -117,7 +123,7 @@ def place_movies(root: str, cfg, cached: dict) -> list[dict]:
             continue
 
         os.makedirs(folder, exist_ok=True)
-        if not os.path.exists(dest):
+        if not os.path.exists(dest) and not cfg.artwork_only:
             # Hard-link when we can: the cache and the library are usually on
             # the same filesystem, and the films are large.
             try:
@@ -127,7 +133,7 @@ def place_movies(root: str, cfg, cached: dict) -> list[dict]:
 
         for sub in subs_by_parent.get(src.key, []):
             sub_cache = cached.get(sub.key)
-            if not sub_cache or not os.path.exists(sub_cache):
+            if not sub_cache or not os.path.exists(sub_cache) or cfg.artwork_only:
                 continue
             # Disambiguate the several French and Chinese variants, which would
             # otherwise overwrite each other.
@@ -152,8 +158,9 @@ def place_movies(root: str, cfg, cached: dict) -> list[dict]:
                   runtime_minutes=src.runtime or 10, rating=8.0,
                   tags=["stdjflib", "downloaded",
                         "cc-by" if src.licence.startswith("CC") else "public-domain"])
-        artwork.item_images(folder, src.key, src.title, cfg,
-                            subtitle=f"{src.year} · {src.licence}")
+        artwork.folder_images(folder, src.key, src.title, cfg,
+                              kinds=artwork.SETS["movie"],
+                              subtitle=f"{src.year} · {src.licence}")
         made.append({"library": "Movies", "key": src.key, "path": dest})
     return made
 
@@ -176,7 +183,13 @@ BUILDERS = [
 def run(cfg) -> dict:
     started = time.time()
     WARNINGS.clear()
-    _say(f"stdjflib — building the {cfg.tier} tier into {cfg.root}")
+    artwork.reset_drawn()
+    if cfg.artwork_only:
+        _say(f"stdjflib — redrawing the artwork of the {cfg.tier} tier "
+             f"in {cfg.root}")
+        _say("  media is left alone; nothing is downloaded")
+    else:
+        _say(f"stdjflib — building the {cfg.tier} tier into {cfg.root}")
     _say(f"  ffmpeg: {ff.version(cfg.ffmpeg)}")
     if cfg.hwaccel:
         _say(f"  hardware encoding: {cfg.hwaccel} (large files only; "
@@ -242,7 +255,10 @@ def run(cfg) -> dict:
         "libraries": libs,
         "items": items,
     }
-    if not cfg.dry_run:
+    # An artwork pass rebuilt no media, so it has nothing to say about what is
+    # on disk. Rewriting the manifest from it would record whatever tier and
+    # bulk count *this* invocation happened to use as if they had been built.
+    if not cfg.dry_run and not cfg.artwork_only:
         write_manifest(cfg, manifest)
         write_attribution(cfg)
         write_readme(cfg)
@@ -253,6 +269,12 @@ def run(cfg) -> dict:
         for warning in WARNINGS:
             _say(f"  ! {warning}")
         _say()
+    if cfg.artwork_only:
+        _say(f"Done: {artwork.drawn()} images redrawn across {len(items)} "
+             f"items in {time.time() - started:.0f}s")
+        _say("  the manifest was left as it was — no media changed")
+        return manifest
+
     _say(f"Done: {len(items)} items in {time.time() - started:.0f}s"
          + (f", {len(WARNINGS)} skipped" if WARNINGS else ""))
     if not cfg.dry_run:
@@ -263,8 +285,12 @@ def run(cfg) -> dict:
 
 
 def _previous(cfg) -> dict:
+    return read_manifest(cfg.root)
+
+
+def read_manifest(root: str) -> dict:
     """The manifest already on disk, or {} if there is none to read."""
-    path = cfg.path(config.MANIFEST)
+    path = os.path.join(root, config.MANIFEST)
     try:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)

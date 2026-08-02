@@ -17,7 +17,13 @@ import concurrent.futures as futures
 import json
 import os
 
-from . import config, ff, recipes
+from . import artwork, config, ff, recipes
+
+# Beyond this many artwork files in one library, only a sample is probed. A
+# bulk library is thousands of images of half a dozen shapes, and probing all
+# of them costs minutes to learn what the first hundred already said. What
+# was skipped is printed rather than passed over in silence.
+ARTWORK_SAMPLE = 120
 
 # ffmpeg names encoders and codecs differently; probing reports the codec.
 CODEC_OF = {
@@ -107,11 +113,105 @@ def _check_recipe(rec, path: str, cfg) -> list[str]:
     return issues
 
 
-def run(cfg) -> tuple[int, list[str]]:
-    """Verify the library at cfg.root. Returns (checked, problems)."""
+def _artwork_kind(name: str) -> str | None:
+    """Which image type a filename claims to be, or None if it is not artwork.
+
+    Names, not folders: the same `poster.jpg` rule has to work for an item in
+    its own folder, for `<film>-poster.jpg` beside a loose file and for
+    `season01-poster.jpg` up in the series folder.
+    """
+    stem, ext = os.path.splitext(name.lower())
+    if ext not in (".jpg", ".png"):
+        return None
+    for kind, spelling in _ARTWORK_STEMS:
+        if stem == spelling or stem.endswith("-" + spelling):
+            return kind
+    return None
+
+
+# Every spelling `artwork.py` writes, mapped back to the shape it should be.
+# Spelled out rather than derived from that module's three naming tables,
+# because those are keyed the other way and collide when inverted — and a
+# check that inherits its expectations from the thing it is checking is not a
+# check. Longest first: `clearart` must not be read as `art`.
+_ARTWORK_STEMS = (
+    ("art", "clearart"),
+    ("thumb", "landscape"),
+    ("backdrop", "backdrop"),
+    ("backdrop", "fanart"),
+    ("banner", "banner"),
+    ("poster", "poster"),
+    ("square", "folder"),
+    ("square", "cover"),
+    ("thumb", "thumb"),
+    ("logo", "logo"),
+    ("disc", "disc"),
+)
+
+
+def _check_artwork(path: str, kind: str, cfg) -> list[str]:
+    """Probe one image and compare its shape against the type it claims to be.
+
+    The shape is the whole point. A client rounds a row's median aspect ratio
+    onto 2:3, 16:9 or 1:1 and lays every card in the row out from it, so a
+    poster that is secretly 16:9 does not look wrong on its own — it quietly
+    reshapes the row it is in, and the layout bug you were hunting hides
+    behind it.
+    """
+    data = ff.probe(path, cfg.ffprobe)
+    if not data:
+        return [f"{path}: unreadable"]
+    streams = [s for s in data.get("streams", []) if s.get("width")]
+    if not streams:
+        return [f"{path}: no image stream"]
+    width, height = streams[0]["width"], streams[0]["height"]
+    if not height:
+        return [f"{path}: zero height"]
+    want = artwork.SPECS[kind].aspect
+    got = width / height
+    # 1% — enough for rounding at these sizes, nowhere near the tolerance
+    # jellyfin-web snaps with, which would let a 4:3 pass as 16:9.
+    if abs(got - want) > want * 0.01:
+        return [f"{path}: {width}x{height} is {got:.2f}:1, but a "
+                f"{kind} is {artwork.SPECS[kind].ratio} ({want:.2f}:1)"]
+    return []
+
+
+def check_artwork(cfg, libraries) -> tuple[int, list[str]]:
+    """Probe the artwork under each library folder. Returns (checked, problems)."""
+    targets: list[tuple[str, str]] = []
+    problems: list[str] = []
+    for library in libraries:
+        found = []
+        for folder, _dirs, files in os.walk(cfg.path(library)):
+            for name in files:
+                kind = _artwork_kind(name)
+                if kind:
+                    found.append((os.path.join(folder, name), kind))
+        found.sort()
+        if len(found) > ARTWORK_SAMPLE:
+            step = len(found) // ARTWORK_SAMPLE
+            problems.append(
+                f"{library}: {len(found)} images, probing every {step}th "
+                f"({ARTWORK_SAMPLE} of them) — this is a note, not a fault")
+            found = found[::step][:ARTWORK_SAMPLE]
+        targets += found
+
+    if not targets:
+        return 0, problems
+    with futures.ThreadPoolExecutor(cfg.workers * 2) as pool:
+        for issues in pool.map(lambda t: _check_artwork(t[0], t[1], cfg),
+                               targets):
+            problems.extend(issues)
+    return len(targets), problems
+
+
+def run(cfg) -> tuple[int, int, list[str]]:
+    """Verify the library at cfg.root. Returns (files, images, problems)."""
     manifest_path = cfg.path(config.MANIFEST)
     if not os.path.exists(manifest_path):
-        return 0, [f"no manifest at {manifest_path} — was this built by stdjflib?"]
+        return 0, 0, [f"no manifest at {manifest_path} — "
+                      f"was this built by stdjflib?"]
     with open(manifest_path, encoding="utf-8") as fh:
         manifest = json.load(fh)
 
@@ -145,4 +245,12 @@ def run(cfg) -> tuple[int, list[str]]:
     problems += [f"{item['key']}: missing ({item['path']})"
                  for item, ok in zip(listed, present) if not ok]
 
-    return checked, problems
+    # The artwork is checked against the manifest's library list rather than
+    # this invocation's: `verify` is usually run without the --bulk the build
+    # had, and a library that is on disk should be checked whether or not
+    # today's arguments would have produced it.
+    images, image_problems = check_artwork(
+        cfg, manifest.get("libraries") or cfg.libraries())
+    problems += image_problems
+
+    return checked, images, problems

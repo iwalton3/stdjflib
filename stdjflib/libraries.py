@@ -61,6 +61,10 @@ def _short(title: str, key: str, *, group: str = "Library",
 
 
 def _emit(rec: Recipe, path: str, cfg, *, allow_hw: bool = False) -> bool:
+    if cfg.artwork_only:
+        # The media is already there and is not what this run is about. Say
+        # yes so the item's artwork and metadata still get written.
+        return True
     try:
         res = generate.build(rec, path, cfg, allow_hw=allow_hw)
         return res.ok
@@ -101,9 +105,10 @@ def build_test_media(root: str, cfg) -> list[dict]:
                     collection=rec.group,
                     sort_title=f"{rec.group} — {rec.title}",
                 )
-                artwork.draw("poster", rec.key, [rec.title],
-                             os.path.join(folder, f"{safe}-poster.jpg"), cfg,
-                             subtitle=rec.group)
+                # One folder holds a whole codec group, so these are loose
+                # files and only the sidecar naming resolves.
+                artwork.sidecar_images(media, rec.key, rec.title, cfg,
+                                       kinds=("poster",), subtitle=rec.group)
             return {"library": "Test Media", "key": rec.key, "path": media,
                     "group": rec.group}
         return run
@@ -173,8 +178,11 @@ def build_movies(root: str, cfg) -> list[dict]:
                 nfo.movie(os.path.join(root, f"{name}.nfo"), key=rec.key,
                           title=title, plot=plot, year=year, runtime_minutes=1,
                           tags=["stdjflib", "naming"])
-                artwork.draw("poster", rec.key, [title],
-                             os.path.join(root, f"{name}-poster.jpg"), cfg)
+                # A film with no folder of its own: every image has to carry
+                # the filename as a prefix, and a client that only ever saw
+                # folder-per-movie libraries has never loaded one.
+                artwork.sidecar_images(media, rec.key, title, cfg,
+                                       kinds=artwork.SETS["movie"])
             made.append({"library": "Movies", "key": rec.key, "path": media})
 
         elif shape == "mismatch":
@@ -184,7 +192,7 @@ def build_movies(root: str, cfg) -> list[dict]:
                 nfo.movie(os.path.join(folder, "movie.nfo"), key=rec.key,
                           title=title, plot=plot, year=year, runtime_minutes=1,
                           tags=["stdjflib", "naming"])
-                artwork.item_images(folder, rec.key, title, cfg)
+                artwork.folder_images(folder, rec.key, title, cfg)
             made.append({"library": "Movies", "key": rec.key, "path": media})
 
         elif shape == "versions":
@@ -202,7 +210,7 @@ def build_movies(root: str, cfg) -> list[dict]:
                 nfo.movie(os.path.join(folder, "movie.nfo"), key=rec.key,
                           title=title, plot=plot, year=year, runtime_minutes=1,
                           tags=["stdjflib", "naming"])
-                artwork.item_images(folder, rec.key, title, cfg)
+                artwork.folder_images(folder, rec.key, title, cfg)
             made.append({"library": "Movies", "key": rec.key, "path": folder})
 
         elif shape == "parts":
@@ -216,7 +224,7 @@ def build_movies(root: str, cfg) -> list[dict]:
                 nfo.movie(os.path.join(folder, "movie.nfo"), key=rec.key,
                           title=title, plot=plot, year=year, runtime_minutes=3,
                           tags=["stdjflib", "naming"])
-                artwork.item_images(folder, rec.key, title, cfg)
+                artwork.folder_images(folder, rec.key, title, cfg)
             made.append({"library": "Movies", "key": rec.key, "path": folder})
 
         elif shape == "extras":
@@ -237,7 +245,10 @@ def build_movies(root: str, cfg) -> list[dict]:
                 nfo.movie(os.path.join(folder, "movie.nfo"), key=rec.key,
                           title=title, plot=plot, year=year, runtime_minutes=1,
                           tags=["stdjflib", "naming", "extras"])
-                artwork.item_images(folder, rec.key, title, cfg)
+                # The one film carrying every image type Jellyfin has, so a
+                # client can be pointed at a single title to see all of them.
+                artwork.folder_images(folder, rec.key, title, cfg,
+                                      kinds=artwork.SETS["everything"])
             made.append({"library": "Movies", "key": rec.key, "path": folder})
 
     return made
@@ -297,6 +308,26 @@ EPISODE_TITLES = [
 ]
 
 
+def _season_artwork(series_folder: str, season_folder: str, season_no: int,
+                    show_key: str, show_title: str, cfg, *,
+                    in_series_folder: bool) -> None:
+    """One season's artwork, in whichever of the two places it is being tested.
+
+    A season's Primary is a poster like the series' own — the shape does not
+    change just because the item is a season, and a client that draws seasons
+    at 16:9 crops the title off every one of them.
+    """
+    key = f"{show_key}-s{season_no}"
+    label = "Specials" if season_no == 0 else f"Season {season_no}"
+    title = f"{show_title}\n{label}"
+    if in_series_folder:
+        artwork.season_images(series_folder, season_no, key, title, cfg,
+                              subtitle=label)
+    else:
+        artwork.folder_images(season_folder, key, title, cfg,
+                              kinds=artwork.SETS["season"], subtitle=label)
+
+
 def build_shows(root: str, cfg) -> list[dict]:
     made = []
     tasks: list = []
@@ -309,8 +340,13 @@ def build_shows(root: str, cfg) -> list[dict]:
             nfo.tvshow(os.path.join(folder, "tvshow.nfo"), key=key, title=title,
                        plot=show["plot"], year=show["year"],
                        tags=["stdjflib", "shows"])
-            artwork.item_images(folder, key, title, cfg,
-                                kinds=("poster", "backdrop", "logo", "banner"))
+            # One show carries every image type Jellyfin has, so a client can
+            # be pointed at a single title to exercise all of them; the rest
+            # get the ordinary series set.
+            artwork.folder_images(
+                folder, key, title, cfg,
+                kinds=(artwork.SETS["everything"] if key == "standard-show"
+                       else artwork.SETS["series"]))
 
         style = show["style"]
         rec = _short(title, f"{key}-ep", duration=10)
@@ -333,9 +369,12 @@ def build_shows(root: str, cfg) -> list[dict]:
                             plot=_show["plot"], season_no=season_no,
                             episode_no=ep_no, aired=aired, runtime_minutes=1,
                             end_episode=end)
-                artwork.draw("thumb", ep_key, [ep_title],
-                             os.path.splitext(path)[0] + "-thumb.jpg", cfg,
-                             subtitle=f"S{season_no:02d}E{ep_no:02d}")
+                # `<episode>-thumb.jpg`, which Jellyfin registers as the
+                # episode's *Primary* — hence 16:9, and hence a row of
+                # episodes laying out landscape rather than as posters.
+                artwork.sidecar_images(path, ep_key, ep_title, cfg,
+                                       kinds=("thumb",),
+                                       subtitle=f"S{season_no:02d}E{ep_no:02d}")
                 return {"library": "Shows", "key": ep_key, "path": path}
 
             tasks.append(run)
@@ -348,12 +387,24 @@ def build_shows(root: str, cfg) -> list[dict]:
                                title=f"Season {season_no}", number=season_no,
                                plot=f"Season {season_no} of {title}.",
                                year=show["year"] + season_no - 1)
+                    # Both spellings Jellyfin accepts, one per season. Season
+                    # one is `season01-poster.jpg` up in the series folder,
+                    # which is where the resolver looks first; season two is
+                    # `Season 02/poster.jpg`, which is where people put it.
+                    # A client that only handles one shows half the posters.
+                    _season_artwork(folder, sdir, season_no, key, title, cfg,
+                                    in_series_folder=season_no == 1)
                 for ep_no in range(1, count + 1):
                     et = EPISODE_TITLES[(ep_no - 1) % len(EPISODE_TITLES)]
                     episode(season_no, ep_no,
                             os.path.join(sdir, f"{title} - S{season_no:02d}E{ep_no:02d} - {et}.mkv"),
                             et, f"{show['year'] + season_no - 1}-0{season_no}-{ep_no:02d}")
             sdir = os.path.join(folder, "Season 00")
+            if not cfg.dry_run:
+                # Season 0 is spelled `season-specials-…`, not `season00-…`.
+                # The one season name a client is most likely to get wrong.
+                _season_artwork(folder, sdir, 0, key, title, cfg,
+                                in_series_folder=True)
             for ep_no in range(1, show["specials"] + 1):
                 episode(0, ep_no,
                         os.path.join(sdir, f"{title} - S00E{ep_no:02d} - Special {ep_no}.mkv"),
@@ -477,10 +528,17 @@ def build_music(root: str, cfg) -> list[dict]:
             discs = album.get("discs", 1)
             art_path = None
             if not cfg.dry_run:
-                name = "folder.jpg" if album["art"] == "folder" else ".cover.jpg"
+                # Album art is square, not a 2:3 poster. The server says so
+                # itself — MusicAlbum and MusicArtist both override
+                # `GetDefaultPrimaryImageAspectRatio()` to return 1 — and
+                # clients lay music out in square cards on the strength of it.
+                # A portrait cover is therefore pillarboxed or cropped, and
+                # which of the two it is is the bug worth finding.
+                name = (artwork.filename("square") if album["art"] == "folder"
+                        else ".cover.jpg")
                 if album["art"] != "none":
                     art_path = artwork.draw(
-                        "poster", album["key"], [album["album"]],
+                        "square", album["key"], album["album"],
                         os.path.join(album_dir, name), cfg,
                         subtitle=album["artist"])
 
@@ -510,7 +568,18 @@ def build_music(root: str, cfg) -> list[dict]:
     albums = [a for a in ALBUMS
               if a["ext"] != "opus" or ff.have(cfg.ffmpeg, "libopus")]
     results = _run_all([album_task(a) for a in albums], cfg)
-    return [item for group in results for item in (group or [])]
+    made = [item for group in results for item in (group or [])]
+
+    # Artist artwork, once per artist rather than once per album — two albums
+    # by one artist would otherwise race for the same file. An artist's
+    # Primary is square like an album's, and the backdrop and logo are what a
+    # client draws behind an artist page.
+    if not cfg.dry_run:
+        for artist in dict.fromkeys(a["artist"] for a in albums):
+            artwork.folder_images(os.path.join(root, artist),
+                                  f"artist-{artist}", artist, cfg,
+                                  kinds=artwork.SETS["artist"])
+    return made
 
 
 def _audio_track(path: str, cfg, album, disc: int, n: int, name: str,
@@ -518,6 +587,15 @@ def _audio_track(path: str, cfg, album, disc: int, n: int, name: str,
     """One tagged audio file. Tags come from ffmpeg's metadata options."""
     if cfg.dry_run:
         return True
+    if cfg.artwork_only:
+        # The audio is already encoded and is not what this run is about —
+        # but for an album whose art lives *inside* the files, the picture is
+        # the only thing that is stale, and leaving it would mean "redraw
+        # every image" quietly skipped a third of the music library.
+        if (cover and os.path.exists(cover) and os.path.exists(path)
+                and album["ext"] in ("flac", "mp3", "m4a")):
+            return _reembed_cover(path, cover, cfg)
+        return os.path.exists(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # A different pitch per track, so you can hear which one is playing and
     # whether shuffle actually shuffled.
@@ -560,6 +638,31 @@ def _audio_track(path: str, cfg, album, disc: int, n: int, name: str,
         return False
 
 
+def _reembed_cover(path: str, cover: str, cfg) -> bool:
+    """Swap the picture inside an audio file, keeping the audio bit-for-bit.
+
+    `-c:a copy` is the point: re-encoding to change a cover would make the
+    library's audio differ from the one everyone else built, for the sake of
+    a thumbnail.
+    """
+    tmp = ff.temp_path(path)
+    argv = [cfg.ffmpeg, "-hide_banner", "-nostdin", "-y",
+            "-i", path, "-i", cover,
+            # Only the audio from the original — an mp3 that already carries a
+            # cover would otherwise end up with two.
+            "-map", "0:a", "-map", "1:v", "-c:a", "copy",
+            "-c:v", "mjpeg", "-disposition:v", "attached_pic", tmp]
+    try:
+        ff.run(argv, verbose=cfg.verbose, timeout=120)
+        os.replace(tmp, path)
+        return True
+    except (ff.FFmpegError, OSError) as exc:
+        print(f"    ! {os.path.basename(path)}: {str(exc).splitlines()[-1][:110]}")
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        return False
+
+
 # --------------------------------------------------------------------------
 # Photos, Home Videos, Books, Music Videos
 # --------------------------------------------------------------------------
@@ -582,7 +685,9 @@ def build_photos(root: str, cfg) -> list[dict]:
             continue
         # The picture says which way up it should appear; the EXIF tag says how
         # to get there. Disagreement is visible at a glance.
-        got = artwork.draw("thumb", f"exif-{code}", [f"TOP\nEXIF {code}"], path,
+        # 3:2, because a square would hide half the orientations: mirroring
+        # a square looks like rotating it.
+        got = artwork.draw("photo", f"exif-{code}", f"TOP\nEXIF {code}", path,
                            cfg, subtitle=label)
         if got:
             _set_exif_orientation(path, code, cfg)
@@ -594,7 +699,7 @@ def build_photos(root: str, cfg) -> list[dict]:
         path = os.path.join(formats, f"format-{ext}.{ext}")
         if cfg.dry_run:
             continue
-        if artwork.draw("thumb", f"fmt-{ext}", [ext.upper()], path, cfg,
+        if artwork.draw("photo", f"fmt-{ext}", ext.upper(), path, cfg,
                         subtitle=note):
             made.append({"library": "Photos", "key": f"fmt-{ext}", "path": path})
 
@@ -648,6 +753,15 @@ def build_home_videos(root: str, cfg) -> list[dict]:
             path = os.path.join(root, folder, f"{name}.mp4")
             rec = _clip(rec, container="mp4")
             if _emit(rec, path, cfg):
+                if not cfg.dry_run:
+                    # Deliberately mixed: some 16:9 stills, some 2:3 posters.
+                    # jellyfin-web shapes a row from the *median* aspect ratio
+                    # of what is in it, so a folder holding both is the case
+                    # where the median decides against half the artwork — the
+                    # Home Videos shape mismatch, reproducible on demand.
+                    kind = "thumb" if i % 2 else "poster"
+                    artwork.sidecar_images(path, rec.key, name, cfg,
+                                           kinds=(kind,), subtitle=folder)
                 made.append({"library": "Home Videos", "key": rec.key,
                              "path": path})
     return made
@@ -669,6 +783,13 @@ def build_music_videos(root: str, cfg) -> list[dict]:
                                    album="Singles", year=YEAR,
                                    plot=f"Music video for {track}.",
                                    runtime_minutes=1)
+                    # Several videos share the artist's folder, so these can
+                    # only be sidecars. Poster and still both, because a
+                    # music video is the one item type where clients disagree
+                    # about which shape the row should be.
+                    artwork.sidecar_images(path, rec.key, track, cfg,
+                                           kinds=("poster", "thumb"),
+                                           subtitle=artist)
                 made.append({"library": "Music Videos", "key": rec.key,
                              "path": path})
     return made
@@ -689,7 +810,7 @@ def build_books(root: str, cfg) -> list[dict]:
         folder = os.path.join(root, author)
         os.makedirs(folder, exist_ok=True)
         epub = os.path.join(folder, f"{title}.epub")
-        _write_epub(epub, title, author)
+        _write_epub(epub, title, author, cfg)
         made.append({"library": "Books", "key": f"book-{i}", "path": epub})
 
     # A comic archive: a zip of numbered images, which is all a CBZ is.
@@ -699,7 +820,8 @@ def build_books(root: str, cfg) -> list[dict]:
     pages = []
     for p in range(1, 5):
         page = os.path.join(comics, f".page{p}.jpg")
-        if artwork.draw("poster", f"cbz-{p}", [f"Page {p}"], page, cfg):
+        if artwork.draw("photo", f"cbz-{p}", f"Page {p}", page, cfg,
+                        size=(1200, 1800), stamp=False):
             pages.append(page)
     if pages:
         with zipfile.ZipFile(cbz, "w") as zf:
@@ -711,9 +833,15 @@ def build_books(root: str, cfg) -> list[dict]:
     return made
 
 
-def _write_epub(path: str, title: str, author: str) -> None:
+def _write_epub(path: str, title: str, author: str, cfg=None) -> None:
     import zipfile
 
+    # An EPUB holds no artwork, so a redraw has nothing to change in one —
+    # and rewriting it would only churn the zip's timestamps and send
+    # Jellyfin off to rescan a file that is identical in every way that
+    # matters.
+    if cfg is not None and cfg.artwork_only and os.path.exists(path):
+        return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with zipfile.ZipFile(path, "w") as zf:
         # mimetype must be first and stored uncompressed — that is what makes
@@ -803,6 +931,13 @@ _ROMAN = ["", " II", " III", " IV", " V", " VI", " VII", " VIII"]
 
 # How many distinct clips back a bulk library.
 BULK_POOL = 12
+
+# The shapes a bulk photo comes in. Four of them, unevenly weighted, because
+# the question a photo library asks a client is what it does with a row whose
+# median aspect ratio does not describe most of the pictures in it. Landscape
+# first, so the median lands there and the portraits are the ones squeezed.
+BULK_PHOTO_SHAPES = [(1800, 1200), (1600, 1200), (1200, 1800), (1500, 1500),
+                     (1920, 1080), (1800, 1200)]
 
 
 def bulk_name(index: int) -> str:
@@ -937,9 +1072,9 @@ def build_bulk_movies(root: str, cfg) -> list[dict]:
                       rating=meta["rating"], tags=["stdjflib", "bulk"])
             # One in eight ships without a poster, on purpose.
             if i % 8:
-                artwork.draw("poster", meta["key"], [meta["title"]],
-                             os.path.join(folder, "poster.jpg"), cfg,
-                             subtitle=str(meta["year"]))
+                artwork.folder_images(folder, meta["key"], meta["title"], cfg,
+                                      kinds=("poster",),
+                                      subtitle=str(meta["year"]))
             return {"library": "Bulk Movies", "key": meta["key"], "path": media}
         return run
 
@@ -976,8 +1111,8 @@ def build_bulk_shows(root: str, cfg) -> list[dict]:
                            title=meta["title"], plot=meta["plot"],
                            year=meta["year"], rating=meta["rating"],
                            tags=["stdjflib", "bulk"])
-                artwork.item_images(folder, meta["key"], meta["title"], cfg,
-                                    kinds=("poster", "backdrop"))
+                artwork.folder_images(folder, meta["key"], meta["title"], cfg,
+                                      kinds=("poster", "backdrop"))
             # Long shows split across seasons of 24, so season lists get big too.
             for n in range(1, episodes + 1):
                 season_no = (n - 1) // 24 + 1
@@ -998,9 +1133,10 @@ def build_bulk_shows(root: str, cfg) -> list[dict]:
                             aired=f"{meta['year']}-01-01", runtime_minutes=1)
                 # A quarter get a still, so the missing-thumb path is common.
                 if n % 4 == 0:
-                    artwork.draw("thumb", ep_key, [f"Episode {ep_no}"],
-                                 os.path.join(sdir, name + "-thumb.jpg"), cfg,
-                                 subtitle=f"S{season_no:02d}E{ep_no:02d}")
+                    artwork.sidecar_images(
+                        media, ep_key, f"Episode {ep_no}", cfg,
+                        kinds=("thumb",),
+                        subtitle=f"S{season_no:02d}E{ep_no:02d}")
                 out.append({"library": "Bulk Shows", "key": ep_key,
                             "path": media})
             return out
@@ -1028,9 +1164,8 @@ def build_bulk_music(root: str, cfg) -> list[dict]:
             album_dir = os.path.join(root, safe_name(artist),
                                      f"{safe} ({meta['year']})")
             if not cfg.dry_run and index % 6:
-                artwork.draw("poster", meta["key"], [meta["title"]],
-                             os.path.join(album_dir, "folder.jpg"), cfg,
-                             subtitle=artist)
+                artwork.folder_images(album_dir, meta["key"], meta["title"],
+                                      cfg, kinds=("square",), subtitle=artist)
             count = min(per_album, cfg.bulk - index * per_album)
             for n in range(1, count + 1):
                 path = os.path.join(album_dir, f"{n:02d} - Track {n}.mp3")
@@ -1089,8 +1224,13 @@ def build_bulk_photos(root: str, cfg) -> list[dict]:
             if cfg.dry_run:
                 return {"library": "Bulk Photos", "key": meta["key"],
                         "path": path}
-            if not artwork.draw("thumb", meta["key"], [meta["title"]], path,
-                                cfg, subtitle=f"photo {i:05d}"):
+            # A spread of shapes rather than a thousand identical 16:9
+            # frames: a client picks a row's layout from the median aspect
+            # ratio of what is in it, and a library that is all one shape
+            # never exercises that.
+            if not artwork.draw("photo", meta["key"], meta["title"], path, cfg,
+                                subtitle=f"photo {i:05d}",
+                                size=BULK_PHOTO_SHAPES[i % len(BULK_PHOTO_SHAPES)]):
                 return None
             return {"library": "Bulk Photos", "key": meta["key"], "path": path}
         return run
@@ -1111,7 +1251,7 @@ def build_bulk_books(root: str, cfg) -> list[dict]:
             if cfg.dry_run:
                 return {"library": "Bulk Books", "key": meta["key"],
                         "path": path}
-            _write_epub(path, meta["title"], author)
+            _write_epub(path, meta["title"], author, cfg)
             return {"library": "Bulk Books", "key": meta["key"], "path": path}
         return run
 

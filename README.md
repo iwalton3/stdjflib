@@ -18,6 +18,7 @@ all standard library.
 ./stdjflib.py list --tier standard         # what would it contain?
 ./stdjflib.py build /srv/qa-library        # build it
 ./stdjflib.py verify /srv/qa-library       # is it what it claims to be?
+./stdjflib.py artwork /srv/qa-library      # redraw every image, media untouched
 ```
 
 ## What you get
@@ -44,7 +45,9 @@ Bulk Photos/
 Bulk Books/
 ```
 
-Every item ships an NFO with `<lockdata>true</lockdata>` and its own artwork, so
+Every item ships an NFO with `<lockdata>true</lockdata>` and its own artwork —
+posters, backdrops, banners, logos, season posters, episode stills and square
+album covers, each at the shape Jellyfin expects that image type to be — so
 Jellyfin never queries the internet and two builds present identical metadata.
 That is what makes the library usable for automated testing rather than merely
 convenient.
@@ -127,6 +130,54 @@ a truncated file and a zero-byte file
 **Paths** loose files · folder/file name disagreement · multi-version ·
 multi-part stacking · trailers and extras folders · unicode and
 right-to-left titles · titles long enough to overflow any column
+
+**Artwork** every image type Jellyfin has, at the shape it expects it —
+Primary as a 2:3 poster, as a 1:1 album cover and as a 16:9 episode still ·
+Backdrop · Banner at 5.4:1 · transparent Logo and clearart · Disc · season
+posters in both places the server looks for them · sidecar naming beside
+loose files as well as folder naming · photos in a spread of aspect ratios
+
+## Artwork
+
+An image's shape is not decoration. jellyfin-web takes the **median** aspect
+ratio of a row, rounds it onto 2:3, 16:9, 1:1 or 4:3, and lays every card in
+that row out from the result; the clients that copy it inherit the behaviour.
+So a poster that is secretly 16:9 does not look wrong on its own — it reshapes
+the row it is in, and the layout bug you were hunting hides behind it.
+
+| Type | Shape | In a folder | Beside a loose file |
+| --- | --- | --- | --- |
+| Primary (poster) | 2:3 | `poster.jpg` | `<name>-poster.jpg` |
+| Primary (album, artist) | 1:1 | `folder.jpg` | — |
+| Primary (episode) | 16:9 | — | `<episode>-thumb.jpg` |
+| Backdrop | 16:9 | `backdrop.jpg` | `<name>-fanart.jpg` |
+| Thumb | 16:9 | `landscape.jpg` | `<name>-thumb.jpg` |
+| Banner | 5.4:1 | `banner.jpg` | `<name>-banner.jpg` |
+| Logo | 2.6:1, transparent | `logo.png` | `<name>-logo.png` |
+| Art (clearart) | 16:9, transparent | `clearart.png` | `<name>-clearart.png` |
+| Disc | 1:1, transparent | `disc.png` | `<name>-disc.png` |
+
+Season posters go in the *series* folder as `season01-poster.jpg`, and season
+zero is spelled `season-specials-poster.jpg`. `Season 01/poster.jpg` also
+resolves, so the Standard Show uses one spelling for season one and the other
+for season two — a client that handles only one shows half the posters.
+
+Each image is drawn as the thing it stands for — a poster has a spine, a
+still has sprocket holes, a banner has an art block and a wordmark, disc art
+is round — and stamped with its own type and ratio. A client showing a banner
+where a poster belongs shows a picture with `BANNER 5.4:1` written across it.
+
+**`stdjflib artwork <root>` redraws every image in a library that is already
+built.** It reads the tier and bulk count out of the manifest, runs every
+builder with the media steps switched off, and touches nothing else — so the
+images land wherever a build would have put them, *including image types
+added since that library was built*, which a pass over the files on disk
+could not discover. Roughly 15 seconds for a minimal library. Album art
+embedded inside FLAC and MP3 files is swapped with `-c:a copy`, so the audio
+stays bit-identical to everyone else's.
+
+`stdjflib verify` re-probes the artwork too, and compares each image's actual
+shape against the type its filename claims.
 
 ## The bulk libraries
 
@@ -378,7 +429,7 @@ be checked mechanically. A QA library is not worth a copyright argument.
 python3 -m unittest discover -s tests -t .
 ```
 
-112 tests, well under a second, needing no ffmpeg, server or container runtime. They cover the matrix's
+132 tests, well under a second, needing no ffmpeg, server or container runtime. They cover the matrix's
 internal consistency, the licence rules, NFO output and determinism, ffmpeg
 argument assembly, and the VobSub encoder — including a round-trip of the RLE
 against an independent reference decoder written in the test, which is the only

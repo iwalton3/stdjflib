@@ -91,6 +91,37 @@ def version(ffmpeg: str = "ffmpeg") -> str:
         return "unknown"
 
 
+@functools.lru_cache(maxsize=8)
+def filters(ffmpeg: str = "ffmpeg") -> frozenset[str]:
+    """The set of filter names this ffmpeg has.
+
+    Separate from `capabilities`: `-encoders` does not list filters, and the
+    artwork uses a few that are newer than the encoders it needs (`gradients`
+    arrived in 4.4). Anything missing degrades the picture rather than failing
+    the build.
+    """
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-filters"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    names = set()
+    for line in proc.stdout.splitlines():
+        # Filter lines look like " .SC gradients  |->V  Draw a gradients."
+        # The arrow column is what separates them from the legend above, whose
+        # lines are otherwise the same shape.
+        parts = line.split()
+        if len(parts) >= 3 and len(parts[0]) == 3 and "->" in parts[2]:
+            names.add(parts[1])
+    return frozenset(names)
+
+
+def has_filter(ffmpeg: str, name: str) -> bool:
+    return name in filters(ffmpeg)
+
+
 def have(ffmpeg: str, *encoders: str) -> bool:
     caps = capabilities(ffmpeg)
     return all(e in caps for e in encoders)
