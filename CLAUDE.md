@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (102 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (112 tests,
 well under a second, no ffmpeg). To try it for real, build the minimal tier —
 it downloads nothing and takes about 80 seconds on a 16-core machine:
 
@@ -46,6 +46,7 @@ filter or muxer problem.
 | `stdjflib/jfserver.py` | building and running a server from source |
 | `stdjflib/provision.py` | library options, the test accounts, setup |
 | `stdjflib/container.py` | running the official image under podman/docker |
+| `stdjflib/livetv.py` | optional faketvsource tuner and XMLTV guide |
 | `stdjflib/cli.py` | argument parsing and the subcommands |
 
 Adding a test case usually means adding one `Recipe` to `recipes.py` and
@@ -155,6 +156,21 @@ runs before provisioning for the same reason — a mount the container cannot
 traverse should fail loudly and early, not look like an empty library. FUSE
 mounts are the usual culprit; rootless podman handles sshfs here, rootful
 Docker may not see it at all if the mount postdates the daemon.
+
+**There is no `GET /LiveTv/TunerHosts`.** It answers POST and DELETE only,
+and a GET returns 405 with an empty body — which reads as an auth or routing
+problem rather than a wrong verb. What already exists is in
+`GET /System/Configuration/livetv`, under `TunerHosts` and `ListingProviders`.
+
+**Live TV needs the guide refreshed before anything appears.** Adding a tuner
+and a listings provider leaves the Live TV section empty until the
+`RefreshGuide` scheduled task has run, which looks like a broken tuner.
+
+**faketvsource needs `--public-url` whenever the server is not local.** It
+builds its stream URLs from the request's Host header otherwise, so a
+containerised Jellyfin gets URLs pointing at itself. Both halves are required:
+the tuner URL handed to Jellyfin *and* the URLs inside the playlist. Fixing
+only the first gives a tuner that saves, lists channels, and plays nothing.
 
 **`wait_until_up` must require a real payload.** A socket that accepts and
 closes — a previous server still shutting down on the same port — reads as an

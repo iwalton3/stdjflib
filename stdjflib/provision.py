@@ -11,8 +11,18 @@ from __future__ import annotations
 import json
 import os
 
-from . import config
+from . import config, livetv
 from .jfapi import ApiError, Jellyfin
+
+
+def _say(msg: str = "") -> None:
+    """Flushed, because stderr is not buffered and stdout is when piped.
+
+    Without this an error prints above the progress line that explains what
+    was being attempted, and the log reads as though the failure happened
+    somewhere it did not.
+    """
+    print(msg, flush=True)
 
 # Every item type Jellyfin will look for a remote provider for. A TypeOptions
 # entry has to exist for each one, because the check is "is there a TypeOptions
@@ -286,7 +296,8 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
               chapter_images: bool = False, trickplay: bool = False,
               replace: bool = False, scan: bool = True,
               media_root: str | None = None, still_alive=None,
-              say=print) -> dict:
+              live_tv_url: str | None = None, tuner_type: str = "m3u",
+              tuner_count: int = 0, say=_say) -> dict:
     """Set up a server from whatever state it is in. Safe to re-run."""
     say("Waiting for the server")
     info = jf.wait_until_up(still_alive=still_alive)
@@ -355,6 +366,20 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
 
     result = {"server": jf.base, "admin": admin, "password": password,
               "libraries": wanted, "accounts": created}
+
+    if live_tv_url:
+        say("Live TV")
+        result["live_tv"] = livetv.configure(
+            jf, live_tv_url, tuner_type=tuner_type, tuner_count=tuner_count,
+            replace=True, say=say)
+        say("  refreshing the guide")
+        # Channels do not exist until this runs, so a client pointed at the
+        # server before it finishes sees an empty Live TV section rather than
+        # a loading one.
+        done = livetv.refresh_guide(jf, say=say)
+        if not done:
+            say("  ! guide refresh did not finish in time")
+        result["live_tv"].update(livetv.summarise(jf, say=say))
 
     if scan:
         say("Scanning the library")

@@ -263,3 +263,108 @@ class TestContainer(unittest.TestCase):
                              "/a:/b:ro,z")
         finally:
             container.selinux_enabled = original
+
+
+class TestLiveTv(unittest.TestCase):
+    """faketvsource wiring. Needs neither a server nor faketvsource."""
+
+    def _fake(self, **kw):
+        from stdjflib import livetv
+
+        return livetv.FakeTv("/src", "/state", **kw)
+
+    def test_public_url_defaults_to_loopback(self):
+        self.assertEqual(self._fake().public_url, "http://127.0.0.1:8409")
+
+    def test_public_url_is_told_to_faketvsource(self):
+        """Without --public-url it builds stream URLs from the Host header,
+        which is not reachable from inside a container."""
+        fake = self._fake(public_host="host.containers.internal")
+        self.assertIn("--public-url", fake.argv())
+        self.assertIn("http://host.containers.internal:8409", fake.argv())
+        # We still health-check it over loopback; only the server needs the
+        # other name.
+        self.assertEqual(fake.local_url, "http://127.0.0.1:8409")
+
+    def test_no_public_url_flag_when_local(self):
+        self.assertNotIn("--public-url", self._fake().argv())
+
+    def test_tuner_count_is_passed_through(self):
+        """Zero is meaningful (unlimited), so it must not be dropped."""
+        for count in (0, 1, 4):
+            argv = self._fake(tuner_count=count).argv()
+            with self.subTest(count=count):
+                self.assertIn("--tuner-count", argv)
+                self.assertEqual(argv[argv.index("--tuner-count") + 1],
+                                 str(count))
+
+    def test_seed_is_passed_so_the_guide_is_stable(self):
+        self.assertIn("--seed", self._fake().argv())
+
+    def test_container_host_names_differ_by_runtime(self):
+        from stdjflib import container, livetv
+
+        for runtime in container.RUNTIMES:
+            with self.subTest(runtime):
+                self.assertIn(runtime, livetv.HOST_FROM_CONTAINER)
+        self.assertNotEqual(livetv.HOST_FROM_CONTAINER["podman"],
+                            livetv.HOST_FROM_CONTAINER["docker"])
+
+
+class _RecordingApi:
+    """Minimal stand-in for the API client, capturing what was posted."""
+
+    def __init__(self):
+        self.posted = []
+
+    def get(self, path, **kw):
+        return {}
+
+    def post(self, path, **kw):
+        self.posted.append((path, kw.get("body") or {}))
+        return {"Id": "x"}
+
+    def request(self, *args, **kw):
+        return None
+
+    def body(self, path):
+        return next(b for p, b in self.posted if p == path)
+
+
+class TestLiveTvConfigure(unittest.TestCase):
+    def _configure(self, tuner_type):
+        from stdjflib import livetv
+
+        api = _RecordingApi()
+        livetv.configure(api, "http://h:8409", tuner_type=tuner_type,
+                         say=lambda *_: None)
+        return api
+
+    def test_tuner_url_differs_by_type(self):
+        """HDHomeRun discovers from the base URL; M3U wants the playlist."""
+        for tuner_type, expected in (("m3u", "http://h:8409/playlist.m3u"),
+                                     ("hdhomerun", "http://h:8409")):
+            tuner = self._configure(tuner_type).body("/LiveTv/TunerHosts")
+            with self.subTest(tuner_type):
+                self.assertEqual(tuner["Url"], expected)
+                self.assertEqual(tuner["Type"], tuner_type)
+
+    def test_guide_always_points_at_the_xml(self):
+        listings = self._configure("hdhomerun").body("/LiveTv/ListingProviders")
+        self.assertEqual(listings["Type"], "xmltv")
+        self.assertEqual(listings["Path"], "http://h:8409/guide.xml")
+
+    def test_category_keywords_are_supplied(self):
+        """Jellyfin keyword-matches these to set IsNews/IsSports/IsKids/
+        IsMovie; leaving them to chance leaves those flags to chance."""
+        listings = self._configure("m3u").body("/LiveTv/ListingProviders")
+        for key in ("NewsCategories", "SportsCategories", "KidsCategories",
+                    "MovieCategories"):
+            with self.subTest(key):
+                self.assertTrue(listings[key])
+
+    def test_rejects_an_unknown_tuner_type(self):
+        from stdjflib import livetv
+
+        with self.assertRaises(ValueError):
+            livetv.configure(None, "http://h", tuner_type="satellite")

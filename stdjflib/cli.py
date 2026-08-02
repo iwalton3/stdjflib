@@ -9,7 +9,7 @@ import sys
 import time
 
 from . import (build, catalog, config, container, fetch, ff, jfserver,
-               provision, recipes, verify)
+               livetv, provision, recipes, verify)
 from .jfapi import Jellyfin
 
 DEFAULT_ROOT = os.environ.get("STDJFLIB_ROOT", "")
@@ -93,6 +93,21 @@ def _parser() -> argparse.ArgumentParser:
                         help="the name the server reports")
         sp.add_argument("-v", "--verbose", action="store_true",
                         help="show the build output")
+        sp.add_argument("--live-tv", action="store_true",
+                        help="also run faketvsource and wire it up as a tuner, "
+                             "so the client's Live TV screens become testable")
+        sp.add_argument("--tuner-type", choices=livetv.TUNER_TYPES,
+                        default="m3u",
+                        help="M3U and HDHomeRun are separate code paths in "
+                             "Jellyfin, so they are worth testing separately "
+                             "(default: m3u)")
+        sp.add_argument("--tuner-count", type=int, default=0, metavar="N",
+                        help="simulated tuner limit; tune more channels than "
+                             "this and the source answers 503, like a real "
+                             "tuner out of capacity (0 = unlimited)")
+        sp.add_argument("--faketv-source", default=None,
+                        help="path to a faketvsource checkout")
+        sp.add_argument("--faketv-port", type=int, default=livetv.DEFAULT_PORT)
         return sp
 
     s = server_args(sub.add_parser(
@@ -117,6 +132,10 @@ def _parser() -> argparse.ArgumentParser:
         "provision", help="set up an already-running Jellyfin server"))
     pr.add_argument("--server", default="http://127.0.0.1:8096",
                     help="base URL of the running server")
+    pr.add_argument("--live-tv-host", default=None, metavar="HOST",
+                    help="hostname or IP the *server* should use to reach "
+                         "faketvsource running here (default: 127.0.0.1, "
+                         "which only works when the server is on this machine)")
     pr.add_argument("--media-root", default=None,
                     help="path the *server* sees the library at, when that "
                          "differs from this machine's (containers, remote mounts)")
@@ -326,6 +345,33 @@ def main(argv=None) -> int:
         return 130
 
 
+def _start_faketv(args, state: str, public_host: str | None):
+    """Start faketvsource, or explain why it cannot be started.
+
+    Returns (instance, url_for_the_server) or (None, None).
+    """
+    if not getattr(args, "live_tv", False):
+        return None, None
+    source = livetv.find_source(args.faketv_source)
+    if not source:
+        raise RuntimeError(
+            "--live-tv needs a faketvsource checkout; none found. "
+            "Pass --faketv-source /path/to/faketvsource.")
+    if not livetv.has_ffmpeg():
+        raise RuntimeError("--live-tv needs ffmpeg on PATH")
+
+    fake = livetv.FakeTv(source, state, port=args.faketv_port,
+                         tuner_count=args.tuner_count,
+                         public_host=public_host, verbose=args.verbose)
+    print(f"Starting faketvsource from {source}", flush=True)
+    fake.start()
+    channels = fake.wait_until_up()
+    print(f"  {channels} channels on {fake.public_url}"
+          f"{'' if public_host is None else ' (as the server sees it)'}",
+          flush=True)
+    return fake, fake.public_url
+
+
 def _provision_kwargs(args) -> dict:
     return {
         "password": args.password,
@@ -334,16 +380,39 @@ def _provision_kwargs(args) -> dict:
         "replace": args.replace_libraries,
         "scan": not args.no_scan,
         "server_name": args.server_name,
+        "tuner_type": args.tuner_type,
+        "tuner_count": args.tuner_count,
     }
 
 
 def cmd_provision(args) -> int:
     root = os.path.abspath(args.root)
-    jf = Jellyfin(args.server)
-    provision.provision(jf, root, media_root=args.media_root,
-                        **_provision_kwargs(args))
-    _print_connection(args.server, args.password)
-    return 0
+    state = os.path.join(root, config.STATE_DIR, "faketv")
+    fake = None
+    try:
+        # A server elsewhere cannot reach 127.0.0.1 here, so make the operator
+        # say how it should reach us rather than guessing wrong and producing
+        # a tuner that saves fine and never plays.
+        fake, url = _start_faketv(args, state, args.live_tv_host)
+        jf = Jellyfin(args.server)
+        provision.provision(jf, root, media_root=args.media_root,
+                            live_tv_url=url, **_provision_kwargs(args))
+        _print_connection(args.server, args.password)
+        if fake:
+            print(f"\nfaketvsource is running as long as this command is.")
+            print("  Ctrl-C to stop it.")
+            try:
+                while fake.alive():
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("\nStopping.")
+        return 0
+    except RuntimeError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 1
+    finally:
+        if fake:
+            fake.stop()
 
 
 def cmd_serve(args) -> int:
@@ -396,10 +465,15 @@ def cmd_serve(args) -> int:
               "only if you want the browser UI)")
     instance.start()
 
+    fake = None
     try:
+        # Both processes are on this machine, so loopback is what the server
+        # should use.
+        fake, live_tv_url = _start_faketv(args, state, None)
         jf = Jellyfin(instance.url)
         try:
             provision.provision(jf, root, still_alive=instance.alive,
+                                live_tv_url=live_tv_url,
                                 **_provision_kwargs(args))
         except Exception:
             if not instance.alive():
@@ -419,10 +493,15 @@ def cmd_serve(args) -> int:
         print("\nThe server exited on its own. Last of its log:\n")
         print(instance.log_tail())
         return 1
+    except RuntimeError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         print("\nStopping.")
         return 0
     finally:
+        if fake:
+            fake.stop()
         instance.stop()
 
 
@@ -496,12 +575,19 @@ def cmd_container(args) -> int:
         print(f"\n{exc}", file=sys.stderr)
         return 1
 
+    fake = None
     try:
+        # faketvsource runs on the host; inside the container, 127.0.0.1 is the
+        # container itself. Podman and Docker each publish a different name for
+        # "the host", and neither resolves outside a container.
+        fake, live_tv_url = _start_faketv(
+            args, state, livetv.HOST_FROM_CONTAINER.get(runtime))
         jf = Jellyfin(box.url)
         try:
             # The server must be told its own path to the media, not ours.
             provision.provision(jf, root, media_root=box.media_root,
                                 still_alive=box.alive,
+                                live_tv_url=live_tv_url,
                                 **_provision_kwargs(args))
         except Exception:
             if not box.alive():
@@ -515,6 +601,14 @@ def cmd_container(args) -> int:
             print(f"\nContainer {box.name} left running.")
             print(f"  logs  {runtime} logs -f {box.name}")
             print(f"  stop  ./stdjflib.py container-stop --runtime {runtime}")
+            if fake:
+                # Left running deliberately: killing it here would leave the
+                # container pointing at a tuner that no longer answers, which
+                # looks like a broken tuner rather than a stopped one.
+                print(f"  faketvsource left running on {fake.public_url}"
+                      f" (pid {fake.process.pid})")
+                print(f"  stop  kill {fake.process.pid}")
+                fake = None
             return 0
         print(f"\nFollowing {box.name}. Ctrl-C to stop and remove it.")
         while box.alive():
@@ -522,10 +616,15 @@ def cmd_container(args) -> int:
         print("\nThe container exited. Last of its log:\n")
         print(box.logs())
         return 1
+    except RuntimeError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         print("\nStopping.")
         return 0
     finally:
+        if fake:
+            fake.stop()
         if not args.keep_running:
             box.stop()
             box.remove()

@@ -234,6 +234,45 @@ daemon's mount namespace. If the check fails, build a library on local disk
 (`stdjflib build /var/tmp/qa --tier minimal --bulk 30` takes about 40 seconds)
 and point at that instead.
 
+### Live TV (optional)
+
+```sh
+./stdjflib.py serve /srv/qa-library --live-tv
+./stdjflib.py serve /srv/qa-library --live-tv --tuner-type hdhomerun
+./stdjflib.py container /srv/qa-library --live-tv --tuner-count 2
+```
+
+Off by default. With `--live-tv` the run also starts faketvsource and wires it
+in as a tuner plus an XMLTV guide, then refreshes the listings and waits — six
+channels and around 970 programmes. It needs a faketvsource checkout
+(`--faketv-source`; found automatically at `~/Desktop/faketvsource`) and
+ffmpeg, and adds no other dependency.
+
+This reaches a large part of a client that a media library cannot touch at
+all: guide grids, channel logos, now/next, timers and recordings. It is also
+what makes `qa-kid` meaningful — that account has Live TV access revoked,
+which tests nothing until there is Live TV to be denied.
+
+**`--tuner-type` matters.** M3U and HDHomeRun are separate tuner host
+implementations in Jellyfin, with separate discovery and separate stream URLs,
+so testing one says nothing about the other. Both are verified working.
+
+**`--tuner-count N`** caps the simulated tuners, so tuning more channels than
+that returns `503` — the same answer a real tuner out of capacity gives.
+
+Two things are handled that otherwise fail quietly:
+
+- **A containerised server cannot reach `127.0.0.1`.** That address is the
+  container, not the host running faketvsource. The tuner URL becomes
+  `host.containers.internal` under podman or `host.docker.internal` under
+  Docker, *and* faketvsource is started with `--public-url` so the stream URLs
+  inside the playlist are rewritten to match. Getting only the first half right
+  gives a tuner that saves cleanly, lists all six channels, and plays none of
+  them.
+- **A server elsewhere has to be told how to reach this machine**, which is
+  what `provision --live-tv-host` is for. The `127.0.0.1` default is correct
+  only when the server is local.
+
 ### The test accounts
 
 Twelve, each reaching a client path that is otherwise tedious to set up by
@@ -332,7 +371,7 @@ be checked mechanically. A QA library is not worth a copyright argument.
 python3 -m unittest discover -s tests -t .
 ```
 
-102 tests, well under a second, no ffmpeg or server required. They cover the matrix's
+112 tests, well under a second, needing no ffmpeg, server or container runtime. They cover the matrix's
 internal consistency, the licence rules, NFO output and determinism, ffmpeg
 argument assembly, and the VobSub encoder — including a round-trip of the RLE
 against an independent reference decoder written in the test, which is the only
