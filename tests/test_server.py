@@ -108,6 +108,28 @@ class TestAccounts(unittest.TestCase):
         self.assertTrue(first["policy"].get("IsAdministrator"))
         self.assertTrue(first["password"])
 
+    def test_the_admin_policy_only_grants(self):
+        """ACCOUNTS[0]'s policy is applied to the account we are signed in as.
+
+        Which is safe in exactly one direction. `UpdatePolicyAsync` writes
+        permissions and revokes no session, so a policy that only ever grants
+        cannot lock the provisioner out — but one that takes a right away, or
+        sets `IsDisabled`, would break the Live TV setup and the library scan
+        that run after it, and the failure would surface somewhere unrelated.
+
+        So: no `False` anywhere in ACCOUNTS[0]. Turning something off for the
+        admin is not a thing this fixture should want, and the one place it
+        would be tempting — trimming a permission to model a restricted
+        administrator — is what the other eleven accounts are for.
+        """
+        policy = provision.ACCOUNTS[0]["policy"]
+        off = sorted(k for k, v in policy.items() if v is False)
+        self.assertEqual(
+            off, [],
+            "ACCOUNTS[0] is the account provision authenticates as; its "
+            "policy must only grant, and these switch something off: %s" % off)
+        self.assertNotIn("IsDisabled", policy)
+
     def test_every_account_explains_itself(self):
         for account in provision.ACCOUNTS:
             with self.subTest(account["name"]):

@@ -377,8 +377,8 @@ hand. Password `stdjflib` throughout, except where the point is not having one.
 
 | Account | What it makes reachable |
 | --- | --- |
-| `qa-admin` | administrator — dashboard, tasks, library management |
-| `qa-user` | everything allowed; the control |
+| `qa-admin` | administrator — everything allowed: dashboard, tasks, library management, recordings, deletion |
+| `qa-user` | everything a non-admin can have; the control. Includes recording management |
 | `qa-nopassword` | no password at all, as home setups often have |
 | `qa-restricted` | only Movies and Shows; the rest must be *absent*, not merely unplayable |
 | `qa-notranscode` | transcoding and remuxing refused — finds the spinner where an error belongs |

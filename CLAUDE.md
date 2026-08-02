@@ -319,3 +319,41 @@ Points that were not obvious:
   completeness is checked against the `Content-Length` of the actual request.
   Treating a recorded size as a checksum makes the tool fail whenever a mirror
   re-encodes something by a few hundred bytes, which is not corruption.
+
+## User policies, and the two sets of defaults
+
+`jfapi.default_policy()` sends a **full** policy object because `set_policy`
+is a replacement, not a patch — anything omitted is blanked. Its values mirror
+`UserEntityExtensions.AddDefaultPermissions` in the server, which is what a
+newly created user actually gets.
+
+**There is a second set of defaults and it disagrees.** The `UserPolicy` DTO
+constructor has its own values, and both are live on different paths: the DTO's
+apply to accounts *migrated* from an older install, because `MigrateUserDb`
+deserializes the old policy file into a `UserPolicy` and any field absent from
+it keeps the constructor's value. So the answer to "what is the default" is
+"which user are you asking about".
+
+`EnableLiveTvManagement` is where this bites: `true` for a migrated account,
+`false` for one created today, and there is **no administrator bypass** —
+`UserPermissionHandler` asks `HasPermission` and nothing else. A server built
+from nothing therefore has no account that can schedule a recording, so the
+entire DVR surface (timers, series rules, the Schedule screen) is unreachable
+and every client looks broken there in the same way. `qa-user` is granted it
+explicitly for that reason; every other account still lacks it, which is a
+state a client has to render too.
+
+**`ACCOUNTS[0]` is the account the provisioner is signed in as**, and its
+policy *is* applied — which is safe in exactly one direction. `UpdatePolicyAsync`
+writes permissions and revokes no session, so a policy that only ever grants
+cannot lock the run out; one that takes a right away, or sets `IsDisabled`,
+would break the Live TV setup and the scan that follow, and would surface as a
+failure somewhere unrelated. `test_the_admin_policy_only_grants` forbids any
+`False` there, and `provision` re-authenticates if the session does not survive.
+
+It carries every management permission on purpose. The wizard makes the first
+user an administrator and nothing more — `IsAdministrator` is its own
+permission and gates none of the others — so without them qa-admin could not
+delete an item, manage a collection or schedule a recording. An earlier version
+of this entry declared four of them while `provision` skipped the account
+entirely, so they were never sent and only read as though they had been.

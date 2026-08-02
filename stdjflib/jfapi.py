@@ -226,14 +226,41 @@ class Jellyfin:
                   expect_json=False)
 
     def default_policy(self) -> dict:
-        """A full policy object, so a partial update cannot blank a field."""
+        """A full policy object, so a partial update cannot blank a field.
+
+        These mirror `UserEntityExtensions.AddDefaultPermissions`, which is
+        what the server stores when a user is *created*.
+
+        There is a second set of defaults in the `UserPolicy` DTO constructor
+        and it disagrees on several fields, so it is worth knowing which one
+        answers your question. Both are live, on different paths: the DTO's
+        apply to accounts **migrated** from an older Jellyfin, because
+        `MigrateUserDb` deserializes the old policy into a `UserPolicy` and
+        anything absent from the file keeps the constructor's value.
+        `EnableLiveTvManagement` is the sharpest case — `true` for a migrated
+        account, `false` for one created today. Users who have carried an
+        install forward have it and never had to ask for it; a server built
+        from nothing does not. New users are what this function is for, so
+        the entity is the one to copy.
+
+        One deliberate departure: `IsHidden`. New users are hidden by default
+        and every account here has to be selectable from the login list —
+        which is also what makes `qa-hidden` mean something.
+        """
         return {
             "IsAdministrator": False,
+            # Not AddDefaultPermissions' value (True); see the note above.
             "IsHidden": False,
             "IsDisabled": False,
             "EnableUserPreferenceAccess": True,
             "EnableRemoteAccess": True,
             "EnableLiveTvAccess": True,
+            # Off for a brand-new user on a stock server, admins included:
+            # AddDefaultPermissions stores false and there is no
+            # administrator bypass — UserPermissionHandler asks
+            # HasPermission and nothing else. So the whole DVR surface
+            # (timers, series rules, the Schedule screen) is unreachable
+            # until someone grants this, which is why qa-user has it.
             "EnableLiveTvManagement": False,
             "EnableMediaPlayback": True,
             "EnableAudioPlaybackTranscoding": True,
@@ -242,7 +269,7 @@ class Jellyfin:
             "EnableContentDeletion": False,
             "EnableContentDownloading": True,
             "EnableSyncTranscoding": True,
-            "EnableMediaConversion": False,
+            "EnableMediaConversion": True,
             "EnableAllDevices": True,
             "EnableAllChannels": True,
             "EnableAllFolders": True,
@@ -251,7 +278,9 @@ class Jellyfin:
             "EnableSubtitleManagement": False,
             "EnableRemoteControlOfOtherUsers": False,
             "EnableSharedDeviceControl": True,
-            "EnablePublicSharing": False,
+            "ForceRemoteSourceTranscoding": False,
+            "EnableLyricManagement": False,
+            "EnablePublicSharing": True,
             "InvalidLoginAttemptCount": 0,
             "LoginAttemptsBeforeLockout": -1,
             "MaxActiveSessions": 0,

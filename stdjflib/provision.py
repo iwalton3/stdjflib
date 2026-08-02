@@ -61,17 +61,45 @@ ACCOUNTS = [
     {
         "name": "qa-admin",
         "password": DEFAULT_PASSWORD,
-        "why": "Administrator. Dashboard, scheduled tasks, library management.",
-        "policy": {"IsAdministrator": True, "EnableContentDeletion": True,
+        "why": ("Administrator, created by the first-run wizard. Everything "
+                "allowed: dashboard, scheduled tasks, library management, "
+                "recordings, deletion."),
+        # Every management permission, because an administrator that cannot
+        # administer is a trap rather than a fixture. The wizard makes this
+        # account an admin and nothing more: `IsAdministrator` is its own
+        # permission and gates none of the others, and there is no bypass
+        # anywhere — UserPermissionHandler asks HasPermission and stops. So
+        # without these, qa-admin could not delete an item, manage a
+        # collection or schedule a recording.
+        #
+        # This policy IS applied, unlike every previous version of this entry,
+        # which declared four of these and had them silently dropped. Safe
+        # because it only ever grants: UpdatePolicyAsync writes permissions
+        # and revokes no session, so the one thing that could lock the
+        # provisioner out mid-run is a policy that takes rights away or sets
+        # IsDisabled. Keep it a superset. The guard below re-authenticates
+        # anyway if the session does not survive.
+        "policy": {"IsAdministrator": True,
+                   "EnableContentDeletion": True,
                    "EnableCollectionManagement": True,
                    "EnableSubtitleManagement": True,
-                   "EnableRemoteControlOfOtherUsers": True},
+                   "EnableLyricManagement": True,
+                   "EnableLiveTvManagement": True,
+                   "EnableRemoteControlOfOtherUsers": True,
+                   "EnableMediaConversion": True},
     },
     {
         "name": "qa-user",
         "password": DEFAULT_PASSWORD,
-        "why": "An ordinary user with everything allowed. The control.",
-        "policy": {},
+        "why": ("An ordinary user with everything a non-admin can have. The "
+                "control, and the non-admin that can manage recordings."),
+        # "Everything allowed" has to include this or it is not the control.
+        # EnableLiveTvManagement is a third Live TV permission, separate from
+        # EnableLiveTvAccess, and a new user does not get it — so without this
+        # no account on the server could schedule a recording and the entire
+        # DVR surface was unreachable for every client. Every other account
+        # still lacks it, which is the state a client has to render too.
+        "policy": {"EnableLiveTvManagement": True},
     },
     {
         "name": "qa-nopassword",
@@ -355,14 +383,22 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
             policy["EnabledFolders"] = [folder_ids[f]
                                         for f in account["folders"]
                                         if f in folder_ids]
-        # The admin account is the one we are authenticated as; taking its
-        # rights away mid-run would end the session and the rest of the setup.
-        if name != admin:
-            jf.set_policy(user["Id"], policy)
+        jf.set_policy(user["Id"], policy)
         pw = account["password"] or "(no password)"
         say(f"  {name:16} {pw:12} {account['why'].splitlines()[0]}")
         created.append({"name": name, "password": account["password"],
                         "id": user["Id"], "why": account["why"]})
+
+    # We just rewrote the policy of the account we are signed in as. Nothing in
+    # UpdatePolicyAsync revokes a session, and ACCOUNTS[0]'s policy only ever
+    # grants — but everything after this point (Live TV, the scan) needs the
+    # token, and a cheap authenticated call is a better way to find out than
+    # the next real request failing somewhere unrelated.
+    try:
+        jf.get("/System/Info")
+    except ApiError:
+        say("  (admin session did not survive its own policy; signing in again)")
+        jf.login(admin, password)
 
     result = {"server": jf.base, "admin": admin, "password": password,
               "libraries": wanted, "accounts": created}
