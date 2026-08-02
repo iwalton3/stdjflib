@@ -1073,7 +1073,7 @@ def build_bulk_movies(root: str, cfg) -> list[dict]:
             # One in eight ships without a poster, on purpose.
             if i % 8:
                 artwork.folder_images(folder, meta["key"], meta["title"], cfg,
-                                      kinds=("poster",),
+                                      kinds=("poster",), seq=i,
                                       subtitle=str(meta["year"]))
             return {"library": "Bulk Movies", "key": meta["key"], "path": media}
         return run
@@ -1112,7 +1112,7 @@ def build_bulk_shows(root: str, cfg) -> list[dict]:
                            year=meta["year"], rating=meta["rating"],
                            tags=["stdjflib", "bulk"])
                 artwork.folder_images(folder, meta["key"], meta["title"], cfg,
-                                      kinds=("poster", "backdrop"))
+                                      kinds=("poster", "backdrop"), seq=index)
             # Long shows split across seasons of 24, so season lists get big too.
             for n in range(1, episodes + 1):
                 season_no = (n - 1) // 24 + 1
@@ -1135,7 +1135,7 @@ def build_bulk_shows(root: str, cfg) -> list[dict]:
                 if n % 4 == 0:
                     artwork.sidecar_images(
                         media, ep_key, f"Episode {ep_no}", cfg,
-                        kinds=("thumb",),
+                        kinds=("thumb",), seq=index + n,
                         subtitle=f"S{season_no:02d}E{ep_no:02d}")
                 out.append({"library": "Bulk Shows", "key": ep_key,
                             "path": media})
@@ -1165,7 +1165,8 @@ def build_bulk_music(root: str, cfg) -> list[dict]:
                                      f"{safe} ({meta['year']})")
             if not cfg.dry_run and index % 6:
                 artwork.folder_images(album_dir, meta["key"], meta["title"],
-                                      cfg, kinds=("square",), subtitle=artist)
+                                      cfg, kinds=("square",), seq=index,
+                                      subtitle=artist)
             count = min(per_album, cfg.bulk - index * per_album)
             for n in range(1, count + 1):
                 path = os.path.join(album_dir, f"{n:02d} - Track {n}.mp3")
@@ -1229,7 +1230,11 @@ def build_bulk_photos(root: str, cfg) -> list[dict]:
             # ratio of what is in it, and a library that is all one shape
             # never exercises that.
             if not artwork.draw("photo", meta["key"], meta["title"], path, cfg,
-                                subtitle=f"photo {i:05d}",
+                                subtitle=f"photo {i:05d}", seq=i,
+                                # A real photograph is the item; a label
+                                # written across it would only say the
+                                # filename again.
+                                text=not cfg.use_artwork,
                                 size=BULK_PHOTO_SHAPES[i % len(BULK_PHOTO_SHAPES)]):
                 return None
             return {"library": "Bulk Photos", "key": meta["key"], "path": path}

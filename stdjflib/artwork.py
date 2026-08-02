@@ -45,7 +45,7 @@ import tempfile
 import textwrap
 import threading
 
-from . import ff
+from . import ff, photos
 
 # How many images this process has drawn. `stdjflib artwork` reports it, and
 # it is the only number that run says anything about — every builder runs, so
@@ -277,11 +277,25 @@ def _box(x, y, w, h, colour: str, alpha: float = 1.0) -> str:
 
 
 def _text(body_file: str | None, literal: str | None, *, font: str,
-          colour: str, size: int, x: str, y: str, spacing: int = 0) -> str:
+          colour: str, size: int, x: str, y: str, spacing: int = 0,
+          shadow: int = 0) -> str:
+    """One drawtext. `shadow` adds the treatment subtitles use over video.
+
+    A photograph is not a background a fixed colour of text can survive:
+    the next picture along is a snowfield. Darkening the picture until white
+    text works is the obvious fix and the wrong one — it reads as a grey
+    rectangle laid over a photo, which is what it is. A drop shadow plus a
+    hairline outline keeps the photograph at full strength and is what every
+    subtitle renderer does for the same problem.
+    """
     source = (f"textfile='{body_file}'" if body_file
               else f"text='{ff.escape_drawtext(literal or '')}'")
-    return (f"drawtext={source}:fontfile='{font}':fontcolor={colour}"
-            f":fontsize={size}:x={x}:y={y}:line_spacing={spacing}")
+    out = (f"drawtext={source}:fontfile='{font}':fontcolor={colour}"
+           f":fontsize={size}:x={x}:y={y}:line_spacing={spacing}")
+    if shadow:
+        out += (f":shadowcolor=black@0.75:shadowx={shadow}:shadowy={shadow}"
+                f":borderw={max(1, shadow // 2)}:bordercolor=black@0.45")
+    return out
 
 
 def _decor(kind: str, w: int, h: int, accent: str) -> list[str]:
@@ -327,6 +341,59 @@ def _decor(kind: str, w: int, h: int, accent: str) -> list[str]:
     return []
 
 
+def _ramp(w: int, top: float, bottom: float, a0: float, a1: float,
+          steps: int = 24) -> list[str]:
+    """A vertical fade in black, as a stack of thin boxes.
+
+    ffmpeg has no gradient-fill filter that composites onto an existing frame,
+    and a hard-edged rectangle of 40% black over a photograph reads as exactly
+    what it is: a rectangle.
+
+    Two things make the stack read as a gradient rather than as stripes. The
+    slices must **tile exactly** — an overlap of even one pixel is painted
+    twice and shows up as a dark line at every boundary, which is worse than
+    the hard edge being avoided. And there have to be enough of them that one
+    step is invisible: 24 across a 0.45 fade is a step of 5/255, under the
+    threshold at which JPEG's own blocking is more noticeable.
+    """
+    top, bottom = int(top), int(bottom)
+    if bottom <= top:
+        return []
+    edges = [top + round((bottom - top) * i / steps) for i in range(steps + 1)]
+    return [_box(0, edges[i], w, edges[i + 1] - edges[i], "000000",
+                 round(a0 + (a1 - a0) * (i / max(1, steps - 1)), 3))
+            for i in range(steps) if edges[i + 1] > edges[i]]
+
+
+def _scrim(kind: str, w: int, h: int) -> list[str]:
+    """Darkening laid over a photograph so white text stays readable on it.
+
+    Not a flat wash over the whole picture — that is what makes an overlay
+    look like an overlay. A light overall knock-back, then a gradient behind
+    the text, which is what a real poster does; most of the photograph is left
+    at full strength.
+
+    It has to hold for *every* photograph, not the one being looked at. The
+    next picture along is a snowfield, and white text on a snowfield with no
+    scrim is invisible.
+    """
+    if kind == "photo":
+        # Content, not artwork: the photograph is the item. Nothing on top.
+        return []
+    if kind == "banner":
+        # 185px tall and almost entirely text, so this one is a wash — there
+        # is no room for a gradient and nothing much of the picture to lose.
+        return [_box(0, 0, w, h, "000000", 0.40)]
+    if kind == "backdrop":
+        # A backdrop is displayed *behind* a client's own UI, and every one of
+        # them darkens the bottom for its own text. Matching that is honest
+        # about what the image is for, and it is where the title sits.
+        return _ramp(w, h * 0.55, h, 0.0, 0.55)
+    # Everything else leans on the text's own shadow. A light wash only, to
+    # take the edge off a blown-out sky without flattening the picture.
+    return [_box(0, 0, w, h, "000000", 0.12)]
+
+
 def _title_position(kind: str, w: int, h: int, size: int) -> tuple[str, str]:
     """Where the title goes, per kind, as ffmpeg x/y expressions."""
     if kind == "backdrop":
@@ -358,12 +425,17 @@ def _stamp_position(kind: str, w: int, h: int, tag: int) -> tuple[str, str]:
 
 def draw(kind: str, key: str, title: str, out_path: str, cfg, *,
          style: str | None = None, subtitle: str = "",
-         size: tuple[int, int] | None = None, stamp: bool = True) -> str | None:
+         size: tuple[int, int] | None = None, stamp: bool = True,
+         seq: int | None = None, text: bool = True) -> str | None:
     """Render one image. Returns the path, or None if it could not be drawn.
 
     `size` overrides the spec's dimensions, which only photos use — a photo
     library wants a spread of shapes, because a client picks its row layout
     from the median of them.
+
+    `seq` is the item's position in its library. Under `--use-artwork` it
+    decides which photograph backs the image, and position rather than hash is
+    what keeps a screenful free of repeats.
     """
     if kind not in SPECS:
         raise ValueError(f"unknown artwork kind {kind!r}")
@@ -391,8 +463,21 @@ def draw(kind: str, key: str, title: str, out_path: str, cfg, *,
     # A wordmark drawn "solid" still gets a background; that is the one style
     # in four where a client cannot fail on compositing.
     opaque = spec.mode != "wordmark" or style == "solid"
+
+    # A photograph replaces the drawn background, never the wordmarks: a logo
+    # is ink on nothing, and a photograph of a logo is not a logo.
+    photo = None
+    if opaque and spec.mode != "wordmark" and getattr(cfg, "use_artwork", False):
+        photo = photos.pick(cfg, seq, key)
+
     base = (_background(key, width, height, bg, deep, cfg) if opaque
             else f"color=c=black@0:s={width}x{height}:d=1")
+    if photo:
+        # Cover, not fit: `increase` then crop is what every client does to
+        # artwork, and doing it here means the shape on disk is already the
+        # shape that is wanted.
+        base = (f"[0:v]scale={width}:{height}"
+                f":force_original_aspect_ratio=increase,crop={width}:{height}")
 
     workdir = tempfile.mkdtemp(prefix="stdjflib-art-")
     tmp = ff.temp_path(out_path)
@@ -406,28 +491,41 @@ def draw(kind: str, key: str, title: str, out_path: str, cfg, *,
         x, y = _title_position(kind, width, height, title_size)
 
         chain = [base]
-        if opaque:
+        if photo:
+            # A photograph is not a background until something makes the text
+            # survivable on it — the next picture along is a snowfield.
+            chain += _scrim(kind, width, height)
+        elif opaque:
             chain += _decor(kind, width, height, accent)
             # Before the text, so the corners darken and the title does not.
             if ff.has_filter(cfg.ffmpeg, "vignette"):
                 chain.append("vignette=angle=PI/4.2")
-        chain.append(_text(body, None, font=font, colour=ink, size=title_size,
-                           x=x, y=y, spacing=title_size // 5))
+        # Sized off the type: a shadow that reads on a 1500px poster is a
+        # smear on a 185px banner.
+        shadow = max(2, title_size // 12) if photo else 0
+        if text:
+            chain.append(_text(body, None, font=font, colour=ink,
+                               size=title_size, x=x, y=y,
+                               spacing=title_size // 5, shadow=shadow))
 
-        if subtitle and kind not in ("logo", "art", "disc"):
+        if text and subtitle and kind not in ("logo", "art", "disc"):
             small = max(12, title_size // 3)
             sub_y = (f"h-{int(height * 0.16)}" if kind == "backdrop"
                      else f"h-{small * 3}")
             sub_x = (f"{int(width * 0.05)}" if kind == "backdrop"
                      else "(w-text_w)/2")
             chain.append(_text(None, subtitle, font=font,
-                               colour="white@0.75" if opaque else ink,
-                               size=small, x=sub_x, y=sub_y))
+                               colour="white@0.9" if photo else
+                               ("white@0.75" if opaque else ink),
+                               size=small, x=sub_x, y=sub_y,
+                               shadow=max(1, small // 10) if photo else 0))
 
         # The stamp is what makes a misplaced image obvious at a glance: the
         # picture says which type it is and what shape a client should have
         # laid it out at.
-        if stamp and kind != "photo":
+        # Off under --use-artwork: the whole point there is a library that
+        # photographs like a library, and a wall of "POSTER 2:3" does not.
+        if stamp and kind != "photo" and not photo:
             tag = max(11, int(height * 0.040))
             stamp_x, stamp_y = _stamp_position(kind, width, height, tag)
             chain.append(_text(None, f"{kind.upper()} {spec.ratio}", font=font,
@@ -457,9 +555,11 @@ def draw(kind: str, key: str, title: str, out_path: str, cfg, *,
         with open(graph, "w", encoding="utf-8") as fh:
             fh.write(",".join(chain) + "[vout]\n")
 
-        argv = [cfg.ffmpeg, "-hide_banner", "-nostdin", "-y",
-                "-filter_complex_script", graph, "-map", "[vout]",
-                "-frames:v", "1"]
+        argv = [cfg.ffmpeg, "-hide_banner", "-nostdin", "-y"]
+        if photo:
+            argv += ["-i", photo]
+        argv += ["-filter_complex_script", graph, "-map", "[vout]",
+                 "-frames:v", "1"]
         argv += ["-pix_fmt", "rgba"] if spec.transparent else ["-q:v", "4"]
         argv += [tmp]
 
@@ -480,12 +580,13 @@ def draw(kind: str, key: str, title: str, out_path: str, cfg, *,
 
 def folder_images(folder: str, key: str, title: str, cfg, *,
                   kinds: tuple[str, ...] = SETS["movie"],
-                  subtitle: str = "", logo_style: str | None = None) -> list[str]:
+                  subtitle: str = "", logo_style: str | None = None,
+                  seq: int | None = None) -> list[str]:
     """The image set for an item that owns a folder: `poster.jpg` and friends."""
     written = []
     for kind in kinds:
         got = draw(kind, key, title, os.path.join(folder, filename(kind)), cfg,
-                   style=logo_style, subtitle=subtitle)
+                   style=logo_style, subtitle=subtitle, seq=seq)
         if got:
             written.append(got)
     return written
@@ -493,7 +594,8 @@ def folder_images(folder: str, key: str, title: str, cfg, *,
 
 def sidecar_images(media_path: str, key: str, title: str, cfg, *,
                    kinds: tuple[str, ...] = SETS["movie"],
-                   subtitle: str = "", logo_style: str | None = None) -> list[str]:
+                   subtitle: str = "", logo_style: str | None = None,
+                   seq: int | None = None) -> list[str]:
     """The image set for an item that is a loose file: `<name>-poster.jpg`.
 
     The only shape available to an item sharing a folder with others, and the
@@ -505,7 +607,7 @@ def sidecar_images(media_path: str, key: str, title: str, cfg, *,
     for kind in kinds:
         got = draw(kind, key, title,
                    os.path.join(folder, sidecar_name(stem, kind)), cfg,
-                   style=logo_style, subtitle=subtitle)
+                   style=logo_style, subtitle=subtitle, seq=seq)
         if got:
             written.append(got)
     return written
@@ -513,7 +615,7 @@ def sidecar_images(media_path: str, key: str, title: str, cfg, *,
 
 def season_images(series_folder: str, season_no: int, key: str, title: str,
                   cfg, *, kinds: tuple[str, ...] = SETS["season"],
-                  subtitle: str = "") -> list[str]:
+                  subtitle: str = "", seq: int | None = None) -> list[str]:
     """Season artwork in the *series* folder, which is where Jellyfin looks first.
 
     The other spelling — `Season 01/poster.jpg` — also resolves, and both are
@@ -526,7 +628,7 @@ def season_images(series_folder: str, season_no: int, key: str, title: str,
             continue
         got = draw(kind, key, title,
                    os.path.join(series_folder, season_name(season_no, kind)),
-                   cfg, subtitle=subtitle)
+                   cfg, subtitle=subtitle, seq=seq)
         if got:
             written.append(got)
     return written

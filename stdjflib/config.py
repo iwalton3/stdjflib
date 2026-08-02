@@ -130,6 +130,10 @@ class BuildConfig:
     # including image types added since the library was built, which a pass
     # over the files on disk could never discover.
     artwork_only: bool = False
+    # Back the artwork with photographs instead of drawn shapes, so the
+    # library photographs like a real one. Opt-in: it downloads, and it drops
+    # the type stamp that makes a misplaced image obvious. See `photos.py`.
+    use_artwork: bool = False
 
     def __post_init__(self):
         if self.tier not in TIERS:

@@ -7,8 +7,9 @@ failure shows up as an error anywhere.
 """
 
 import unittest
+from unittest import mock
 
-from stdjflib import artwork, libraries, verify
+from stdjflib import artwork, config, libraries, photos, verify
 
 
 class TestSpecs(unittest.TestCase):
@@ -147,6 +148,61 @@ class TestDeterminism(unittest.TestCase):
         self.assertGreater(len(ratios), 2)
         self.assertTrue(any(w < h for w, h in libraries.BULK_PHOTO_SHAPES),
                         "no portrait photos, so the median is never contested")
+
+
+class TestPhotoPool(unittest.TestCase):
+    """`--use-artwork`: which photograph backs which item."""
+
+    def setUp(self):
+        self.cfg = config.BuildConfig(root="/tmp/nothing", use_artwork=True)
+        self.fake = tuple(f"/cache/artwork/p{i}.jpg" for i in range(40))
+        patch = mock.patch.object(photos, "pool", lambda cfg: self.fake)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_a_screenful_holds_no_repeats(self):
+        """The whole requirement, stated as a test.
+
+        Consecutive items get consecutive photographs, so a run shorter than
+        the pool cannot repeat one. A hash would collide instead: 40 items
+        drawn from 400 by hash repeat about 86% of the time.
+        """
+        picked = [photos.pick(self.cfg, i, f"item-{i}")
+                  for i in range(len(self.fake))]
+        self.assertEqual(len(set(picked)), len(self.fake))
+
+    def test_the_same_item_gets_the_same_photograph_every_build(self):
+        self.assertEqual(photos.pick(self.cfg, 7, "x"),
+                         photos.pick(self.cfg, 7, "x"))
+        self.assertEqual(photos.pick(self.cfg, None, "a-key"),
+                         photos.pick(self.cfg, None, "a-key"))
+
+    def test_an_item_with_no_index_still_gets_one(self):
+        """Fixtures have no natural position; they must not go unpainted."""
+        self.assertIn(photos.pick(self.cfg, None, "movie-extras"), self.fake)
+
+    def test_no_pool_means_no_photograph_not_a_crash(self):
+        with mock.patch.object(photos, "pool", lambda cfg: ()):
+            self.assertIsNone(photos.pick(self.cfg, 3, "x"))
+
+    def test_the_pool_is_sized_to_the_build(self):
+        minimal = config.BuildConfig(root="/tmp/x", tier="minimal")
+        full = config.BuildConfig(root="/tmp/x", tier="full")
+        bulky = config.BuildConfig(root="/tmp/x", tier="minimal", bulk=500)
+        self.assertLess(photos.wanted(minimal), photos.wanted(full))
+        # A screenful is a few dozen; even the smallest pool has room over.
+        self.assertGreater(photos.wanted(minimal), 100)
+        # Bulk is where the grids are, so bulk takes the lot whatever the tier.
+        self.assertEqual(photos.wanted(bulky), len(photos.PHOTOS))
+
+    def test_every_photograph_can_be_credited(self):
+        """The ids are pinned so they can be attributed, not just fetched."""
+        for ident, author, slug in photos.PHOTOS:
+            self.assertIsInstance(ident, int)
+            self.assertTrue(author.strip(), ident)
+            self.assertTrue(slug.strip(), ident)
+        self.assertEqual(len({p[0] for p in photos.PHOTOS}),
+                         len(photos.PHOTOS), "duplicate picsum ids")
 
 
 if __name__ == "__main__":

@@ -179,6 +179,45 @@ stays bit-identical to everyone else's.
 `stdjflib verify` re-probes the artwork too, and compares each image's actual
 shape against the type its filename claims.
 
+### Photographic artwork, for screenshots
+
+The drawn artwork is built to be *read*: every image says which type it is and
+what shape a client should have laid it out at. That is what you want when you
+are chasing a layout bug and exactly what you do not want in a screenshot — a
+wall of stamped colour blocks looks like a test fixture, because it is one.
+
+**`--use-artwork`** puts photographs behind the posters, backdrops, banners
+and covers instead, and takes the type stamp off. The text stays, over a drop
+shadow rather than a darkened picture, so the photograph keeps its full
+strength. A photo library becomes actual photographs with no label at all.
+
+```sh
+./stdjflib.py build /srv/qa-library --use-artwork      # at build time
+./stdjflib.py artwork /srv/qa-library --use-artwork    # or swap an existing one
+./stdjflib.py artwork /srv/qa-library --drawn-artwork  # and back again
+```
+
+400 photographs from [Lorem Picsum](https://picsum.photos), which serves
+photographs from Unsplash. The [Unsplash
+licence](https://unsplash.com/license) grants free use, commercial and not,
+with no permission required and no attribution obliged; the one thing it
+forbids is compiling the photos to replicate a competing photo service, which
+this is not. Every photographer is credited in `ATTRIBUTION.md` anyway, with a
+link to the original.
+
+Unlike the film catalogue, this does not pass through the licence gate —
+there is no per-image claim to check, only one blanket statement covering the
+service. Hence: off by default, named in the flag, and credited.
+
+The ids are pinned in `picsum.py` rather than fetched, so the same item gets
+the same picture on every build, and photographs are assigned **by position,
+not by hash** — consecutive items get consecutive photographs, so no screenful
+of thumbnails repeats one. (By hash, 40 items drawn from 400 would repeat
+about 86% of the time.) Up to ~105 MB, cached under `.stdjflib/cache/artwork/`,
+so a rebuild or a redraw needs no network. The minimal and standard tiers take
+a 150- and 250-photograph slice of it; anything with bulk libraries takes all
+400.
+
 ## The bulk libraries
 
 `--bulk N` builds six `Bulk *` libraries of roughly N items each — on by
@@ -429,7 +468,7 @@ be checked mechanically. A QA library is not worth a copyright argument.
 python3 -m unittest discover -s tests -t .
 ```
 
-132 tests, well under a second, needing no ffmpeg, server or container runtime. They cover the matrix's
+138 tests, well under a second, needing no ffmpeg, server or container runtime. They cover the matrix's
 internal consistency, the licence rules, NFO output and determinism, ffmpeg
 argument assembly, and the VobSub encoder — including a round-trip of the RLE
 against an independent reference decoder written in the test, which is the only

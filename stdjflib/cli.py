@@ -55,6 +55,13 @@ def _parser() -> argparse.ArgumentParser:
                         "without it.")
     b.add_argument("--no-keep-cache", action="store_true",
                    help="delete downloaded archives after unpacking")
+    b.add_argument("--use-artwork", action="store_true",
+                   help="back the artwork with photographs from picsum.photos "
+                        "(Unsplash licence, credited in ATTRIBUTION.md) so "
+                        "the library looks like a real one in screenshots. "
+                        "Downloads up to ~105 MB, cached; the type stamp "
+                        "comes off, so prefer the drawn artwork when the "
+                        "shape of an image is what is being tested.")
     b.add_argument("--bulk", type=int, default=None, metavar="N",
                    help=(f"items per Bulk * library, for scale testing "
                          f"(paging, virtualised scroll, thumbnail cache, "
@@ -68,6 +75,15 @@ def _parser() -> argparse.ArgumentParser:
     a.add_argument("--bulk", type=int, default=None, metavar="N",
                    help="items per Bulk * library (default: whatever the "
                         "manifest says was built)")
+    a.add_argument("--use-artwork", action="store_true", default=None,
+                   help="back the artwork with photographs from picsum.photos "
+                        "(Unsplash licence, credited in ATTRIBUTION.md) so "
+                        "the library looks like a real one in screenshots. "
+                        "Downloads up to ~105 MB, cached; the type stamp "
+                        "comes off, so prefer the drawn artwork when the "
+                        "shape of an image is what is being tested.")
+    a.add_argument("--drawn-artwork", dest="use_artwork", action="store_false",
+                   help="go back to the drawn artwork, with its type stamps")
     # Tier and bulk come from the manifest unless they are given, so a redraw
     # cannot quietly cover less of the library than is on disk.
     a.set_defaults(tier=None)
@@ -213,6 +229,7 @@ def _config_from(args) -> config.BuildConfig:
         hwaccel=getattr(args, "hwaccel", None),
         bulk=resolve_bulk(getattr(args, "bulk", None),
                           getattr(args, "tier", "standard")),
+        use_artwork=bool(getattr(args, "use_artwork", False)),
     )
 
 
@@ -349,6 +366,10 @@ def cmd_artwork(args) -> int:
         args.tier = previous.get("tier", "standard")
     if args.bulk is None:
         args.bulk = previous.get("bulk", 0)
+    if args.use_artwork is None:
+        # Whatever the library already is, unless told otherwise — a redraw
+        # should not silently swap a photographic library back to drawn.
+        args.use_artwork = previous.get("use_artwork", False)
 
     cfg = dataclasses.replace(_config_from(args), artwork_only=True)
     if not cfg.font_file:

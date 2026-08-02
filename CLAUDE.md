@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (132 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (138 tests,
 well under a second, no ffmpeg). To try it for real, build the minimal tier —
 it downloads nothing and takes about 80 seconds on a 16-core machine:
 
@@ -40,6 +40,8 @@ filter or muxer problem.
 | `stdjflib/libraries.py` | per-library-type builders and the path conventions |
 | `stdjflib/nfo.py` | Kodi-dialect NFO writers |
 | `stdjflib/artwork.py` | one shape per Jellyfin image type, drawn by ffmpeg |
+| `stdjflib/photos.py` | the opt-in photographic backgrounds (`--use-artwork`) |
+| `stdjflib/picsum.py` | the pinned photo ids and their photographers |
 | `stdjflib/build.py` | orchestration, manifest, ATTRIBUTION, library README |
 | `stdjflib/verify.py` | re-probe everything and compare against the recipes |
 | `stdjflib/jfapi.py` | the Jellyfin API client |
@@ -128,6 +130,29 @@ season zero spelled `season-specials-`. All of it is read out of
 spells the mapping out a second time rather than inverting `artwork.py`'s
 tables, because a check that inherits its expectations from the thing it
 checks is not a check. `test_artwork.py` ties the two together.
+
+**`--use-artwork` is opt-in and does not go through the licence gate.** There
+is nothing for the gate to check — Unsplash's licence is one blanket statement
+covering the service, not a per-image claim like archive.org's. So the terms
+are met the only other way available: off by default, named in the flag, and
+every photographer credited in ATTRIBUTION.md. Do not make it the default, and
+do not add the Unsplash licence to `ALLOWED_LICENCES` — that set is the film
+catalogue's, and it means something narrower.
+
+**Photographs are assigned by position, never by hash.** The requirement is
+that a screenful of thumbnails holds no repeats, and `seq % len(pool)` gives
+exactly that for any run shorter than the pool. A hash looks tidier and fails:
+40 items drawn from 400 by hash repeat about 86% of the time. That is why
+`seq` is plumbed through `folder_images`/`sidecar_images` into `draw`, and why
+the bulk builders pass their loop index.
+
+**Text over a photograph gets a shadow, not a scrim.** Darkening the picture
+until white text works is the obvious fix and the wrong one: it reads as a
+grey rectangle laid over a photo. `drawtext`'s `shadowcolor` plus a hairline
+`borderw` is what subtitle renderers do about the same problem, and it leaves
+the photograph alone. If a gradient is ever needed again, `_ramp` tiles its
+slices **exactly** — a one-pixel overlap is painted twice and shows as a line
+at every boundary, which is worse than the hard edge it was replacing.
 
 **`artwork` regenerates by running the builders, not by walking the files.**
 `cfg.artwork_only` switches the media steps off (`_emit`, `_link_or_copy`,
