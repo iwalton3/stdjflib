@@ -77,11 +77,23 @@ the `IsLocked` check, so local artwork refreshes on an ordinary scan while
 local metadata does not. That is why a redraw propagates to a running server
 and an NFO edit does not.
 
-So an incremental rebuild propagates media and artwork but not metadata. To
-see NFO changes, the item has to be new to the database: `serve
---replace-libraries` (drops and recreates the libraries) or `serve --fresh`
-(discards the server state entirely). Worth saying out loud when a metadata
-change looks like it did nothing.
+So an incremental rebuild propagates media and artwork but not metadata, and
+the item has to be new to the *database* before its NFO is read again.
+
+**`--replace-libraries` does not achieve that, despite looking like it should.**
+`LibraryManager.RemoveVirtualFolder` deletes the shortcut directory under
+`DefaultUserViewsPath` and nothing else — the item rows survive, and because
+Jellyfin derives an item's id from its path, re-adding the same folder adopts
+every one of them back with `IsLocked` intact. `jfapi.remove_library` sends
+`refreshLibrary=false`, so not even `ValidateTopLibraryFolders` runs to prune
+the orphans. Measured: after `--replace-libraries` recreated all fifteen
+libraries and rescanned 4774 items, every pre-existing item still had its old
+metadata and only the two items whose *paths* were new had the new fields.
+
+`serve --fresh` is the one that works: it deletes the state directory, so the
+database starts empty and every NFO is read. It keeps the `-build` artifacts
+directory, so there is no dotnet rebuild — the cost is the wizard, the twelve
+accounts and a full scan, about five minutes here for the full tier.
 
 **What an NFO writes is what `MediaBrowser.XbmcMetadata/Parsers/` reads.**
 Not what Kodi documents and not what `BaseNfoSaver` writes — the two disagree.

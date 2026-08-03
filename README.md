@@ -469,12 +469,19 @@ this library reproducible, and the same flag makes
 `MetadataService.RefreshMetadata` return before it reads the NFO — so a rescan,
 and even a full refresh with "replace all metadata", both leave the old values
 in place. Artwork is the exception and refreshes normally. To pick up metadata
-changes the item has to be new to the database:
+changes the item has to be new to the *database*, which means starting the
+server from an empty one:
 
 ```sh
-./stdjflib.py serve /srv/qa-library --replace-libraries   # recreate the libraries
-./stdjflib.py serve /srv/qa-library --fresh               # or discard server state
+./stdjflib.py serve /srv/qa-library --fresh
 ```
+
+`--replace-libraries` is not enough, however much it looks like it should be:
+removing a library deletes Jellyfin's shortcut folder and leaves the items,
+and since an item's id comes from its path, re-adding the same folder adopts
+them all back — still locked, still holding the old metadata. `--fresh`
+deletes the server state instead, so the database starts empty. It keeps the
+compiled server, so the cost is the setup wizard and one full scan.
 
 ## Adding it to Jellyfin
 
