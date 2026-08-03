@@ -705,3 +705,479 @@ class TestPartialBuildManifest(unittest.TestCase):
         cfg = self.cfgmod.BuildConfig(root=os.path.join(self.dir, "nope"))
         self.assertEqual(self.build._carry_forward(cfg, {"Movies"}), [])
         self.assertEqual(self.build._previous(cfg), {})
+
+
+class TestStrm(unittest.TestCase):
+    """Stream files, against `ProbeProvider.FetchShortcutInfo` restated here.
+
+    The parsing rule is written out again rather than imported from
+    `strm.py`, for the same reason `TestMultiVersionNaming` copies out
+    `VideoListResolver`'s patterns: a check that asks the implementation what
+    the answer is agrees with it however wrong it is.
+    """
+
+    # `FetchShortcutInfo`: strip tabs, CR and LF from every line, trim it, and
+    # take the first that is neither empty nor a `#` comment.
+    @staticmethod
+    def reference_target(text):
+        for line in text.split("\n"):
+            line = line.replace("\t", "").replace("\r", "").strip()
+            if line and not line.startswith("#"):
+                return line
+        return None
+
+    # The four schemes the same method accepts. Anything else is logged as
+    # "invalid or non-remote" and dropped.
+    SCHEMES = ("http", "https", "rtsp", "rtp")
+
+    def setUp(self):
+        from stdjflib import libraries, origin, strm
+
+        self.strm = strm
+        self.origin = origin
+        self.libraries = libraries
+        self.dir = tempfile.mkdtemp()
+        self.targets = libraries.strm_targets(config.BuildConfig(root=self.dir))
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _write(self, name, url, **kw):
+        path = os.path.join(self.dir, name)
+        self.strm.write(path, url, **kw)
+        return path
+
+    def test_accepted_schemes_match_the_server(self):
+        self.assertEqual(tuple(self.strm.SCHEMES), self.SCHEMES)
+
+    def test_a_bare_path_is_not_remote(self):
+        """The refusal is the point: honouring a local path would make a
+        `.strm` a way to read any file on the server."""
+        for line in ("/srv/media/film.mkv", "C:\\media\\film.mkv",
+                     "file:///srv/media/film.mkv", "../film.mkv", "film.mkv"):
+            with self.subTest(line=line):
+                self.assertFalse(self.strm.is_remote(line))
+
+    def test_remote_urls_are_remote(self):
+        for scheme in self.SCHEMES:
+            with self.subTest(scheme=scheme):
+                self.assertTrue(self.strm.is_remote(f"{scheme}://host/path"))
+                # Upper case reaches `Uri.Scheme` lowered, so it is accepted.
+                self.assertTrue(self.strm.is_remote(f"{scheme.upper()}://host/x"))
+
+    def test_a_scheme_with_nothing_after_it_is_not_remote(self):
+        self.assertFalse(self.strm.is_remote("http://"))
+
+    def test_comments_blank_lines_and_indentation_are_skipped(self):
+        path = self._write(
+            "a.strm", "https://example.invalid/wanted.mp4",
+            header=["a comment", "", "https://example.invalid/decoy.mp4"],
+            trailing=["", "\thttps://example.invalid/ignored.mp4"])
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertEqual(self.strm.first_line(path),
+                         "https://example.invalid/wanted.mp4")
+        # And the independent reader agrees with the one under test.
+        self.assertEqual(self.strm.first_line(path),
+                         self.reference_target(text))
+
+    def test_a_tab_indented_url_is_still_the_url(self):
+        path = os.path.join(self.dir, "b.strm")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n\n\t  https://example.invalid/x.mp4  \t\n")
+        self.assertEqual(self.strm.first_line(path),
+                         "https://example.invalid/x.mp4")
+
+    def test_a_file_of_only_comments_yields_nothing(self):
+        path = os.path.join(self.dir, "c.strm")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("# nothing here\n#\n\n")
+        self.assertIsNone(self.strm.first_line(path))
+        self.assertIsNone(self.strm.target(path))
+
+    def test_target_refuses_what_the_server_refuses(self):
+        path = self._write("d.strm", "/srv/media/film.mkv")
+        self.assertEqual(self.strm.first_line(path), "/srv/media/film.mkv")
+        self.assertIsNone(self.strm.target(path))
+
+    def test_written_files_end_in_a_newline_with_no_bom(self):
+        """`File.ReadAllLines` copes with both, so writing either would be
+        testing .NET — and a BOM would make the file differ by platform."""
+        path = self._write("e.strm", "https://example.invalid/x.mp4")
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertNotIn(b"\r", raw)
+
+    def test_every_playable_target_comes_from_the_catalogue(self):
+        """A stream file naming an address of its own would be pointing at
+        something the licence gate has never had an opinion about."""
+        urls = {src.url for src in catalog.all_sources()}
+        for key, source_key in self.libraries.STRM_SOURCES.items():
+            with self.subTest(key=key):
+                self.assertIn(self.targets[key], urls)
+                self.assertEqual(catalog.by_key(source_key).url,
+                                 self.targets[key])
+
+    def test_playable_targets_are_streamable_not_archives(self):
+        """A `.zip` is a perfectly good catalogue entry and a useless URL to
+        hand a player."""
+        for key in self.libraries.STRM_SOURCES.values():
+            with self.subTest(key=key):
+                self.assertFalse(catalog.by_key(key).unzip)
+                self.assertFalse(catalog.by_key(key).url.endswith(".zip"))
+
+    def test_the_unplayable_fixtures_reach_no_third_party(self):
+        """They exist to test a protocol field and a refusal. Either one
+        pointing at a real host would make the library fetch something when
+        somebody pressed play on it to see what happened."""
+        for key, url in self.libraries.STRM_UNPLAYABLE.items():
+            with self.subTest(key=key):
+                self.assertFalse(url.startswith(("http://", "https://")))
+                if "://" in url:
+                    self.assertIn("127.0.0.1", url)
+
+    def test_every_fixture_key_has_a_target_and_the_reverse(self):
+        used = {rec_key for rec_key, _t, shape, _p in self.libraries.NAMING_CASES
+                if shape.startswith("strm")}
+        declared = {k[len("movie-"):] for k in self.targets
+                    if k.startswith("movie-")}
+        self.assertEqual(used, declared)
+
+    def test_the_strm_version_filename_groups_with_its_local_sibling(self):
+        """The alternate is only a version of the film if its name is eligible;
+        otherwise it silently becomes a second film with the same poster."""
+        folder = "Local And Remote Versions (2020)"
+        name = self.libraries.version_path(folder, "Remote Stream", "strm")
+        stem = os.path.splitext(name)[0]
+        self.assertTrue(stem.startswith(folder))
+        self.assertRegex(stem[len(folder):].strip(),
+                         TestMultiVersionNaming.ELIGIBLE)
+
+    def test_the_strm_episode_versions_parse_to_one_episode(self):
+        """Episode grouping keys on the parsed season and episode number and
+        nothing else, which is what lets an `.mkv` and a `.strm` be one
+        episode with two sources."""
+        base = "Remote Stream Show - S01E03 - Something Happens"
+        both = [base + ".mkv",
+                self.libraries.version_path(base, "Remote Stream", "strm")]
+        keys = {re.search(r"S(\d+)E(\d+)", path).groups() for path in both}
+        self.assertEqual(len(keys), 1)
+
+    def test_the_stream_album_carries_no_codec_to_encode_with(self):
+        """`.strm` is in Jellyfin's audio extension list, so a music library
+        resolves one as a track — but there is nothing to encode, and an album
+        that still named a codec would be one edit away from trying to."""
+        albums = [a for a in self.libraries.ALBUMS if a.get("stream")]
+        self.assertTrue(albums)
+        for album in albums:
+            self.assertEqual(album["ext"], "strm")
+            self.assertFalse(album["codec"])
+            # No embedded cover can exist in a file the server never opens.
+            self.assertNotEqual(album["art"], "embedded")
+
+
+class TestOriginRanges(unittest.TestCase):
+    """The local origin, against what a player actually asks it for.
+
+    RFC 9110's byte-range rules are restated here rather than imported: the
+    suffix form (`bytes=-500` is the *last* 500 bytes) is the one that is easy
+    to implement backwards, and an implementation asked whether it agrees with
+    itself always says yes.
+    """
+
+    def setUp(self):
+        from stdjflib import origin
+
+        self.origin = origin
+
+    def test_no_header_means_the_whole_file(self):
+        self.assertIsNone(self.origin._parse_range(None, 100))
+        self.assertIsNone(self.origin._parse_range("", 100))
+
+    def test_an_open_ended_range_runs_to_the_end(self):
+        self.assertEqual(self.origin._parse_range("bytes=10-", 100), (10, 99))
+
+    def test_a_closed_range_is_inclusive(self):
+        self.assertEqual(self.origin._parse_range("bytes=0-0", 100), (0, 0))
+        self.assertEqual(self.origin._parse_range("bytes=10-19", 100), (10, 19))
+
+    def test_a_suffix_range_is_the_last_n_bytes(self):
+        """Reading this as 'up to byte 500' serves the wrong end of the file,
+        which looks like corruption rather than a bug."""
+        self.assertEqual(self.origin._parse_range("bytes=-20", 100), (80, 99))
+        self.assertEqual(self.origin._parse_range("bytes=-500", 100), (0, 99))
+
+    def test_an_end_past_the_file_is_clamped(self):
+        self.assertEqual(self.origin._parse_range("bytes=90-999", 100), (90, 99))
+
+    def test_a_start_past_the_file_is_unsatisfiable(self):
+        self.assertIs(self.origin._parse_range("bytes=100-", 100), False)
+        self.assertIs(self.origin._parse_range("bytes=-0", 100), False)
+
+    def test_multipart_and_junk_fall_back_to_the_whole_file(self):
+        for header in ("bytes=0-9,20-29", "items=0-9", "bytes=abc", "bytes="):
+            with self.subTest(header=header):
+                self.assertIsNone(self.origin._parse_range(header, 100))
+
+
+class TestOriginServer(unittest.TestCase):
+    """Serve a real file over a real socket and ask for real ranges.
+
+    Worth doing end to end rather than in pieces: the failure this guards
+    against is a 200 where the client asked for 206, which every unit of the
+    code can be correct about individually while the response is still wrong.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import urllib.error
+        import urllib.request
+
+        from stdjflib import config, origin
+
+        cls.request = urllib.request
+        cls.http_error = urllib.error.HTTPError
+        cls.dir = tempfile.mkdtemp()
+        media = os.path.join(cls.dir, config.STATE_DIR, origin.DIRNAME)
+        os.makedirs(media, exist_ok=True)
+        cls.body = bytes(range(256)) * 40          # 10240 bytes, position-checkable
+        with open(os.path.join(media, "clip.mkv"), "wb") as fh:
+            fh.write(cls.body)
+        cls.server = origin.Origin(cls.dir, port=0, bind="127.0.0.1")
+        cls.server.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+
+        cls.server.stop()
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def fetch(self, name="clip.mkv", headers=None, method="GET"):
+        req = self.request.Request(f"{self.server.local_url}/{name}",
+                                   headers=headers or {}, method=method)
+        try:
+            with self.request.urlopen(req, timeout=10) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except self.http_error as exc:
+            return exc.code, dict(exc.headers), exc.read()
+
+    def test_the_whole_file_comes_back_intact(self):
+        status, headers, body = self.fetch()
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.body)
+        self.assertEqual(headers.get("Accept-Ranges"), "bytes")
+        self.assertEqual(headers.get("Content-Type"), "video/x-matroska")
+
+    def test_a_range_gets_206_and_only_that_range(self):
+        status, headers, body = self.fetch(headers={"Range": "bytes=1000-1099"})
+        self.assertEqual(status, 206)
+        self.assertEqual(headers.get("Content-Range"), "bytes 1000-1099/10240")
+        self.assertEqual(headers.get("Content-Length"), "100")
+        self.assertEqual(body, self.body[1000:1100])
+
+    def test_an_open_ended_range_reaches_the_end(self):
+        status, _headers, body = self.fetch(headers={"Range": "bytes=10200-"})
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.body[10200:])
+
+    def test_a_suffix_range_returns_the_tail(self):
+        status, _headers, body = self.fetch(headers={"Range": "bytes=-64"})
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.body[-64:])
+
+    def test_an_unsatisfiable_range_is_416_with_the_size(self):
+        status, headers, _body = self.fetch(headers={"Range": "bytes=99999-"})
+        self.assertEqual(status, 416)
+        self.assertEqual(headers.get("Content-Range"), "bytes */10240")
+
+    def test_head_carries_the_length_and_no_body(self):
+        status, headers, body = self.fetch(method="HEAD")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Length"), str(len(self.body)))
+        self.assertEqual(body, b"")
+
+    def test_a_missing_file_is_404(self):
+        self.assertEqual(self.fetch("nope.mkv")[0], 404)
+
+    def test_nothing_outside_the_origin_directory_is_reachable(self):
+        """The origin sits under the library root, which holds the manifest and
+        the download cache. A traversal out of it would serve those."""
+        for name in ("../manifest.json", "..%2Fmanifest.json", "%2Fetc%2Fpasswd",
+                     "sub/clip.mkv", "..\\clip.mkv"):
+            with self.subTest(name=name):
+                self.assertIn(self.fetch(name)[0], (400, 404))
+
+    def test_files_lists_what_is_there(self):
+        self.assertEqual(self.server.files(), ["clip.mkv"])
+
+    def test_reachable_agrees_with_the_server(self):
+        self.assertTrue(self.origin_mod().reachable(
+            self.server.local_url, "clip.mkv"))
+        self.assertFalse(self.origin_mod().reachable(
+            self.server.local_url, "nope.mkv"))
+
+    def origin_mod(self):
+        from stdjflib import origin
+
+        return origin
+
+
+class TestOriginFixtures(unittest.TestCase):
+    """How the origin and the `.strm` files that name it are kept in step."""
+
+    def setUp(self):
+        from stdjflib import libraries, origin
+
+        self.libraries = libraries
+        self.origin = origin
+
+    def test_every_origin_fixture_points_at_a_file_that_gets_built(self):
+        """A stream file naming an origin clip nobody generates is a fixture
+        that resolves and 404s, which reads as a broken server."""
+        cfg = config.BuildConfig(root="/tmp/whatever")
+        for key, url in self.libraries.origin_targets(cfg.stream_origin).items():
+            with self.subTest(key=key):
+                self.assertIn(url.rsplit("/", 1)[-1], self.libraries.ORIGIN_CLIPS)
+
+    def test_every_origin_clip_is_named_by_a_fixture(self):
+        """The other direction: a clip nobody points at is build time spent on
+        something no test can reach, and it would go unnoticed for exactly
+        that reason."""
+        named = {name for _lib, name in self.libraries.ORIGIN_FIXTURES.values()}
+        for name in self.libraries.ORIGIN_CLIPS:
+            with self.subTest(name=name):
+                self.assertIn(name, named)
+
+    def test_a_clip_may_be_shared_but_a_fixture_key_may_not(self):
+        """Two `.strm` files naming one clip are still two items — the file is
+        a stream target, not an item. Two fixtures sharing a *key* would be
+        one overwriting the other."""
+        keys = list(self.libraries.ORIGIN_FIXTURES)
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertLess(len(self.libraries.ORIGIN_CLIPS), len(keys))
+
+    def test_there_is_a_clip_long_enough_to_hold_a_resume_point(self):
+        """`UserDataManager.UpdatePlayState` enforces
+        MinResumeDurationSeconds, 300 by default: below it the position is
+        zeroed and the item is marked played, so a shorter fixture cannot test
+        resume at all."""
+        longest = max(seconds for _ext, seconds, _video, _audios
+                      in self.libraries.ORIGIN_CLIPS.values())
+        self.assertGreater(longest, 300)
+
+    def test_the_long_clip_is_not_allowed_to_dominate_the_tier(self):
+        """400 seconds at the bitrate the other clips use would be some 80 MB
+        in a minimal tier of 400. Nothing about a resume point needs to look
+        good."""
+        clips = self.libraries.ORIGIN_CLIPS
+        longest = max(clips, key=lambda name: clips[name][1])
+        _ext, seconds, video, audios = clips[longest]
+        kbits = int(video.bitrate.rstrip("k"))
+        kbits += sum(int((a.bitrate or "128k").rstrip("k")) for a in audios)
+        self.assertLess(kbits * seconds / 8 / 1000, 8, "megabytes")
+
+    def test_both_version_spellings_exist(self):
+        """They test opposite things. A set whose primary is the local file
+        leaves its shortcut alternate unprobed; a set whose primary *is* the
+        shortcut gets both runtimes, because the probe gate reads the item's
+        path. Losing either leaves a gap the other cannot cover."""
+        shapes = {shape for _k, _t, shape, _p in self.libraries.NAMING_CASES}
+        self.assertIn("strm-origin-versions", shapes)
+        self.assertIn("strm-origin-primary-versions", shapes)
+
+    def test_the_strm_primary_is_named_exactly_like_its_folder(self):
+        """`OrganizeAlternateVersions` makes an exact-name file the primary
+        outright. One character of drift and the local file wins instead, the
+        item's path stops ending in .strm, and the fixture silently becomes a
+        duplicate of the other one."""
+        folder = "Origin Primary Versions (2020)"
+        primary = folder + ".strm"
+        self.assertEqual(os.path.splitext(primary)[0], folder)
+        # And the alternate still has to be eligible for the set at all.
+        alternate = self.libraries.version_path(folder, "Local File", "mkv")
+        stem = os.path.splitext(alternate)[0]
+        self.assertTrue(stem.startswith(folder))
+        self.assertRegex(stem[len(folder):].strip(),
+                         TestMultiVersionNaming.ELIGIBLE)
+
+    def test_the_two_version_sets_do_not_share_a_local_length(self):
+        """A runtime should say which fixture you are looking at as well as
+        which source within it."""
+        self.assertNotEqual(self.libraries.ORIGIN_VERSION_LOCAL_SECONDS,
+                            self.libraries.ORIGIN_PRIMARY_LOCAL_SECONDS)
+        clips = self.libraries.ORIGIN_CLIPS
+        _lib, name = self.libraries.ORIGIN_FIXTURES["movie-strm-origin-primary"]
+        self.assertNotEqual(clips[name][1],
+                            self.libraries.ORIGIN_PRIMARY_LOCAL_SECONDS)
+
+    def test_the_version_fixture_lengths_are_far_enough_apart(self):
+        """A version picker whose two entries report the same runtime cannot
+        say which one is playing, so a test asserting on the switch would pass
+        without switching."""
+        clips = self.libraries.ORIGIN_CLIPS
+        _lib, name = self.libraries.ORIGIN_FIXTURES["movie-strm-origin-versions"]
+        remote_seconds = clips[name][1]
+        local_seconds = self.libraries.ORIGIN_VERSION_LOCAL_SECONDS
+        self.assertGreaterEqual(max(remote_seconds, local_seconds),
+                                2 * min(remote_seconds, local_seconds))
+
+    def test_origin_urls_are_remote_as_far_as_jellyfin_is_concerned(self):
+        from stdjflib import strm
+
+        cfg = config.BuildConfig(root="/tmp/whatever")
+        for url in self.libraries.origin_targets(cfg.stream_origin).values():
+            self.assertTrue(strm.is_remote(url), url)
+
+    def test_the_origin_lives_outside_every_library_folder(self):
+        """Media inside a library folder is scanned, and the origin clips would
+        become items — which is the one thing a stream target must not be."""
+        path = self.origin.directory("/srv/qa")
+        self.assertTrue(path.startswith("/srv/qa/" + config.STATE_DIR))
+        for library in config.LIBRARIES:
+            self.assertNotIn(f"/{library}/", path + "/")
+
+    def test_the_default_origin_port_does_not_collide_with_faketvsource(self):
+        from stdjflib import livetv
+
+        self.assertNotEqual(self.origin.DEFAULT_PORT, livetv.DEFAULT_PORT)
+
+    def test_port_is_read_back_out_of_the_recorded_url(self):
+        self.assertEqual(self.origin.port_of("http://127.0.0.1:8410"), 8410)
+        self.assertEqual(self.origin.port_of("http://host.containers.internal:9"), 9)
+
+    def test_a_loopback_origin_is_reported_unreachable_from_a_container(self):
+        """The trap `livetv.py` documents, arriving from the other side: the
+        URL is already inside the files and cannot be fixed at startup."""
+        ok, why = self.origin.describe_reachability(
+            "http://127.0.0.1:8410", from_container="host.containers.internal")
+        self.assertFalse(ok)
+        self.assertIn("--stream-origin", why)
+        self.assertIn("host.containers.internal", why)
+
+    def test_a_named_host_is_left_alone(self):
+        ok, why = self.origin.describe_reachability(
+            "http://host.containers.internal:8410",
+            from_container="host.containers.internal")
+        self.assertTrue(ok)
+        self.assertEqual(why, "")
+
+    def test_a_loopback_origin_is_fine_for_a_server_on_this_machine(self):
+        ok, _why = self.origin.describe_reachability("http://127.0.0.1:8410")
+        self.assertTrue(ok)
+
+    def test_a_non_http_origin_is_refused_at_config_time(self):
+        """Jellyfin drops a .strm naming anything but http/https/rtsp/rtp, so
+        an origin that is not one produces a library of dead fixtures."""
+        with self.assertRaises(ValueError):
+            config.BuildConfig(root="/tmp/x", stream_origin="ftp://host/media")
+
+    def test_a_trailing_slash_does_not_double_up_in_the_url(self):
+        cfg = config.BuildConfig(root="/tmp/x",
+                                 stream_origin="http://host:8410/")
+        for url in self.libraries.origin_targets(cfg.stream_origin).values():
+            self.assertNotIn("//", url.split("://", 1)[1])

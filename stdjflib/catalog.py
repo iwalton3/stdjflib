@@ -306,6 +306,21 @@ def all_sources() -> list[Source]:
     return out
 
 
+def by_key(key: str) -> Source:
+    """One entry by key, for fixtures that reference a source without fetching it.
+
+    The `.strm` fixtures point at these URLs rather than inventing their own,
+    so a stream file cannot end up naming something outside the licence gate's
+    claim set. Raising beats returning None: a fixture whose source has been
+    renamed away should fail the build, not quietly write a stream file
+    pointing at nothing.
+    """
+    for src in all_sources():
+        if src.key == key:
+            return src
+    raise KeyError(f"no catalog source {key!r}")
+
+
 def for_tier(tier: str) -> list[Source]:
     from .config import tier_includes
 

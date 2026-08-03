@@ -17,7 +17,7 @@ import concurrent.futures as futures
 import dataclasses
 import os
 
-from . import artwork, ff, generate, nfo, recipes
+from . import artwork, catalog, ff, generate, nfo, origin, recipes, strm
 from .recipes import Audio, Recipe, Video
 
 YEAR = 2020
@@ -70,6 +70,23 @@ def _emit(rec: Recipe, path: str, cfg, *, allow_hw: bool = False) -> bool:
         return res.ok
     except (ff.FFmpegError, OSError, ValueError) as exc:
         print(f"    ! {os.path.basename(path)}: {str(exc).splitlines()[-1][:120]}")
+        return False
+
+
+def _strm(path: str, url: str, cfg, **kw) -> bool:
+    """Write one stream file, on the same terms `_emit` writes media.
+
+    A `.strm` is media as far as the build is concerned — it is what the item
+    plays — so an artwork pass leaves it alone and says yes anyway, exactly as
+    `_emit` does, and the item's NFO and images still get rewritten.
+    """
+    if cfg.dry_run or cfg.artwork_only:
+        return True
+    try:
+        strm.write(path, url, **kw)
+        return True
+    except OSError as exc:
+        print(f"    ! {os.path.basename(path)}: {exc}")
         return False
 
 
@@ -162,7 +179,228 @@ NAMING_CASES = [
     ("very-long-title", "A Movie With An Extremely Long Title That Goes On Well "
      "Past Any Reasonable Column Width And Keeps Going", "flat",
      "A title long enough to overflow every list column and card label."),
+    ("strm-loose", "Remote Stream Movie", "strm-flat",
+     "A .strm file: one line of text holding a URL, resolved as a movie and "
+     "played from the network. Nothing is probed on a scan, so this item has "
+     "no runtime, no stream list and no resolution at all until something "
+     "asks to play it — measured, and not for want of a <runtime> in the NFO, "
+     "which is there and does not fill it. Everything a client can draw "
+     "before playback is the metadata and the images beside the file, and the "
+     "media source is remote, which is a code path a library of local files "
+     "never reaches."),
+    ("strm-comments", "Commented Stream File", "strm-folder",
+     "The same thing with everything the parser is supposed to tolerate: a "
+     "comment header, blank lines, a tab-indented URL, and a second URL "
+     "underneath. Jellyfin takes the first line that is neither blank nor a "
+     "'#' comment and ignores the rest — a .strm is one source, not a "
+     "playlist. A client showing two versions here is reading the file itself "
+     "and reading it wrong."),
+    ("strm-rtsp", "RTSP Stream Movie", "strm-flat",
+     "A stream file naming rtsp:// rather than http://. Jellyfin accepts four "
+     "schemes — http, https, rtsp and rtp — so this item's media source has a "
+     "protocol a client that assumed HTTP has never had to render. The "
+     "address is a loopback one with nothing behind it: the protocol field is "
+     "the fixture, not the stream."),
+    ("strm-local-path", "Stream File Naming A Local Path", "strm-flat",
+     "A stream file containing a filesystem path instead of a URL. Jellyfin "
+     "refuses it twice over — once in the parser, again in "
+     "BaseItem.GetVersionInfo — because honouring it would make a .strm a way "
+     "to read any file on the server. What it resolves to instead, measured, "
+     "is an item whose only media source is the stream file itself: protocol "
+     "File, not remote, pointing at this .strm. That is the awkward state "
+     "being tested — everything about the item looks playable, and what a "
+     "client would be asked to open is a line of text."),
+    ("strm-versions", "Local And Remote Versions", "strm-versions",
+     "One film with two sources, one on disk and one on the network. The "
+     "file named exactly like the folder is local and primary; the alternate "
+     "is a .strm. Multi-version grouping compares filenames without their "
+     "extensions, so a stream file sits in a version set beside real media — "
+     "and switching between them switches between a local file and a URL."),
+    ("strm-origin", "Local Origin Stream Movie", "strm-flat",
+     "The same shape as Remote Stream Movie, pointing at an HTTP origin "
+     "running on this machine instead of at archive.org. As far as Jellyfin "
+     "is concerned the source is just as remote — protocol Http, IsRemote "
+     "true, no probe on a scan — but nothing leaves the box, so this is the "
+     "one an end-to-end playback test can use with the network unplugged. It "
+     "needs the origin server running: `stdjflib serve` starts it, and the "
+     "URL is baked in at build time, so a server that is not on this machine "
+     "needs `build --stream-origin`."),
+    ("strm-origin-versions", "Local Origin Versions", "strm-origin-versions",
+     "One film, two sources, and neither of them needs a network: the primary "
+     "is a 10-second file on disk, the alternate is a .strm pointing at the "
+     "30-second clip on this machine's origin. Switching version switches "
+     "between a local file and a URL, and the media really is three times as "
+     "long on one side as the other. Measured, and worth knowing before "
+     "asserting on it: the alternate reports **no runtime at all** until it "
+     "plays, even from PlaybackInfo and even with mediaSourceId pinned to it. "
+     "MediaSourceManager only forces the remote probe when the *item's* path "
+     "ends in .strm, and a version set's path is its primary's — so the "
+     "shortcut in the set is never probed. Tell the sources apart by Path, "
+     "IsRemote or Id; RunTimeTicks will not do it here. Origin Primary "
+     "Versions is the same set built the other way up, where it does — the "
+     "two are a pair and neither substitutes for the other."),
+    ("strm-origin-primary", "Origin Primary Versions",
+     "strm-origin-primary-versions",
+     "The same version set built the other way up, and the pair is the point. "
+     "Here the .strm is the file named exactly like its folder, which makes it "
+     "the primary source outright — so the *item's* path ends in .strm, "
+     "MediaSourceManager's probe gate fires on it, and both sources come back "
+     "carrying their own runtime: 30 seconds from the origin on the primary, "
+     "20 from the local file behind it. In Local Origin Versions, where the "
+     "primary is the local file, the shortcut alternate is never probed and "
+     "reports nothing. So one of these two says whether a client reads a "
+     "version's own duration, and the other says what it does when there is "
+     "none to read. Neither substitutes for the other."),
+    ("strm-long", "Long Origin Stream Movie", "strm-flat",
+     "A stream fixture that is 400 seconds long, which is the only reason it "
+     "exists. Jellyfin refuses to keep a resume point for anything shorter "
+     "than MinResumeDurationSeconds — 300 by default — and zeroes the "
+     "position and marks the item played instead. Every other clip in this "
+     "library is 12 to 30 seconds, so this is the one item a resume, "
+     "progress or continue-watching test can be pointed at. The position is "
+     "only kept between 5% and 90%, so the window that holds one is 20s to "
+     "360s. It is encoded at a deliberately poor bitrate: nothing about a "
+     "resume point needs to look good, and 400 seconds at the usual rate "
+     "would outweigh the rest of the tier."),
 ]
+
+# Where the `.strm` fixtures point. Every playable one names a *catalogue*
+# source rather than an address of its own, so a stream file cannot end up
+# referencing something the licence gate has never had an opinion about — and
+# `build.write_attribution` credits them from this table whether or not the
+# tier downloaded anything. A stream file is a line of text, so these fixtures
+# cost nothing and exist even in the minimal tier.
+#
+# One film per fixture rather than one film everywhere, so browsing these is
+# not the same eleven minutes six times over.
+STRM_SOURCES = {
+    "movie-strm-loose": "prelinger-aboutban1935",
+    "movie-strm-comments": "prelinger-sniffles1955",
+    "movie-strm-versions": "prelinger-careofth1949",
+    "show-strm-episode": "prelinger-sleepfor1950",
+    "show-strm-version": "prelinger-eatforhe1954",
+    "music-strm": "prelinger-parkcons1938",
+}
+
+# The two that are *not* meant to play. Both are deliberately local: an
+# unroutable loopback port and a filesystem path. Neither goes near the
+# network, and neither is supposed to — what they test is the protocol field
+# and the refusal, not a stream.
+STRM_UNPLAYABLE = {
+    "movie-strm-rtsp": "rtsp://127.0.0.1:8554/stdjflib/no-such-stream",
+    "movie-strm-local-path":
+        "/srv/media/Movies/Some Film (2020)/Some Film (2020).mkv",
+}
+
+# The clips behind the local origin. These are generated exactly like
+# everything else here and served over HTTP from `.stdjflib/origin/` by
+# `origin.py`, so the URL is remote as far as Jellyfin is concerned and
+# nothing leaves the machine.
+#
+# They are the reason an end-to-end playback test does not need a network. The
+# archive.org fixtures are the better test — a real host, real TLS, real
+# redirects — and they are unusable in CI and on a metered connection, so both
+# exist and the local ones are named so a test can pick them deliberately.
+#
+# `origin-long.mp4` is the one whose *duration* is the fixture.
+# `UserDataManager.UpdatePlayState` enforces
+# `ServerConfiguration.MinResumeDurationSeconds`, which defaults to **300**:
+# anything shorter has its position zeroed and is marked played outright, so
+# no resume point can exist for it at all. Every other clip in this library is
+# 12-30 seconds, which means that until this one existed there was nothing a
+# resume, progress or continue-watching test could be pointed at. 400s clears
+# the threshold with room to spare — and because the same method only keeps a
+# position between `MinResumePct` 5 and `MaxResumePct` 90, the window that
+# actually holds one here is 20s to 360s.
+#
+# Its bitrate is deliberately miserable. 400 seconds at the 1500k the other
+# clips use would be some 80 MB in a library whose whole minimal tier is 400,
+# and nothing about a resume point needs to look good.
+# name -> (container, seconds, video, audio). The long one names its audio
+# bitrate too: at the default the soundtrack alone would outweigh the picture
+# over 400 seconds, and a mono 48k stream is still a stream to switch to and
+# still audible enough to tell you playback is running.
+ORIGIN_CLIPS = {
+    "origin-movie.mkv": ("mkv", 30,
+                         Video(width=1280, height=720, bitrate="1500k"),
+                         (Audio(encoder="aac"),)),
+    "origin-episode.mp4": ("mp4", 30,
+                           Video(width=854, height=480, bitrate="900k"),
+                           (Audio(encoder="aac"),)),
+    "origin-long.mp4": ("mp4", 400,
+                        Video(width=640, height=360, bitrate="90k"),
+                        (Audio(encoder="aac", channels=1, bitrate="48k"),)),
+}
+
+# Which fixture names which clip, and the library it belongs to so a partial
+# build does not produce clips nothing points at. Several fixtures may share
+# one clip: the file is a stream *target*, not an item, so two `.strm` files
+# naming it are still two separate items.
+# What the local primary of `strm-origin-versions` runs for, against the 30s
+# of the clip its alternate streams. Named because the ratio is the fixture:
+# a version picker whose entries report the same runtime cannot tell you which
+# source you got.
+ORIGIN_VERSION_LOCAL_SECONDS = 10
+
+# And the local *alternate* of `strm-origin-primary-versions`, the set built
+# the other way up. Distinct from both 10 and 30 so that a runtime alone says
+# which of the two version fixtures you are looking at as well as which source
+# within it.
+ORIGIN_PRIMARY_LOCAL_SECONDS = 20
+
+ORIGIN_FIXTURES = {
+    "movie-strm-origin": ("Movies", "origin-movie.mkv"),
+    "movie-strm-origin-versions": ("Movies", "origin-movie.mkv"),
+    "movie-strm-origin-primary": ("Movies", "origin-movie.mkv"),
+    "movie-strm-long": ("Movies", "origin-long.mp4"),
+    "show-strm-origin": ("Shows", "origin-episode.mp4"),
+}
+
+
+def origin_targets(base_url: str) -> dict:
+    """Fixture key -> URL, for a given origin base URL."""
+    return {key: f"{base_url}/{name}"
+            for key, (_lib, name) in ORIGIN_FIXTURES.items()}
+
+
+def strm_targets(cfg) -> dict:
+    """Every stream fixture's URL, remote and local-origin alike."""
+    return {
+        **{key: catalog.by_key(src).url for key, src in STRM_SOURCES.items()},
+        **STRM_UNPLAYABLE,
+        **origin_targets(cfg.stream_origin),
+    }
+
+
+def build_origin(cfg) -> list[dict]:
+    """The clips the local-origin `.strm` fixtures point at.
+
+    Deliberately not inside any library folder — `PhotoResolver` and the video
+    resolvers scan what they are given, and a folder of media inside a library
+    would turn the origin into items in their own right, which is the one thing
+    a stream target must not be.
+    """
+    # Only what this run's libraries actually name. A `--only Movies` build
+    # that produced the episode clip too would leave a file on the origin that
+    # nothing points at, and `verify` would rightly say so.
+    needed = sorted({name for lib, name in ORIGIN_FIXTURES.values()
+                     if cfg.wants(lib)})
+
+    made = []
+    target_dir = origin.directory(cfg.root)
+    for name in needed:
+        ext, seconds, video, audios = ORIGIN_CLIPS[name]
+        rec = _short(
+            "Served over HTTP by the local origin",
+            f"origin-{os.path.splitext(name)[0]}",
+            duration=seconds, video=video, audios=audios, container=ext,
+            notes="This clip is not a library item. It sits under "
+                  ".stdjflib/origin/ and exists to be fetched over HTTP by "
+                  "the .strm fixture that names it.")
+        path = os.path.join(target_dir, name)
+        if _emit(rec, path, cfg):
+            made.append({"library": "Origin", "key": rec.key, "path": path})
+    return made
 
 
 # How Jellyfin decides that several files are one item in several versions,
@@ -231,6 +469,7 @@ def build_movies(root: str, cfg) -> list[dict]:
     fixtures that demonstrate each path convention.
     """
     made = []
+    targets = strm_targets(cfg)
     for key, title, shape, plot in NAMING_CASES:
         year = YEAR
         safe = title.replace("/", "-").replace(":", " -")
@@ -287,6 +526,98 @@ def build_movies(root: str, cfg) -> list[dict]:
                           tags=["stdjflib", "naming"])
                 artwork.folder_images(folder, rec.key, title, cfg)
             made.append({"library": "Movies", "key": rec.key, "path": folder})
+
+        elif shape == "strm-flat":
+            name = f"{safe} ({year})"
+            media = os.path.join(root, f"{name}.strm")
+            if _strm(media, targets[rec.key], cfg) and not cfg.dry_run:
+                nfo.movie(os.path.join(root, f"{name}.nfo"), key=rec.key,
+                          title=title, plot=plot, year=year, runtime_minutes=11,
+                          tags=["stdjflib", "naming", "strm"])
+                # A shortcut is never probed, so these images are not merely
+                # the preferred artwork — they are the only artwork the item
+                # can ever have. There is no embedded poster to fall back to
+                # and no frame to grab one from.
+                artwork.sidecar_images(media, rec.key, title, cfg,
+                                       kinds=artwork.SETS["movie"])
+            made.append({"library": "Movies", "key": rec.key, "path": media,
+                         "stream": targets[rec.key]})
+
+        elif shape == "strm-folder":
+            folder = os.path.join(root, f"{safe} ({year})")
+            media = os.path.join(folder, f"{safe} ({year}).strm")
+            ok = _strm(
+                media, targets[rec.key], cfg,
+                header=["Written by stdjflib. Everything above the first URL "
+                        "is a comment,",
+                        "and everything below it is ignored.",
+                        "",
+                        "https://example.invalid/decoy-in-a-comment.mkv"],
+                # The tab is deliberate: FetchShortcutInfo strips tabs before
+                # it trims, so an indented URL is still a URL.
+                trailing=["", "\thttps://example.invalid/second-url-never-read.mkv"])
+            if ok and not cfg.dry_run:
+                nfo.movie(os.path.join(folder, "movie.nfo"), key=rec.key,
+                          title=title, plot=plot, year=year, runtime_minutes=11,
+                          tags=["stdjflib", "naming", "strm"])
+                artwork.folder_images(folder, rec.key, title, cfg)
+            made.append({"library": "Movies", "key": rec.key, "path": media,
+                         "stream": targets[rec.key]})
+
+        elif shape in ("strm-versions", "strm-origin-versions"):
+            folder = os.path.join(root, f"{safe} ({year})")
+            base = os.path.join(folder, f"{safe} ({year})")
+            # The exact-name file, and the one thing here that is real media:
+            # it is primary by the folder-name rule, so the item plays locally
+            # unless a client is asked for the other source.
+            #
+            # Ten seconds against the origin clip's thirty, for the local-origin
+            # spelling. A version picker whose two entries report the same
+            # runtime cannot tell you which one you got, so a test asserting on
+            # the source it switched to would pass without switching anything.
+            local = _clip(rec, key=f"{rec.key}-local",
+                          video=Video(width=1280, height=720, bitrate="1500k"))
+            if shape == "strm-origin-versions":
+                local = _clip(local, duration=ORIGIN_VERSION_LOCAL_SECONDS)
+            _emit(local, base + ".mkv", cfg)
+            remote = version_path(base, "Remote Stream", "strm")
+            _strm(remote, targets[rec.key], cfg)
+            if not cfg.dry_run:
+                nfo.movie(os.path.join(folder, "movie.nfo"), key=rec.key,
+                          title=title, plot=plot, year=year, runtime_minutes=11,
+                          tags=["stdjflib", "naming", "strm"])
+                artwork.folder_images(folder, rec.key, title, cfg)
+            made.append({"library": "Movies", "key": rec.key, "path": folder})
+            # The stream file gets an entry of its own as well as the folder's:
+            # it is one file among an item's several sources, so nothing else
+            # in the manifest would name it and `verify` would never read it.
+            made.append({"library": "Movies", "key": f"{rec.key}-remote",
+                         "path": remote, "stream": targets[rec.key]})
+
+        elif shape == "strm-origin-primary-versions":
+            folder = os.path.join(root, f"{safe} ({year})")
+            base = os.path.join(folder, f"{safe} ({year})")
+            # The stream file is the one named exactly like its folder, and
+            # that is the entire fixture. `OrganizeAlternateVersions` makes an
+            # exact-name file the primary outright, so the *item's* path ends
+            # in `.strm` — which is the disjunct that
+            # `MediaSourceManager.GetPlaybackMediaSources` actually tests. The
+            # remote probe therefore fires, and unlike the set built the other
+            # way up, both sources report a real runtime.
+            primary = base + ".strm"
+            _strm(primary, targets[rec.key], cfg)
+            _emit(_clip(rec, key=f"{rec.key}-local",
+                        duration=ORIGIN_PRIMARY_LOCAL_SECONDS,
+                        video=Video(width=1280, height=720, bitrate="1500k")),
+                  version_path(base, "Local File", "mkv"), cfg)
+            if not cfg.dry_run:
+                nfo.movie(os.path.join(folder, "movie.nfo"), key=rec.key,
+                          title=title, plot=plot, year=year, runtime_minutes=11,
+                          tags=["stdjflib", "naming", "strm"])
+                artwork.folder_images(folder, rec.key, title, cfg)
+            made.append({"library": "Movies", "key": rec.key, "path": folder})
+            made.append({"library": "Movies", "key": f"{rec.key}-primary",
+                         "path": primary, "stream": targets[rec.key]})
 
         elif shape == "parts":
             folder = os.path.join(root, f"{safe} ({year})")
@@ -385,6 +716,21 @@ SHOWS = [
                 "this show.",
     },
     {
+        "key": "strm-show", "title": "Remote Stream Show", "year": 2025,
+        "style": "strm",
+        "plot": "A season assembled from stream files. Episode one is a .strm "
+                "and nothing else, episode two is ordinary media for "
+                "comparison, episode three has both — one local source and "
+                "one remote, grouped as versions of the same episode — and "
+                "episode four streams from an HTTP origin running on this "
+                "machine, so it plays with the network unplugged. A "
+                "shortcut is never probed on a scan, so an episode built this "
+                "way has no runtime, no streams, no chapters and no extracted "
+                "still until something asks to play it: everything a client "
+                "renders in the episode list has to come from the NFO and the "
+                "thumbnail beside it.",
+    },
+    {
         "key": "flat-show", "title": "Flat Show No Season Folders", "year": 2023,
         "style": "flat", "episodes": 6,
         "plot": "SxxExx files sitting directly in the show folder with no "
@@ -450,6 +796,7 @@ def _season_artwork(series_folder: str, season_folder: str | None,
 def build_shows(root: str, cfg) -> list[dict]:
     made = []
     tasks: list = []
+    targets = strm_targets(cfg)
     for show in SHOWS:
         title = show["title"]
         folder = os.path.join(root, f"{title} ({show['year']})")
@@ -480,7 +827,8 @@ def build_shows(root: str, cfg) -> list[dict]:
         season_art: list[tuple[int, str | None, bool]] = []
 
         def episode(season_no, ep_no, path, ep_title, aired, end=None,
-                    versions=None, airs=None, _rec=rec, _key=key, _show=show):
+                    versions=None, stream=None, streams=(), airs=None,
+                    _rec=rec, _key=key, _show=show):
             """Queue one episode. `_rec`/`_key`/`_show` are bound as defaults
             because they change on every turn of the enclosing loop, and a
             closure over them would see only the last show's values.
@@ -494,24 +842,37 @@ def build_shows(root: str, cfg) -> list[dict]:
             wrong. The duplicates also make the show behave sanely on a server
             with no episode grouping at all, where each file really is its own
             episode.
+
+            `stream` makes the episode's own file a `.strm` playing that URL
+            instead of media — `path` should then already end in `.strm`.
+            `streams` is `(tag, url)` pairs adding stream files *beside*
+            whatever else the episode has, which is how one episode ends up
+            with a local source and a remote one.
             """
             ep_key = f"{_key}-s{season_no}e{ep_no}"
             base = os.path.splitext(path)[0]
-            files = [(path, None, None, ep_key)] if not versions else [
-                (version_path(base, tag, ext), video, audios,
-                 f"{ep_key}-{tag}")
-                for tag, ext, video, audios in versions
-            ]
+            if versions:
+                files = [(version_path(base, tag, ext), video, audios,
+                          f"{ep_key}-{tag}", None)
+                         for tag, ext, video, audios in versions]
+            else:
+                files = [(path, None, None, ep_key, stream)]
+            files += [(version_path(base, tag, "strm"), None, None,
+                       f"{ep_key}-{tag}", url) for tag, url in streams]
 
             def run():
                 out = []
-                for target, video, audios, file_key in files:
-                    v = _clip(_rec, key=file_key, title=ep_title)
-                    if video:
-                        v = _clip(v, video=video, audios=audios,
-                                  container=os.path.splitext(target)[1][1:])
-                    if not _emit(v, target, cfg):
-                        continue
+                for target, video, audios, file_key, url in files:
+                    if url is not None:
+                        if not _strm(target, url, cfg):
+                            continue
+                    else:
+                        v = _clip(_rec, key=file_key, title=ep_title)
+                        if video:
+                            v = _clip(v, video=video, audios=audios,
+                                      container=os.path.splitext(target)[1][1:])
+                        if not _emit(v, target, cfg):
+                            continue
                     if cfg.dry_run:
                         continue
                     # Keyed on the episode, not the file: every version is the
@@ -529,8 +890,11 @@ def build_shows(root: str, cfg) -> list[dict]:
                     artwork.sidecar_images(
                         target, ep_key, ep_title, cfg, kinds=("thumb",),
                         subtitle=f"S{season_no:02d}E{ep_no:02d}")
-                    out.append({"library": "Shows", "key": file_key,
-                                "path": target})
+                    entry = {"library": "Shows", "key": file_key,
+                             "path": target}
+                    if url is not None:
+                        entry["stream"] = url
+                    out.append(entry)
                 return out
 
             tasks.append(run)
@@ -654,6 +1018,36 @@ def build_shows(root: str, cfg) -> list[dict]:
                     EPISODE_TITLES[3], f"{show['year']}-04-04",
                     versions=EPISODE_VERSIONS[:2])
 
+        elif style == "strm":
+            sdir = os.path.join(folder, "Season 01")
+            season_art.append((1, sdir, False))
+            names = [f"{title} - S01E{n:02d} - {EPISODE_TITLES[n - 1]}"
+                     for n in (1, 2, 3, 4)]
+            # Episode one: a stream file standing on its own, which is the
+            # shape a scraper-fed library is entirely made of.
+            episode(1, 1, os.path.join(sdir, names[0] + ".strm"),
+                    EPISODE_TITLES[0], f"{show['year']}-06-01",
+                    stream=targets["show-strm-episode"])
+            # Episode two: ordinary media, so the difference between a probed
+            # episode and a shortcut is visible in one list rather than across
+            # two shows.
+            episode(1, 2, os.path.join(sdir, names[1] + ".mkv"),
+                    EPISODE_TITLES[1], f"{show['year']}-06-02")
+            # Episode three: both at once. Episode grouping keys on the season
+            # and episode number parsed out of the name and nothing else, so
+            # the extension is free to differ — one episode, a local source and
+            # a remote one behind the same source picker.
+            episode(1, 3, os.path.join(sdir, names[2] + ".mkv"),
+                    EPISODE_TITLES[2], f"{show['year']}-06-03",
+                    streams=(("Remote Stream",
+                              targets["show-strm-version"]),))
+            # Episode four: the same as episode one, but served from this
+            # machine. The episode an end-to-end playback test can use with
+            # the network unplugged.
+            episode(1, 4, os.path.join(sdir, names[3] + ".strm"),
+                    EPISODE_TITLES[3], f"{show['year']}-06-04",
+                    stream=targets["show-strm-origin"])
+
         elif style == "flat":
             season_art.append((1, None, True))
             for ep_no in range(1, show["episodes"] + 1):
@@ -717,6 +1111,21 @@ ALBUMS = [
     {"key": "unicode-album", "artist": "アーティスト", "album": "アルバム",
      "year": 2023, "codec": "flac", "ext": "flac", "tracks": 4, "art": "embedded",
      "note": "Japanese artist, album and track names."},
+    {"key": "strm-album", "artist": "Nightly Build", "album": "Remote Sessions",
+     "year": 2025, "codec": "", "ext": "strm", "tracks": 3, "art": "folder",
+     "stream": True,
+     "note": "Tracks that are stream files rather than audio. `.strm` is in "
+             "Jellyfin's audio extension list as well as its video one, so in "
+             "a music library the audio resolver claims it and the item is a "
+             "track — the extension decides the type, and what the URL points "
+             "at is never consulted. Nothing is probed, so there are no tags "
+             "and no embedded cover: the album art can only be the folder.jpg "
+             "beside them, and the track number and artist are simply absent. "
+             "The shortcut goes no further than that. `BaseItem.GetVersionInfo` "
+             "substitutes the URL for the file only inside `if (item is Video)`, "
+             "so a track's media source stays the .strm on disk — protocol "
+             "File, IsRemote false. Measured on 12.0: this resolves and does "
+             "not play, and a client is handed a text file to open."},
 ]
 
 TRACK_NAMES = ["Opening", "Second Movement", "Interlude", "The Long One",
@@ -730,6 +1139,8 @@ def build_music(root: str, cfg) -> list[dict]:
     uses it for every track, then deletes it — a lifecycle that would need
     locking if two albums shared a worker mid-flight.
     """
+    targets = strm_targets(cfg)
+
     def album_task(album):
         def run():
             out = []
@@ -767,9 +1178,12 @@ def build_music(root: str, cfg) -> list[dict]:
                     if _audio_track(
                             path, cfg, album, disc, n, title, track_artist,
                             art_path if album["art"] == "embedded" else None):
-                        out.append({"library": "Music",
-                                    "key": f"{album['key']}-d{disc}t{n}",
-                                    "path": path})
+                        entry = {"library": "Music",
+                                 "key": f"{album['key']}-d{disc}t{n}",
+                                 "path": path}
+                        if album.get("stream"):
+                            entry["stream"] = targets["music-strm"]
+                        out.append(entry)
             # The embedded cover was only ever a staging file.
             if album["art"] == "embedded" and art_path and os.path.exists(art_path):
                 os.unlink(art_path)
@@ -798,6 +1212,11 @@ def build_music(root: str, cfg) -> list[dict]:
 def _audio_track(path: str, cfg, album, disc: int, n: int, name: str,
                  track_artist: str, cover: str | None) -> bool:
     """One tagged audio file. Tags come from ffmpeg's metadata options."""
+    if album.get("stream"):
+        # A shortcut has no tags at all, so `untagged` would be redundant here
+        # and `cover` has nothing to embed into — the two things this function
+        # otherwise exists to do.
+        return _strm(path, strm_targets(cfg)["music-strm"], cfg)
     if cfg.dry_run:
         return True
     if cfg.artwork_only:

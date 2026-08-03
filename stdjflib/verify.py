@@ -18,7 +18,7 @@ import dataclasses
 import json
 import os
 
-from . import artwork, config, ff, recipes
+from . import artwork, config, ff, origin, recipes, strm
 
 # Beyond this many artwork files in one library, only a sample is probed. A
 # bulk library is thousands of images of half a dozen shapes, and probing all
@@ -206,6 +206,63 @@ def check_artwork(cfg, libraries, report) -> int:
     return len(targets)
 
 
+def check_streams(root: str, manifest, report) -> int:
+    """Re-read every `.strm` and compare it against the URL the build recorded.
+
+    Not a tautology, because the two ends do different work: the build writes
+    a whole file — comment header, blank lines, an indented URL, decoy lines
+    below it — and `strm.first_line` is an independent restatement of
+    `ProbeProvider.FetchShortcutInfo` that has to pick the same one line back
+    out of it. A stream file that got truncated, re-encoded or edited into
+    something Jellyfin would read differently fails here.
+    """
+    base = manifest.get("stream_origin") or ""
+    served = set(origin.Origin(root).files()) if base else set()
+    wanted = set()
+
+    checked = 0
+    rejected = []
+    for item in manifest.get("items", []):
+        want = item.get("stream")
+        if not want:
+            continue
+        checked += 1
+        got = strm.first_line(item["path"])
+        if got is None:
+            report.problems.append(
+                f"{item['key']}: .strm holds no URL line ({item['path']})")
+        elif got != want:
+            report.problems.append(
+                f"{item['key']}: .strm points at {got!r}, expected {want!r}")
+        elif not strm.is_remote(got):
+            rejected.append(item["key"])
+        elif base and got.startswith(base + "/"):
+            # A local-origin fixture. Unlike the archive.org ones, whether it
+            # would 404 is knowable without the network, so it is checked
+            # rather than assumed.
+            name = got[len(base) + 1:]
+            wanted.add(name)
+            if name not in served:
+                report.problems.append(
+                    f"{item['key']}: names {name} on the local origin, but "
+                    f"no such file is there to serve")
+
+    # And the other way. An origin clip nobody points at is build time spent
+    # on something no fixture can reach, which nothing else would notice.
+    for extra in sorted(served - wanted):
+        report.notes.append(
+            f"the local origin serves {extra}, which no stream file names")
+    if rejected:
+        # These are the fixtures Jellyfin is supposed to refuse. Named rather
+        # than passed over, so "the library contains a stream file the server
+        # will not play" reads as intended rather than as a fault nobody
+        # noticed.
+        report.notes.append(
+            f"{len(rejected)} stream file(s) deliberately name something "
+            f"Jellyfin refuses: " + ", ".join(sorted(rejected)))
+    return checked
+
+
 @dataclasses.dataclass
 class Report:
     """What a verify run found.
@@ -218,6 +275,7 @@ class Report:
 
     files: int = 0
     images: int = 0
+    streams: int = 0
     problems: list = dataclasses.field(default_factory=list)
     notes: list = dataclasses.field(default_factory=list)
 
@@ -269,5 +327,6 @@ def run(cfg) -> Report:
     # today's arguments would have produced it.
     report.images = check_artwork(
         cfg, manifest.get("libraries") or cfg.libraries(), report)
+    report.streams = check_streams(cfg.root, manifest, report)
     report.files = checked
     return report

@@ -139,8 +139,25 @@ class BuildConfig:
     # library photographs like a real one. Opt-in: it downloads, and it drops
     # the type stamp that makes a misplaced image obvious. See `photos.py`.
     use_artwork: bool = False
+    # Where the local-origin `.strm` fixtures say their media lives. Baked
+    # into the files at build time, because that is what a `.strm` is — so
+    # unlike faketvsource's `--public-url`, which is chosen when the process
+    # starts, this has to be right when the library is *built*. The default
+    # suits a server on this machine; anything else (a container, a server on
+    # another host) needs it set here and the library rebuilt.
+    stream_origin: str = ""
 
     def __post_init__(self):
+        if not self.stream_origin:
+            from . import origin
+
+            object.__setattr__(self, "stream_origin", origin.default_base_url())
+        if not self.stream_origin.startswith(("http://", "https://")):
+            raise ValueError(
+                f"--stream-origin must be an http(s) URL, got "
+                f"{self.stream_origin!r}; Jellyfin drops a .strm naming "
+                f"anything else")
+        object.__setattr__(self, "stream_origin", self.stream_origin.rstrip("/"))
         if self.tier not in TIERS:
             raise ValueError(f"unknown tier {self.tier!r}, expected one of {TIERS}")
         if self.hwaccel not in (None, "nvenc"):

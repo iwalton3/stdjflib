@@ -35,6 +35,8 @@ filter or muxer problem.
 | `stdjflib/generate.py` | Recipe → ffmpeg invocation → file |
 | `stdjflib/vobsub.py` | the hand-written VobSub (.idx/.sub) encoder |
 | `stdjflib/subs.py` | subtitle sample text and the SRT/ASS/VTT writers |
+| `stdjflib/strm.py` | `.strm` stream files, and the parsing rule they are written against |
+| `stdjflib/origin.py` | the local HTTP origin those stream files can point at |
 | `stdjflib/catalog.py` | what gets downloaded, and under what licence |
 | `stdjflib/fetch.py` | resumable downloads, the licence gate, unzip |
 | `stdjflib/libraries.py` | per-library-type builders and the path conventions |
@@ -219,6 +221,143 @@ was built without — a pass over what is on disk can only refresh what is
 already there. Embedded album art is re-muxed with `-c:a copy`; re-encoding
 the audio to change a cover would make the library differ from everyone
 else's.
+
+**A `.strm` is decided by its extension, and never opened.** `.strm` is in
+`NamingOptions`' `VideoFileExtensions` *and* its `AudioFileExtensions`, so the
+item type comes from the library's collection type and nothing else — Movie in
+movies, Episode in tvshows, Audio in music, and `MovieResolver` (priority
+Fourth) beats `AudioResolver` (Fifth) everywhere it is eligible. Then
+`IsShortcut`, set from the extension in `BaseVideoResolver.SetVideoType` and
+`AudioResolver.Resolve`, switches off every provider that would open the file:
+`FFProbeVideoInfo` and `AudioFileProber` gate on
+`!IsShortcut || EnableRemoteContentProbe`, and `EmbeddedImageProvider`,
+`VideoImageProvider`, `AudioImageProvider`, `ChapterManager` and
+`TrickplayManager` all return false outright. So a scan reads no streams, no
+runtime, no embedded cover, no chapters and no trickplay from one, and
+everything a client shows before playback has to be in the NFO and the images
+beside it. `MediaSourceManager.GetPlaybackMediaSources` turns remote probing
+back on when playback is requested, which is why the stream details arrive
+late rather than never.
+
+Two consequences for the fixtures: `music-strm`'s album carries no codec and
+no embedded art, because there is nothing to encode into and nothing that
+would ever read a cover out of it; and the `.strm` movies carry the full
+sidecar artwork set, because those files are not the *preferred* artwork,
+they are the only artwork the item can have.
+
+**The NFO does not fill in what the probe skipped.** Measured on 12.0 after a
+`--fresh` scan: a `.strm` movie comes back with every NFO field set — tagline,
+countries, critic rating, genres, plot — and `RunTimeTicks` **null**, despite
+`<runtime>11</runtime>` sitting in that same file as a direct child of
+`<movie>` and `BaseNfoParser` having a `case "runtime"` that reads it. So "the
+metadata comes from the NFO" is true of everything except duration. Do not
+write a fixture plot that promises a runtime; the show and movie plots say
+there is none, and that is the measurement.
+
+**An audio `.strm` resolves but never becomes remote.**
+`BaseItem.GetVersionInfo` does the shortcut substitution inside
+`var video = item as Video; if (video is not null) { … }`, and there is no
+matching branch for `Audio`. So a `.strm` in a music library resolves as a
+track — `AudioResolver` sets `IsShortcut`, `ProbeProvider.FetchAudioInfo`
+even calls `FetchShortcutInfo` and stores the `ShortcutPath` — and its media
+source still comes back protocol `File`, `IsRemote` false, path pointing at
+the `.strm` itself. Measured: all three tracks of `strm-album`. The fixture is
+kept because the resolver half genuinely works and a client is handed the item
+either way; its note says plainly that it does not play. Do not "fix" it here
+— there is nothing on this side to fix.
+
+**Only `http`, `https`, `rtsp` and `rtp` are honoured in a `.strm`, and both
+halves of the check matter.** `ProbeProvider.FetchShortcutInfo` sets
+`ShortcutPath` only for those four; `BaseItem.GetVersionInfo` then refuses
+again for any shortcut whose protocol resolves to `File`. A local path
+therefore yields an item with no usable media source rather than the file it
+names — the comment in the server says why, and it is not a subtle reason.
+`movie-strm-local-path` is that case on purpose. Do not "fix" it, and do not
+add a scheme to `strm.SCHEMES` without finding it in `FetchShortcutInfo`
+first.
+
+**The local origin exists so a playback test needs no network, and its URL is
+baked in at build time.** The archive.org fixtures are the better test — a
+real host, real TLS, real redirects — and unusable in CI or offline, so
+`origin.py` serves two generated clips from `.stdjflib/origin/` over HTTP and
+two fixtures point at those instead. Three things about it are load-bearing:
+
+- **Range requests must return 206.** `SimpleHTTPRequestHandler` ignores
+  `Range` and answers 200 with the whole body; ffmpeg reads that as a server
+  that cannot seek, so playback starts and every seek silently does nothing.
+  That is why `origin.py` is a hand-written handler and not four lines of
+  `http.server`. Verified end to end: `ffmpeg -ss 20` against the origin
+  produces a frame, and the request log is all 206.
+- **The origin is under `.stdjflib/`, never inside a library folder.** Media
+  in a library folder gets scanned, and the clips would become items — the one
+  thing a stream *target* must not be.
+- **`--stream-origin` is a build flag, not a startup one.** faketvsource is
+  told at startup how the server will reach it; a `.strm` was written earlier
+  and cannot be told anything, so a container or a remote server needs the
+  library **rebuilt** with the right base URL.
+  `origin.describe_reachability` is what says so before a scan turns it into
+  items that resolve and never play, and `cli._start_origin` prints it.
+
+It is a daemon thread rather than a subprocess, which is why it is the one
+long-lived thing here that does *not* need the `_stop_on_signals` treatment: a
+thread cannot outlive the interpreter, so no `kill` can leave port 8410 held.
+
+**`origin-long.mp4` is 400 seconds because 300 is a cliff.**
+`UserDataManager.UpdatePlayState` enforces
+`ServerConfiguration.MinResumeDurationSeconds`, default **300**: anything
+shorter has `positionTicks` zeroed and `Played` set outright. Every other clip
+here is 12-30 seconds, so before this one there was no item in the library
+that could hold a resume point at all, and a resume test against any of them
+would have been testing the cliff. The same method keeps a position only
+between `MinResumePct` 5 and `MaxResumePct` 90, so the usable window is 20s to
+360s. Do not shorten it below 300, and do not raise its bitrate: 400 seconds
+at the 1500k the other clips use is ~80 MB against a whole minimal tier of
+400, which is why it is 640x360 at 90k with a mono 48k track and lands at 7 MB.
+
+**A `.strm` inside a version set is never remote-probed, so it reports no
+runtime.** The trigger in `MediaSourceManager.GetPlaybackMediaSources` is
+`item.Path.EndsWith(".strm")` — the *item's* path, and a version set's path is
+its **primary's**. So `Local Origin Stream Movie`, whose own path is the
+`.strm`, gets probed on PlaybackInfo and comes back with 30s and its streams;
+`Local Origin Versions`, whose primary is the local `.mkv`, leaves its
+shortcut alternate at `RunTimeTicks` null. Measured both ways, including with
+`mediaSourceId` pinned to the alternate — `MediaInfoHelper` passes
+`allowMediaProbe: true`, so that is not the gate; the path test is.
+
+Consequence for anyone writing against `Local Origin Versions`: tell its
+sources apart by `Path`, `IsRemote` or `Id`, never by runtime. The *media*
+still differs threefold — 10 seconds local against 30 remote, which is what a
+player sees once it starts — and `ORIGIN_VERSION_LOCAL_SECONDS` names the 10
+so the ratio is stated once.
+
+**So there are two version sets, and they are a pair.** `Origin Primary
+Versions` names its `.strm` exactly like its folder, which
+`OrganizeAlternateVersions` makes the primary outright — so the item's path
+*does* end in `.strm`, the gate fires, and both sources come back with their
+own runtime and streams. Measured on 12.0:
+
+| Fixture | primary | alternate |
+| --- | --- | --- |
+| `Local Origin Versions` | File, 10.0s | Http, **runtime None, no streams** |
+| `Origin Primary Versions` | Http, 30.0s | File, 20.0s |
+
+One says whether a client reads a *version's own* duration; the other says
+what it does when there is none to read. Neither substitutes for the other,
+and renaming either one's files to match the other destroys the case it
+covers — in particular, making `Local Origin Versions`' shortcut the primary
+would flip which side is unprobed and lose the absence entirely.
+`ORIGIN_PRIMARY_LOCAL_SECONDS` is 20 rather than 10 so a runtime alone says
+which of the two fixtures is on screen.
+
+`ORIGIN_CLIPS` is keyed by filename and `ORIGIN_FIXTURES` maps fixtures onto
+it many-to-one, because a clip is a stream *target*: two `.strm` files naming
+one file are still two separate items.
+
+`strm.first_line` restates that parser — first line that is neither blank nor
+`#`, after tabs and CR are stripped and it is trimmed — and `verify` compares
+what it reads against the URL the manifest recorded. It is deliberately a
+second statement rather than a call back into `strm.write`, for the same
+reason `verify._ARTWORK_STEMS` spells the artwork mapping out again.
 
 **A truncated download raises no exception.** The server ends the body early
 and `read()` just returns empty, so without the explicit

@@ -28,11 +28,11 @@ Movies/          Blender open movies, public-domain shorts, and one fixture
                  per path convention Jellyfin resolves
 Test Media/      the generated codec / container / subtitle / HDR / frame-rate /
                  scan-type / aspect-ratio matrix, 88 files
-Shows/           seven series covering season folders, absolute numbering,
+Shows/           eight series covering season folders, absolute numbering,
                  date-based episodes, double episodes, gaps, flat layouts,
-                 multi-version episodes
+                 multi-version episodes, .strm stream files
 Music/           FLAC, MP3, Opus, ALAC; embedded and folder art; multi-disc,
-                 various-artists, and a completely untagged album
+                 various-artists, an untagged album, and one of .strm tracks
 Music Videos/    artist/track layout with musicvideo NFOs
 Photos/          all eight EXIF orientations, and several image formats
 Home Videos/     dated folders of short clips
@@ -87,9 +87,9 @@ hear.
 
 | Tier | Downloads | Library | Items | Generate | What it adds |
 | --- | --- | --- | --- | --- | --- |
-| `minimal` | none | 0.4 GB | 209 | ~40 s | generated media only — the CI tier, works offline |
-| `standard` | 2.4 GB | 3.8 GB | 253 | ~2.5 min | the Blender open movies, 24 real subtitle files, public-domain shorts |
-| `full` | 3.4 GB | 8.5 GB | 4774 | ~4 min | 4K, 60 fps, stereoscopic 3D, MPEG-2 and Cinepak derivatives, 8K, and the six `Bulk *` libraries |
+| `minimal` | none | 0.4 GB | 234 | ~40 s | generated media only — the CI tier, works offline |
+| `standard` | 2.4 GB | 3.8 GB | 278 | ~2.5 min | the Blender open movies, 24 real subtitle files, public-domain shorts |
+| `full` | 3.4 GB | 8.5 GB | 4799 | ~4 min | 4K, 60 fps, stereoscopic 3D, MPEG-2 and Cinepak derivatives, 8K, and the six `Bulk *` libraries |
 
 Measured on a 16-core machine. "Library" excludes the download cache, which
 `.stdjflib/cache/` keeps so a rebuild needs no network, and "Generate" excludes
@@ -136,6 +136,17 @@ behind one · **multi-version episodes**, tagged by resolution and by cut, in a
 season folder and in a folder of their own · multi-part stacking · trailers
 and extras folders · unicode and right-to-left titles · titles long enough to
 overflow any column
+
+**Remote sources** `.strm` stream files, which are a line of text where a media
+file would be: as a loose movie, in a folder of its own, as an episode, as
+`.strm` tracks in a music library, and as one alternate version of a film whose
+other version is on disk. Plus the two the server is *supposed* to refuse — a
+scheme it does not accept, and a filesystem path, which it declines twice over
+because honouring it would make a `.strm` a way to read any file on the server.
+Five more play from an HTTP origin on this machine — among them both
+spellings of a version set and a 400-second item — so an end-to-end playback
+test needs no network. Nothing is downloaded for any of them at any tier; see
+[Stream files](#stream-files)
 
 **Metadata** every field `MediaBrowser.XbmcMetadata`'s parsers actually read —
 taglines (including one absent and one far too long) · critic rating out of
@@ -233,6 +244,149 @@ about 86% of the time.) Up to ~105 MB, cached under `.stdjflib/cache/artwork/`,
 so a rebuild or a redraw needs no network. The minimal and standard tiers take
 a 150- and 250-photograph slice of it; anything with bulk libraries takes all
 400.
+
+## Stream files
+
+A `.strm` is one line of text holding a URL. Jellyfin resolves the item from
+the *path*, exactly as it would for an `.mkv`, then plays the URL instead of a
+file — which makes it the one case where an ordinary-looking item has a media
+source that is not local. There are fifteen of them here, and none of them
+downloads anything at any tier, because a stream file is a line of text.
+
+The behaviour worth knowing, all of it read out of the server:
+
+- **The extension decides the item type; the target does not.** `.strm` is in
+  `NamingOptions`' video extension list *and* its audio one, so the same file
+  is a Movie in a movies library, an Episode in a tvshows one and a track in a
+  music one. Nothing looks inside first. That is why there is a `.strm` album
+  as well as `.strm` films.
+- **A shortcut is never probed on a scan.** `IsShortcut` turns off ffprobe,
+  embedded image extraction, chapters and trickplay alike, so everything a
+  client shows before playback has to come from the NFO and the images on
+  disk. Remote probing is switched back on only when playback is actually
+  requested, which is why the stream details arrive late rather than never.
+  Measured on 12.0: every NFO field lands — tagline, genres, countries,
+  ratings, plot — and the **runtime does not**, despite `<runtime>` being in
+  the same file. A `.strm` item has no duration and no resolution until
+  something plays it.
+- **The file format tolerates more than it looks like it does.** `#` comments,
+  blank lines and leading tabs are all skipped, and everything after the first
+  URL is ignored — a `.strm` is one source, not a playlist. One fixture is
+  built out of exactly that: a comment header with a decoy URL inside it, an
+  indented real URL, and a second URL underneath that must not be read.
+- **Only `http`, `https`, `rtsp` and `rtp` are honoured**, and the check is
+  made twice — once in the parser, again in `BaseItem.GetVersionInfo`. A
+  `.strm` naming a local path resolves to an item with *no usable media
+  source* rather than to the file it names, because honouring it would make a
+  stream file a way to read any file on the server. That fixture is here, and
+  so is an `rtsp://` one, whose point is the protocol field rather than the
+  stream.
+- **A `.strm` groups as a version beside real media.** Multi-version matching
+  compares filenames without their extensions, so `Local And Remote Versions`
+  is one film with a local primary and a remote alternate, and the stream show's
+  episode three is one episode with both.
+- **Five of them need no network at all**, including both spellings of a
+  version set and a 400-second item for resume tests — see
+  [the local origin](#the-local-origin-for-tests-with-no-network).
+- **The audio case resolves but does not play, and that is the server's.**
+  `BaseItem.GetVersionInfo` swaps the URL in for the file only inside
+  `if (item is Video)`, with no branch for `Audio` — so a `.strm` track comes
+  back with protocol `File` and its media source pointing at the text file.
+  The album is here because the resolver half genuinely works and a client is
+  handed the item regardless; its note in the library says so.
+
+Most of the playable ones point at public-domain Prelinger shorts already named
+in `catalog.py`, so a stream file cannot reference something the licence gate
+has never had an opinion about; they are credited in `ATTRIBUTION.md` whether
+or not the tier downloaded a copy. The two unplayable ones are deliberately
+local — an unroutable loopback port and a filesystem path — so pressing play on
+either fetches nothing from anybody.
+
+### The local origin, for tests with no network
+
+A real remote host is the better test and the wrong one for CI, a metered
+connection, or a machine that is deliberately offline. So two fixtures —
+**Local Origin Stream Movie** and the stream show's **S01E04** — point at an
+HTTP server running on this machine instead:
+
+```
+.stdjflib/origin/origin-movie.mkv     30s, h264 + aac, in Matroska
+.stdjflib/origin/origin-episode.mp4   30s, h264 + aac, in MP4
+.stdjflib/origin/origin-long.mp4      400s, 640x360 at 90k + mono aac — 7 MB
+```
+
+Five fixtures point at those three clips — a clip is a stream *target*, not an
+item, so two `.strm` files naming one are still two items:
+
+| Fixture | Why it exists |
+| --- | --- |
+| `Local Origin Stream Movie` | the plain case: a loose `.strm`, played from this machine |
+| `Remote Stream Show` S01E04 | the same, as an episode |
+| `Local Origin Versions` | **a version set with no network**: a 10s local primary beside the 30s origin clip, so switching version switches between a local file and a URL |
+| `Origin Primary Versions` | the same set built the other way up — the `.strm` is named exactly like its folder, so it is the *primary* and a 20s local file is the alternate |
+| `Long Origin Stream Movie` | 400 seconds, for resume and progress |
+
+**The two version sets are a pair, and the difference between them is the
+server's.** `MediaSourceManager` forces the remote probe only when the
+*item's* path ends in `.strm` — and a version set's path is its **primary's**.
+Measured on 12.0 from `PlaybackInfo`:
+
+| Fixture | primary | alternate |
+| --- | --- | --- |
+| `Local Origin Versions` | File, 10.0s | Http, **no runtime, no streams** |
+| `Origin Primary Versions` | Http, 30.0s | File, 20.0s |
+
+So a shortcut sitting *inside* a set is never probed, however you ask —
+pinning `mediaSourceId` to it does not help. Naming the `.strm` exactly like
+its folder makes it the primary, puts a `.strm` back in the item's path, and
+the gate fires. One fixture tells you whether a client reads a version's own
+duration; the other tells you what it does when there is none to read. In
+`Local Origin Versions`, tell the sources apart by `Path`, `IsRemote` or `Id`
+— the media really is 10s against 30s once playing.
+
+The 400-second one is the only item in the library a resume test can use.
+`UserDataManager.UpdatePlayState` enforces `MinResumeDurationSeconds`, 300 by
+default: below it the position is zeroed and the item is marked played
+outright, and every other clip here is 12–30 seconds. The position is only
+kept between `MinResumePct` 5 and `MaxResumePct` 90, so the window that holds
+one is 20s–360s. Its bitrate is deliberately poor — 400 seconds at the rate
+the other clips use would be some 80 MB in a minimal tier of 400, and nothing
+about a resume point needs to look good.
+
+`stdjflib serve` starts that server alongside Jellyfin, on port 8410. As far
+as Jellyfin is concerned the source is exactly as remote as archive.org —
+protocol `Http`, `IsRemote` true, no probe until playback — but nothing leaves
+the machine. Measured: `PlaybackInfo` on both comes back with the real 30s
+runtime, `Video:h264, Audio:aac`, and direct play.
+
+It is a file server with one thing that is not optional: **byte ranges**.
+Python's `SimpleHTTPRequestHandler` ignores `Range` and answers 200 with the
+whole body, which ffmpeg reads as a server that cannot seek — so playback would
+start and every seek would silently do nothing. Hence a hand-written handler,
+206 responses, and `ffmpeg -ss 20` against it as the check.
+
+The clips live under `.stdjflib/` rather than in a library folder, because
+media inside a library folder is scanned and the origin would become items in
+its own right — the one thing a stream target must not be.
+
+**The URL is written into the `.strm` files at build time**, which is the same
+trap `--public-url` covers for faketvsource, arriving from the other side:
+faketvsource is told at startup how the server will reach it, and a stream file
+cannot be told anything. A server that is not on this machine needs the library
+rebuilt:
+
+```sh
+./stdjflib.py build /srv/qa-library \
+    --stream-origin http://host.containers.internal:8410
+```
+
+`stdjflib container` says so rather than letting the scan produce items that
+resolve and never play. `--no-stream-origin` leaves the server unstarted, which
+is a state worth being able to reach on purpose.
+
+`stdjflib verify` re-reads every stream file and checks that the line Jellyfin
+would take from it is still the URL the build recorded — and, for the local
+ones, that the file they name is actually there to serve.
 
 ## The bulk libraries
 

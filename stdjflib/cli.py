@@ -12,7 +12,7 @@ import sys
 import time
 
 from . import (build, catalog, config, container, fetch, ff, jfserver,
-               livetv, provision, recipes, verify)
+               livetv, origin, provision, recipes, verify)
 from .jfapi import Jellyfin
 
 DEFAULT_ROOT = os.environ.get("STDJFLIB_ROOT", "")
@@ -70,6 +70,12 @@ def _parser() -> argparse.ArgumentParser:
                          f"search, sort). Defaults to {config.DEFAULT_BULK} at "
                          f"the full tier and 0 below it; --bulk 0 disables, "
                          f"and any N overrides either way."))
+    b.add_argument("--stream-origin", default=None, metavar="URL",
+                   help=(f"base URL the local-origin .strm fixtures should "
+                         f"name (default: {origin.default_base_url()}). It is "
+                         f"written into the files, so set it here if Jellyfin "
+                         f"will not be on this machine — a container wants "
+                         f"http://host.containers.internal:{origin.DEFAULT_PORT}."))
 
     a = common(sub.add_parser(
         "artwork",
@@ -122,6 +128,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="the name the server reports")
         sp.add_argument("-v", "--verbose", action="store_true",
                         help="show the build output")
+        sp.add_argument("--no-stream-origin", action="store_true",
+                        help="do not serve the local .strm origin. Those two "
+                             "fixtures then resolve and do not play, which is "
+                             "a state worth being able to reach on purpose.")
         sp.add_argument("--live-tv", action="store_true",
                         help="also run faketvsource and wire it up as a tuner, "
                              "so the client's Live TV screens become testable")
@@ -232,6 +242,7 @@ def _config_from(args) -> config.BuildConfig:
         bulk=resolve_bulk(getattr(args, "bulk", None),
                           getattr(args, "tier", "standard")),
         use_artwork=bool(getattr(args, "use_artwork", False)),
+        stream_origin=getattr(args, "stream_origin", None) or "",
     )
 
 
@@ -387,6 +398,9 @@ def cmd_verify(args) -> int:
     report = verify.run(cfg)
     print(f"re-probed {report.files} generated files against their recipes "
           f"and {report.images} images against the shape their type calls for")
+    if report.streams:
+        print(f"re-read {report.streams} stream files for the URL Jellyfin "
+              f"would take from each")
     for note in report.notes:
         print(f"  note: {note}")
     if not report.problems:
@@ -492,6 +506,39 @@ def _start_faketv(args, state: str, public_host: str | None):
     return fake, fake.public_url
 
 
+def _start_origin(args, root: str, *, from_container: str | None = None):
+    """Serve the local `.strm` origin, if this library has one.
+
+    Returns the running server or None. Never fatal: a library built before
+    the origin fixtures existed simply has nothing to serve, and a port
+    already taken costs those two fixtures rather than the whole run.
+    """
+    if getattr(args, "no_stream_origin", False):
+        return None
+    base = build.read_manifest(root).get("stream_origin")
+    if not base:
+        return None
+    server = origin.Origin(root, port=origin.port_of(base))
+    files = server.files()
+    if not files:
+        return None
+
+    ok, why = origin.describe_reachability(base, from_container=from_container)
+    if not ok:
+        print(f"  ! {why}", flush=True)
+    if origin.port_in_use(server.port):
+        print(f"  ! port {server.port} is busy, so the local-origin stream "
+              f"fixtures will not play", flush=True)
+        return None
+    try:
+        server.start()
+    except OSError as exc:
+        print(f"  ! could not serve the stream origin: {exc}", flush=True)
+        return None
+    print(f"Stream origin: {len(files)} file(s) on {base}", flush=True)
+    return server
+
+
 def _provision_kwargs(args) -> dict:
     return {
         "password": args.password,
@@ -514,11 +561,13 @@ def _provision_run(args) -> int:
     root = os.path.abspath(args.root)
     state = config.runtime_dir(root, "faketv")
     fake = None
+    origin_server = None
     try:
         # A server elsewhere cannot reach 127.0.0.1 here, so make the operator
         # say how it should reach us rather than guessing wrong and producing
         # a tuner that saves fine and never plays.
         fake, url = _start_faketv(args, state, args.live_tv_host)
+        origin_server = _start_origin(args, root)
         jf = Jellyfin(args.server)
         provision.provision(jf, root, media_root=args.media_root,
                             live_tv_url=url, **_provision_kwargs(args))
@@ -536,6 +585,8 @@ def _provision_run(args) -> int:
         print(f"\n{exc}", file=sys.stderr)
         return 1
     finally:
+        if origin_server:
+            origin_server.stop()
         if fake:
             fake.stop()
 
@@ -598,10 +649,12 @@ def _serve(args) -> int:
     instance.start()
 
     fake = None
+    origin_server = None
     try:
         # Both processes are on this machine, so loopback is what the server
         # should use.
         fake, live_tv_url = _start_faketv(args, state, None)
+        origin_server = _start_origin(args, root)
         jf = Jellyfin(instance.url)
         try:
             provision.provision(jf, root, still_alive=instance.alive,
@@ -632,6 +685,8 @@ def _serve(args) -> int:
         print("\nStopping.")
         return 0
     finally:
+        if origin_server:
+            origin_server.stop()
         if fake:
             fake.stop()
         instance.stop()
@@ -712,12 +767,19 @@ def _container_run(args) -> int:
         return 1
 
     fake = None
+    origin_server = None
     try:
         # faketvsource runs on the host; inside the container, 127.0.0.1 is the
         # container itself. Podman and Docker each publish a different name for
         # "the host", and neither resolves outside a container.
         fake, live_tv_url = _start_faketv(
             args, state, livetv.HOST_FROM_CONTAINER.get(runtime))
+        # The origin has the same problem and cannot be fixed the same way:
+        # its URL is already inside the `.strm` files. So this serves it and
+        # says so when the address in those files is one the container cannot
+        # reach, rather than letting the scan produce items that never play.
+        origin_server = _start_origin(
+            args, root, from_container=livetv.HOST_FROM_CONTAINER.get(runtime))
         jf = Jellyfin(box.url)
         try:
             # The server must be told its own path to the media, not ours.
@@ -745,6 +807,15 @@ def _container_run(args) -> int:
                       f" (pid {fake.process.pid})")
                 print(f"  stop  kill {fake.process.pid}")
                 fake = None
+            if origin_server:
+                # The origin is a thread in *this* process, so unlike
+                # faketvsource it cannot be left behind — returning here ends
+                # it. Say so, because a container left running with the origin
+                # gone is a library whose stream fixtures stop playing for a
+                # reason nothing else would explain.
+                print(f"  ! the stream origin stops with this command; "
+                      f"the local-origin .strm fixtures will not play "
+                      f"while the container outlives it")
             return 0
         print(f"\nFollowing {box.name}. Ctrl-C to stop and remove it.")
         while box.alive():
@@ -759,6 +830,8 @@ def _container_run(args) -> int:
         print("\nStopping.")
         return 0
     finally:
+        if origin_server:
+            origin_server.stop()
         if fake:
             fake.stop()
         if not args.keep_running:
