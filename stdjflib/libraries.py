@@ -134,7 +134,16 @@ NAMING_CASES = [
     ("multi-version", "Multi Version Movie", "versions",
      "Three encodes of one film in one folder, distinguished by the bracketed "
      "tags Jellyfin reads as version names. They must appear as one item with "
-     "three sources, not three items."),
+     "three sources, not three items. No file is named exactly like the "
+     "folder, so the resolution in the tag decides which source is primary: "
+     "the 1080p one."),
+    ("multi-version-editions", "Named Editions Movie", "editions",
+     "The other multi-version spelling. One file is named exactly like the "
+     "folder, which makes it the primary version outright, and the two "
+     "alternates are named for an edition rather than a resolution. They also "
+     "differ in codec, channel count and container, so a client's version "
+     "picker has something to distinguish them by and switching source is "
+     "audible."),
     ("multi-part", "Multi Part Movie", "parts",
      "One film split across three part files. Jellyfin stacks these into a "
      "single playable item; a client that lists them separately plays a third "
@@ -154,6 +163,64 @@ NAMING_CASES = [
      "Past Any Reasonable Column Width And Keeps Going", "flat",
      "A title long enough to overflow every list column and card label."),
 ]
+
+
+# How Jellyfin decides that several files are one item in several versions,
+# and which of them is the primary source. Both halves are worth knowing
+# because both are what these fixtures are shaped to exercise.
+#
+# For a **movie**, `VideoListResolver.IsEligibleForMultiVersion` requires every
+# filename in the folder to start with the folder's own name, and what follows
+# to be either nothing at all, a leading `-`/`_`/`.`, or a bracketed tag. One
+# file failing that disqualifies the whole folder — so the versions become
+# three separate films, which is the failure this fixture is here to catch.
+#
+# For an **episode** the rule is different and much looser: files are grouped
+# by the season and episode number parsed out of the name, so anything after
+# `S01E01` is free-form and two files only have to agree on the number.
+#
+# Which version is primary is `OrganizeAlternateVersions`: a file named exactly
+# like its folder wins outright (movies only — there is no such rule for
+# episodes), otherwise the resolution in the name decides, matched as
+# `[0-9]{2}[0-9]+[ip]` and sorted numerically descending, and a set that names
+# no resolution anywhere falls back to sorting the filenames.
+_VERSION_TAG = " - [{}]"
+
+
+def version_path(base: str, tag: str, ext: str) -> str:
+    """The path of one version of the item whose base path is `base`.
+
+    `base` is the path a single-version item would have, without its
+    extension. The bracket is not decoration: it is one of the two spellings
+    `IsEligibleForMultiVersion` accepts, and the one that stays readable when
+    the tag is an edition name rather than a resolution.
+    """
+    return base + _VERSION_TAG.format(tag) + "." + ext
+
+
+# The three encodes of `multi-version`. Ordered as the server will order them,
+# highest resolution first, so reading the table tells you which is primary.
+MOVIE_VERSIONS = (
+    ("Bluray-1080p", "mkv", Video(width=1920, height=1080, bitrate="4000k"),
+     (Audio(encoder="aac"),)),
+    ("WEBDL-720p", "mkv", Video(width=1280, height=720, bitrate="1500k"),
+     (Audio(encoder="aac"),)),
+    ("SDTV-480p", "mkv", Video(width=854, height=480, bitrate="700k"),
+     (Audio(encoder="aac"),)),
+)
+
+# The alternates of `multi-version-editions`. No resolution appears in any tag,
+# on purpose — these name an *edition*, which is what the bracket syntax is
+# really for, and it means the primary can only come from the exact-name file.
+# The audio differs as well as the picture so that switching version in a
+# client is something you can hear rather than something you have to trust.
+MOVIE_EDITIONS = (
+    ("Directors Cut", "mkv", Video(width=1280, height=720, bitrate="1500k"),
+     (Audio(encoder="ac3", channels=6),)),
+    ("Theatrical", "mp4",
+     Video(encoder="libx265", width=854, height=480, bitrate="700k"),
+     (Audio(encoder="aac"),)),
+)
 
 
 def build_movies(root: str, cfg) -> list[dict]:
@@ -195,18 +262,26 @@ def build_movies(root: str, cfg) -> list[dict]:
                 artwork.folder_images(folder, rec.key, title, cfg)
             made.append({"library": "Movies", "key": rec.key, "path": media})
 
-        elif shape == "versions":
+        elif shape in ("versions", "editions"):
             folder = os.path.join(root, f"{safe} ({year})")
-            variants = [
-                ("Bluray-1080p", Video(width=1920, height=1080, bitrate="4000k")),
-                ("WEBDL-720p", Video(width=1280, height=720, bitrate="1500k")),
-                ("SDTV-480p", Video(width=854, height=480, bitrate="700k")),
-            ]
-            for tag, video in variants:
-                v = _clip(rec, key=f"{rec.key}-{tag}", video=video)
-                _emit(v, os.path.join(folder, f"{safe} ({year}) - [{tag}].mkv"),
-                      cfg)
+            base = os.path.join(folder, f"{safe} ({year})")
+            if shape == "editions":
+                # The exact-name file. Its presence is the whole point of this
+                # case: it overrides the resolution sort and becomes the
+                # primary source no matter what the alternates are called.
+                _emit(_clip(rec, key=f"{rec.key}-primary",
+                            video=Video(width=1920, height=1080,
+                                        bitrate="4000k")),
+                      base + ".mkv", cfg)
+            table = MOVIE_EDITIONS if shape == "editions" else MOVIE_VERSIONS
+            for tag, ext, video, audios in table:
+                v = _clip(rec, key=f"{rec.key}-{tag}", video=video,
+                          audios=audios, container=ext)
+                _emit(v, version_path(base, tag, ext), cfg)
             if not cfg.dry_run:
+                # One `movie.nfo` for the item, not one per version: the
+                # versions are sources of a single film, and a metadata file
+                # per source would be describing items that do not exist.
                 nfo.movie(os.path.join(folder, "movie.nfo"), key=rec.key,
                           title=title, plot=plot, year=year, runtime_minutes=1,
                           tags=["stdjflib", "naming"])
@@ -268,6 +343,11 @@ SHOWS = [
     {
         "key": "absolute-show", "title": "Absolute Numbering Show", "year": 2021,
         "style": "absolute", "episodes": 8,
+        # The one metadata field in this file that changes what the *server*
+        # does: `FillMissingEpisodeNumbersFromPath` compares `DisplayOrder`
+        # against "absolute" and resolves the numbers differently when it
+        # matches. Without it the server is guessing at what `- 003 -` means.
+        "display_order": "absolute",
         "plot": "Episodes numbered straight through with no seasons and no "
                 "season folders, the way fansubbed anime arrives. Jellyfin has "
                 "to map absolute numbers onto a season itself.",
@@ -294,12 +374,44 @@ SHOWS = [
                 "mislabels everything after the first hole.",
     },
     {
+        "key": "versions-show", "title": "Multi Version Show", "year": 2024,
+        "style": "versions",
+        "plot": "One season where most episodes exist in more than one "
+                "encode. Jellyfin groups episode files by the season and "
+                "episode number in the name, so these eight files must appear "
+                "as four episodes, three of them with a source picker. "
+                "Episode grouping arrived in Jellyfin 12.0; on 10.11 every "
+                "file is its own episode, and that difference is the point of "
+                "this show.",
+    },
+    {
         "key": "flat-show", "title": "Flat Show No Season Folders", "year": 2023,
         "style": "flat", "episodes": 6,
         "plot": "SxxExx files sitting directly in the show folder with no "
                 "season directories at all.",
     },
 ]
+
+# The versions of one episode, and the same two shapes as the movie tables
+# above: tags that name a resolution, where the highest is primary, and tags
+# that name a cut, where the primary falls to the filename sort. There is no
+# exact-name rule for episodes — the grouping key is the season and episode
+# number alone — so an episode's primary is always one of these two answers.
+EPISODE_VERSIONS = (
+    ("Bluray-1080p", "mkv", Video(width=1920, height=1080, bitrate="4000k"),
+     (Audio(encoder="aac"),)),
+    ("WEBDL-720p", "mp4", Video(width=1280, height=720, bitrate="1500k"),
+     (Audio(encoder="aac"),)),
+    ("SDTV-480p", "mkv", Video(width=854, height=480, bitrate="700k"),
+     (Audio(encoder="aac"),)),
+)
+
+EPISODE_EDITIONS = (
+    ("Aired", "mkv", Video(width=1280, height=720, bitrate="1500k"),
+     (Audio(encoder="aac"),)),
+    ("Uncensored", "mkv", Video(width=1280, height=720, bitrate="1500k"),
+     (Audio(encoder="ac3", channels=6),)),
+)
 
 EPISODE_TITLES = [
     "Pilot", "The Second One", "Something Happens", "A Complication",
@@ -308,14 +420,21 @@ EPISODE_TITLES = [
 ]
 
 
-def _season_artwork(series_folder: str, season_folder: str, season_no: int,
-                    show_key: str, show_title: str, cfg, *,
+def _season_artwork(series_folder: str, season_folder: str | None,
+                    season_no: int, show_key: str, show_title: str, cfg, *,
                     in_series_folder: bool) -> None:
     """One season's artwork, in whichever of the two places it is being tested.
 
     A season's Primary is a poster like the series' own — the shape does not
     change just because the item is a season, and a client that draws seasons
-    at 16:9 crops the title off every one of them.
+    at 16:9 crops the title off every one of them. It gets a backdrop and a
+    landscape too, because Jellyfin reads all three for a season and a client
+    that lays seasons out in a wide row needs the landscape to have one.
+
+    `season_folder` is None for a season that has no folder — a flat or
+    absolutely-numbered show still has a season one, and the series-folder
+    spelling is then the only place its artwork can go. That case is why the
+    two spellings are not interchangeable.
     """
     key = f"{show_key}-s{season_no}"
     label = "Specials" if season_no == 0 else f"Season {season_no}"
@@ -339,7 +458,8 @@ def build_shows(root: str, cfg) -> list[dict]:
         if not cfg.dry_run:
             nfo.tvshow(os.path.join(folder, "tvshow.nfo"), key=key, title=title,
                        plot=show["plot"], year=show["year"],
-                       tags=["stdjflib", "shows"])
+                       tags=["stdjflib", "shows"],
+                       display_order=show.get("display_order"))
             # One show carries every image type Jellyfin has, so a client can
             # be pointed at a single title to exercise all of them; the rest
             # get the ordinary series set.
@@ -351,31 +471,67 @@ def build_shows(root: str, cfg) -> list[dict]:
         style = show["style"]
         rec = _short(title, f"{key}-ep", duration=10)
 
+        # (season number, its folder, whether the artwork goes up in the
+        # series folder). Filled in by each style below and drawn once at the
+        # end, because every show has seasons whether or not it has season
+        # *folders* — a flat or absolutely-numbered show still gets a season
+        # one, and `season01-poster.jpg` in the series folder is the only
+        # place artwork for a season with no folder of its own can live.
+        season_art: list[tuple[int, str | None, bool]] = []
+
         def episode(season_no, ep_no, path, ep_title, aired, end=None,
-                    _rec=rec, _key=key, _show=show):
+                    versions=None, airs=None, _rec=rec, _key=key, _show=show):
             """Queue one episode. `_rec`/`_key`/`_show` are bound as defaults
             because they change on every turn of the enclosing loop, and a
-            closure over them would see only the last show's values."""
+            closure over them would see only the last show's values.
+
+            `versions` builds the same episode as several files instead of one,
+            taking `path` as the base name and putting the bracketed tag before
+            the extension. Every version gets its own NFO and its own still,
+            even though only the primary's are read: which file the server
+            elects primary is the server's decision, and a fixture that had to
+            guess right would show an episode with no artwork when it guessed
+            wrong. The duplicates also make the show behave sanely on a server
+            with no episode grouping at all, where each file really is its own
+            episode.
+            """
             ep_key = f"{_key}-s{season_no}e{ep_no}"
+            base = os.path.splitext(path)[0]
+            files = [(path, None, None, ep_key)] if not versions else [
+                (version_path(base, tag, ext), video, audios,
+                 f"{ep_key}-{tag}")
+                for tag, ext, video, audios in versions
+            ]
 
             def run():
-                v = _clip(_rec, key=ep_key, title=ep_title)
-                if not _emit(v, path, cfg):
-                    return None
-                if cfg.dry_run:
-                    return None
-                nfo.episode(os.path.splitext(path)[0] + ".nfo",
-                            key=ep_key, title=ep_title,
-                            plot=_show["plot"], season_no=season_no,
-                            episode_no=ep_no, aired=aired, runtime_minutes=1,
-                            end_episode=end)
-                # `<episode>-thumb.jpg`, which Jellyfin registers as the
-                # episode's *Primary* — hence 16:9, and hence a row of
-                # episodes laying out landscape rather than as posters.
-                artwork.sidecar_images(path, ep_key, ep_title, cfg,
-                                       kinds=("thumb",),
-                                       subtitle=f"S{season_no:02d}E{ep_no:02d}")
-                return {"library": "Shows", "key": ep_key, "path": path}
+                out = []
+                for target, video, audios, file_key in files:
+                    v = _clip(_rec, key=file_key, title=ep_title)
+                    if video:
+                        v = _clip(v, video=video, audios=audios,
+                                  container=os.path.splitext(target)[1][1:])
+                    if not _emit(v, target, cfg):
+                        continue
+                    if cfg.dry_run:
+                        continue
+                    # Keyed on the episode, not the file: every version is the
+                    # same episode, so they must not disagree about its
+                    # metadata or draw themselves a different still.
+                    nfo.episode(os.path.splitext(target)[0] + ".nfo",
+                                key=ep_key, title=ep_title,
+                                plot=_show["plot"], season_no=season_no,
+                                episode_no=ep_no, aired=aired,
+                                runtime_minutes=1, end_episode=end,
+                                show_title=_show["title"], **(airs or {}))
+                    # `<episode>-thumb.jpg`, which Jellyfin registers as the
+                    # episode's *Primary* — hence 16:9, and hence a row of
+                    # episodes laying out landscape rather than as posters.
+                    artwork.sidecar_images(
+                        target, ep_key, ep_title, cfg, kinds=("thumb",),
+                        subtitle=f"S{season_no:02d}E{ep_no:02d}")
+                    out.append({"library": "Shows", "key": file_key,
+                                "path": target})
+                return out
 
             tasks.append(run)
 
@@ -387,30 +543,38 @@ def build_shows(root: str, cfg) -> list[dict]:
                                title=f"Season {season_no}", number=season_no,
                                plot=f"Season {season_no} of {title}.",
                                year=show["year"] + season_no - 1)
-                    # Both spellings Jellyfin accepts, one per season. Season
-                    # one is `season01-poster.jpg` up in the series folder,
-                    # which is where the resolver looks first; season two is
-                    # `Season 02/poster.jpg`, which is where people put it.
-                    # A client that only handles one shows half the posters.
-                    _season_artwork(folder, sdir, season_no, key, title, cfg,
-                                    in_series_folder=season_no == 1)
+                # Both spellings Jellyfin accepts, one per season. Season
+                # one is `season01-poster.jpg` up in the series folder, which
+                # is where the resolver looks first; season two is
+                # `Season 02/poster.jpg`, which is where people put it. A
+                # client that only handles one shows half the posters.
+                season_art.append((season_no, sdir, season_no == 1))
                 for ep_no in range(1, count + 1):
                     et = EPISODE_TITLES[(ep_no - 1) % len(EPISODE_TITLES)]
                     episode(season_no, ep_no,
                             os.path.join(sdir, f"{title} - S{season_no:02d}E{ep_no:02d} - {et}.mkv"),
                             et, f"{show['year'] + season_no - 1}-0{season_no}-{ep_no:02d}")
             sdir = os.path.join(folder, "Season 00")
-            if not cfg.dry_run:
-                # Season 0 is spelled `season-specials-…`, not `season00-…`.
-                # The one season name a client is most likely to get wrong.
-                _season_artwork(folder, sdir, 0, key, title, cfg,
-                                in_series_folder=True)
+            # Season 0 is spelled `season-specials-…`, not `season00-…`. The
+            # one season name a client is most likely to get wrong.
+            season_art.append((0, sdir, True))
+            # A special is not simply "at the end of the show". It says where
+            # in watch order it belongs, and the two spellings for that are
+            # both here: one that airs before the series starts and one that
+            # airs after season one finishes. A client that ignores the fields
+            # files both at the end, which looks tidy and is wrong.
+            specials_airs = [
+                {"airs_before_season": 1, "airs_before_episode": 1},
+                {"airs_after_season": 1},
+            ]
             for ep_no in range(1, show["specials"] + 1):
                 episode(0, ep_no,
                         os.path.join(sdir, f"{title} - S00E{ep_no:02d} - Special {ep_no}.mkv"),
-                        f"Special {ep_no}", f"{show['year']}-12-{24 + ep_no:02d}")
+                        f"Special {ep_no}", f"{show['year']}-12-{24 + ep_no:02d}",
+                        airs=specials_airs[(ep_no - 1) % len(specials_airs)])
 
         elif style == "absolute":
+            season_art.append((1, None, True))
             for ep_no in range(1, show["episodes"] + 1):
                 et = EPISODE_TITLES[(ep_no - 1) % len(EPISODE_TITLES)]
                 episode(1, ep_no,
@@ -418,6 +582,9 @@ def build_shows(root: str, cfg) -> list[dict]:
                         et, f"{show['year']}-01-{ep_no:02d}")
 
         elif style == "dated":
+            season_art.append((show["year"],
+                               os.path.join(folder, f"Season {show['year']}"),
+                               True))
             for ep_no in range(1, show["episodes"] + 1):
                 date = f"{show['year']}-03-{ep_no + 9:02d}"
                 sdir = os.path.join(folder, f"Season {show['year']}")
@@ -427,6 +594,7 @@ def build_shows(root: str, cfg) -> list[dict]:
 
         elif style == "double":
             sdir = os.path.join(folder, "Season 01")
+            season_art.append((1, sdir, True))
             ep_no = 1
             while ep_no <= show["episodes"]:
                 if ep_no % 3 == 0:
@@ -444,23 +612,68 @@ def build_shows(root: str, cfg) -> list[dict]:
 
         elif style == "gaps":
             sdir = os.path.join(folder, "Season 01")
+            season_art.append((1, sdir, False))
             for ep_no in (1, 2, 5, 6, 9):
                 et = EPISODE_TITLES[(ep_no - 1) % len(EPISODE_TITLES)]
                 episode(1, ep_no,
                         os.path.join(sdir, f"{title} - S01E{ep_no:02d} - {et}.mkv"),
                         et, f"{show['year']}-09-{ep_no:02d}")
 
+        elif style == "versions":
+            sdir = os.path.join(folder, "Season 01")
+            season_art.append((1, sdir, False))
+
+            # Bound as defaults for the same reason `episode` binds its own:
+            # they change on every turn of the enclosing loop. `episode` too,
+            # which is itself redefined per show.
+            def versioned(ep_no, versions, episode=episode, sdir=sdir,
+                          title=title, show=show):
+                et = EPISODE_TITLES[ep_no - 1]
+                episode(1, ep_no,
+                        os.path.join(sdir, f"{title} - S01E{ep_no:02d} - {et}.mkv"),
+                        et, f"{show['year']}-04-{ep_no:02d}", versions=versions)
+
+            # Three encodes, one of them in a different container, tagged with
+            # resolutions — so the 1080p file is the primary source and the
+            # other two are alternates behind it.
+            versioned(1, EPISODE_VERSIONS)
+            # One file, sitting in among the rest. The control: grouping keys
+            # on the episode number, so an episode with a single encode has to
+            # come through it untouched.
+            versioned(2, None)
+            # Two cuts, neither naming a resolution. The primary falls to the
+            # filename sort, which puts `Aired` ahead of `Uncensored`.
+            versioned(3, EPISODE_EDITIONS)
+            # The same idea with a folder per episode, directly under the
+            # series rather than inside `Season 01`. `SeasonResolver` declines
+            # a folder whose name parses to an episode number instead of a
+            # season, which is what lets the two files inside it resolve as
+            # versions of S01E04.
+            ep4 = f"{title} - S01E04 - {EPISODE_TITLES[3]}"
+            episode(1, 4, os.path.join(folder, ep4, ep4 + ".mkv"),
+                    EPISODE_TITLES[3], f"{show['year']}-04-04",
+                    versions=EPISODE_VERSIONS[:2])
+
         elif style == "flat":
+            season_art.append((1, None, True))
             for ep_no in range(1, show["episodes"] + 1):
                 et = EPISODE_TITLES[(ep_no - 1) % len(EPISODE_TITLES)]
                 episode(1, ep_no,
                         os.path.join(folder, f"{title} - S01E{ep_no:02d} - {et}.mkv"),
                         et, f"{show['year']}-02-{ep_no:02d}")
 
+        if not cfg.dry_run:
+            for season_no, sdir, in_series in season_art:
+                _season_artwork(folder, sdir, season_no, key, title, cfg,
+                                in_series_folder=in_series)
+
         made.append({"library": "Shows", "key": key, "path": folder})
 
-    # Every episode across every show, in one pool rather than six.
-    made += [item for item in _run_all(tasks, cfg) if item]
+    # Every episode across every show, in one pool rather than seven. One task
+    # is one episode and yields one entry per file, which is more than one
+    # wherever the episode exists in several versions.
+    groups = _run_all(tasks, cfg)
+    made += [item for group in groups for item in (group or [])]
     return made
 
 
@@ -795,6 +1008,110 @@ def build_music_videos(root: str, cfg) -> list[dict]:
     return made
 
 
+# --------------------------------------------------------------------------
+# Mixed Content — videos and photographs in one tree
+# --------------------------------------------------------------------------
+
+# Jellyfin's "Home videos and photos" library holds both kinds at once, and a
+# real one is never tidy about it: a folder is all video, all photo, both, or
+# a container for more folders, and which of those it is changes between
+# siblings. `Home Videos/` is deliberately tidy — dated folders of clips — so
+# nothing there asks the question this library exists to ask.
+#
+# Two things are being tested. The first is that a client can render a folder
+# holding two different *kinds* of item without one of them disappearing or
+# being counted wrongly. The second is shape: jellyfin-web picks a row's
+# layout from the **median** aspect ratio of what is in it, so a folder of
+# portrait photographs beside a folder of 16:9 clips is exactly where that
+# decision gets made — and the odd one out in each folder is what shows
+# whether the row shaped itself around the median or around the first item.
+MIXED_SHAPES = {
+    "landscape": (1800, 1200),
+    "portrait": (1200, 1800),
+    "square": (1500, 1500),
+    "wide": (1920, 1080),
+}
+
+# folder (relative, "" for the library root), videos, photos, the shape most
+# of the photos are, the shape the last one is instead, and what it is for.
+MIXED_CONTENT = [
+    ("", 1, 1, "landscape", "portrait",
+     "A clip and a photograph loose in the library root, with no folder of "
+     "their own. The root of a mixed library is itself a mixed folder, which "
+     "a client that only ever renders albums never meets."),
+    ("Both At Once", 2, 4, "landscape", "portrait",
+     "One folder holding videos and photographs together. Sorting, counting "
+     "and the row's shape all have to cope with two kinds at once."),
+    ("Videos Only", 3, 0, "wide", "wide",
+     "Nothing but clips, so the folder reads as a video album."),
+    ("Photos Only", 0, 6, "portrait", "wide",
+     "Nothing but photographs, and portrait ones — the median lands on 2:3 "
+     "and the single wide frame is the one that has to survive it."),
+    ("Trips/2019/Spring", 1, 3, "square", "landscape",
+     "Three levels down, and mixed again. Depth is the test: a client that "
+     "handles one level of nesting can still lose its breadcrumb at three."),
+    ("Trips/2019/Summer", 0, 4, "landscape", "square",
+     "A sibling of the folder above that holds only photographs, so two "
+     "folders in the same row describe themselves differently."),
+    ("Trips/2020", 2, 0, "wide", "wide",
+     "A sibling at a shallower depth holding only clips, so the tree is "
+     "uneven as well as mixed."),
+]
+
+
+def build_mixed_content(root: str, cfg) -> list[dict]:
+    """One task per folder, since each is a handful of small encodes and draws."""
+    def task(entry):
+        folder, n_videos, n_photos, dominant, odd, note = entry
+
+        def run():
+            out = []
+            target = os.path.join(root, folder) if folder else root
+            label = folder.replace("/", " ") or "Root"
+            slug = safe_name(label).lower().replace(" ", "-")
+
+            for i in range(1, n_videos + 1):
+                key = f"mixed-{slug}-v{i}"
+                name = f"{label} Clip {i}"
+                rec = _clip(_short(name, key, duration=6, notes=note,
+                                   video=Video(width=1280, height=720,
+                                               bitrate="1500k")),
+                            container="mp4")
+                path = os.path.join(target, f"{name}.mp4")
+                if not _emit(rec, path, cfg):
+                    continue
+                # Two clips in three carry their own still; the third has
+                # none, so the folder exercises the sidecar path and whatever
+                # a client falls back to, side by side rather than in
+                # different libraries.
+                if not cfg.dry_run and i % 3:
+                    artwork.sidecar_images(path, key, name, cfg,
+                                           kinds=("thumb",), subtitle=label)
+                out.append({"library": "Mixed Content", "key": key,
+                            "path": path})
+
+            for i in range(1, n_photos + 1):
+                key = f"mixed-{slug}-p{i}"
+                name = f"{label} Photo {i:02d}"
+                path = os.path.join(target, f"{name}.jpg")
+                if cfg.dry_run:
+                    out.append({"library": "Mixed Content", "key": key,
+                                "path": path})
+                    continue
+                # The last one is deliberately the wrong shape for its row.
+                shape = MIXED_SHAPES[odd if i == n_photos else dominant]
+                if artwork.draw("photo", key, name, path, cfg,
+                                subtitle=label, seq=i,
+                                text=not cfg.use_artwork, size=shape):
+                    out.append({"library": "Mixed Content", "key": key,
+                                "path": path})
+            return out
+        return run
+
+    groups = _run_all([task(entry) for entry in MIXED_CONTENT], cfg)
+    return [item for group in groups for item in (group or [])]
+
+
 def build_books(root: str, cfg) -> list[dict]:
     """EPUB and CBZ, both of which are zip files this can write directly."""
     import zipfile
@@ -1111,8 +1428,16 @@ def build_bulk_shows(root: str, cfg) -> list[dict]:
                            title=meta["title"], plot=meta["plot"],
                            year=meta["year"], rating=meta["rating"],
                            tags=["stdjflib", "bulk"])
+                # Landscape as well as poster and backdrop, because at this
+                # scale a series row is where a client actually chooses
+                # between the two shapes — and one show in five ships without
+                # one, so the fallback (poster cropped to 16:9, or a
+                # placeholder) is common rather than theoretical.
+                kinds = ("poster", "backdrop")
+                if index % 5:
+                    kinds += ("thumb",)
                 artwork.folder_images(folder, meta["key"], meta["title"], cfg,
-                                      kinds=("poster", "backdrop"), seq=index)
+                                      kinds=kinds, seq=index)
             # Long shows split across seasons of 24, so season lists get big too.
             for n in range(1, episodes + 1):
                 season_no = (n - 1) // 24 + 1
@@ -1130,7 +1455,8 @@ def build_bulk_shows(root: str, cfg) -> list[dict]:
                 nfo.episode(os.path.join(sdir, name + ".nfo"), key=ep_key,
                             title=f"Episode {ep_no}", plot=meta["plot"],
                             season_no=season_no, episode_no=ep_no,
-                            aired=f"{meta['year']}-01-01", runtime_minutes=1)
+                            aired=f"{meta['year']}-01-01", runtime_minutes=1,
+                            show_title=meta["title"])
                 # A quarter get a still, so the missing-thumb path is common.
                 if n % 4 == 0:
                     artwork.sidecar_images(

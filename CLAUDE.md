@@ -62,6 +62,38 @@ Jellyfin accepts, read it there rather than guessing.
 
 ## Invariants worth not breaking
 
+**`lockdata` also locks the NFO out, so changing one never reaches a server
+that already scanned it.** `MetadataService.RefreshMetadata` returns at
+`if (item.IsLocked) return refreshResult;` *before* it runs the local
+providers, so an item already in the database is never re-read from its NFO —
+not on a scan, and not on a full refresh with `replaceAllMetadata=true` either.
+Measured: adding seven fields to every series NFO and rescanning changed
+nothing on the six series already there, while the one series new to that scan
+came back with all of them.
+
+Images are the exception and the asymmetry is deliberate:
+`ProviderManager.CanRefresh` returns true for an `ILocalImageProvider` *above*
+the `IsLocked` check, so local artwork refreshes on an ordinary scan while
+local metadata does not. That is why a redraw propagates to a running server
+and an NFO edit does not.
+
+So an incremental rebuild propagates media and artwork but not metadata. To
+see NFO changes, the item has to be new to the database: `serve
+--replace-libraries` (drops and recreates the libraries) or `serve --fresh`
+(discards the server state entirely). Worth saying out loud when a metadata
+change looks like it did nothing.
+
+**What an NFO writes is what `MediaBrowser.XbmcMetadata/Parsers/` reads.**
+Not what Kodi documents and not what `BaseNfoSaver` writes — the two disagree.
+`outline` is the standing example: the saver writes it, the parser has no
+`case` for it, so it round-trips and changes nothing. Four fields the parser
+*does* read are left out deliberately and `nfo.py`'s docstring says why —
+`watched`/`playcount`/`lastplayed` (they set one named user's view history),
+`trailer` (a URL, in an otherwise offline library), `lockedfields` (redundant
+under `lockdata`), and `namedseason` on a series (Jellyfin parses it with
+`reader.Skip()`; season names come from `season.nfo`'s `seasonname`). Adding a
+field means finding its `case` first.
+
 **Every NFO sets `<lockdata>true`.** Without it Jellyfin queries TMDB and
 friends on scan, and what the client sees then depends on the network, on the
 day, and on whatever a stranger last edited. That single field is what makes
@@ -220,6 +252,39 @@ runs before provisioning for the same reason — a mount the container cannot
 traverse should fail loudly and early, not look like an empty library. FUSE
 mounts are the usual culprit; rootless podman handles sshfs here, rootful
 Docker may not see it at all if the mount postdates the daemon.
+
+**In a photos library, a filename decides whether an image is an item.**
+`PhotoResolver` drops an image two ways, both silently and both by prefix.
+`_ignoreFiles` — folder, thumb, landscape, fanart, backdrop, poster, cover,
+logo, default — is matched with `StartsWith` against the filename, so
+`cover story.jpg` is not a photograph. And `IsOwnedByResolvedMedia` drops any
+image whose name starts with a *video's* name in the same folder, which is
+what makes `<clip>-thumb.jpg` artwork rather than an item. The result is a
+folder that holds fewer items than it has files, with nothing logged.
+`Mixed Content/` puts videos and photographs in one folder on purpose, so it
+lives closest to both rules; `test_mixed_content` restates them.
+
+**Multi-version has no setting, and episodes have a version gate anyway.**
+Nothing in `LibraryOptions` or the server configuration turns it on or off:
+`MovieResolver` passes `SupportsMultiVersion = true` unconditionally, and
+`VideoListResolver.Resolve` then picks `GetEpisodesGroupedByVersion` or
+`GetVideosGroupedByVersion` purely on the collection type. So the only switch
+that exists is the one already being set — a library added as **tvshows** gets
+episode grouping and one added as anything else does not. The version gate is
+real though: episode grouping is commit `d5bb7756f1`, which is in `v12.0-rc*`
+and in no 10.11 tag, so on the container image the same eight files are eight
+episodes. Movie versions work on both. `versions-show` says so in its plot,
+because a fixture that silently means two different things on two servers is
+worse than no fixture.
+
+**The two multi-version spellings pick their primary differently.** For a
+movie, a file named exactly like its folder is the primary source outright;
+with no such file the resolution in the name decides, matched as
+`[0-9]{2}[0-9]+[ip]` and sorted numerically descending. Episodes have no
+exact-name rule at all — they are grouped on the parsed season and episode
+number, so their primary is the resolution or, failing that, the filename
+sort. `libraries.py` carries one fixture per answer, and the tables are
+ordered so that reading them tells you which file wins.
 
 **There is no `GET /LiveTv/TunerHosts`.** It answers POST and DELETE only,
 and a GET returns 405 with an empty body — which reads as an auth or routing

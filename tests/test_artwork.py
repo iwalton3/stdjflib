@@ -122,8 +122,24 @@ class TestSets(unittest.TestCase):
 
     def test_an_episode_gets_a_still_and_a_season_gets_a_poster(self):
         self.assertEqual(artwork.SETS["episode"], ("thumb",))
+        # A season's *Primary* is a poster, not a still — the shape does not
+        # change just because the item is a season. It carries a landscape as
+        # well, but that one registers as Thumb, so the two cannot be
+        # confused: `square` is the only other Primary spelling and a season
+        # must never get it.
         self.assertIn("poster", artwork.SETS["season"])
-        self.assertNotIn("thumb", artwork.SETS["season"])
+        self.assertNotIn("square", artwork.SETS["season"])
+        primaries = {kind for kind in artwork.SETS["season"]
+                     if artwork.SPECS[kind].image_type == "Primary"}
+        self.assertEqual(primaries, {"poster"})
+
+    def test_a_season_carries_a_landscape_and_a_backdrop(self):
+        """Jellyfin reads all three for a season — `SEASON_STEM` is the
+        server's own list — and a client laying seasons out in a wide row has
+        nothing to draw without the landscape."""
+        for kind in ("poster", "backdrop", "thumb"):
+            self.assertIn(kind, artwork.SETS["season"])
+            self.assertIn(kind, artwork.SEASON_STEM)
 
     def test_something_carries_every_type(self):
         """One item per library has the lot, so all of them are reachable."""

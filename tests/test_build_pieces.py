@@ -7,6 +7,7 @@ fails with an error that names the wrong thing entirely.
 
 import os
 import pathlib
+import re
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -367,6 +368,229 @@ class TestBulk(unittest.TestCase):
 
         named = {name for name, _ in libraries.BULK_BUILDERS}
         self.assertEqual(named, set(config.BULK_LIBRARIES))
+
+
+class TestMultiVersionNaming(unittest.TestCase):
+    """The version fixtures, against the server's rules spelled out again here.
+
+    `Emby.Naming/Video/VideoListResolver.cs` is the authority, and these
+    patterns are copied out of it rather than imported from `libraries.py`,
+    for the same reason `verify._ARTWORK_STEMS` restates the artwork mapping:
+    a check that derives its expectations from the thing it is checking would
+    pass just as happily on a table that was wrong.
+    """
+
+    # `IsEligibleForMultiVersion`: strip the folder name off the front, and
+    # what is left must be empty or start with `-`, `_`, `.` or a `[tag]`.
+    ELIGIBLE = re.compile(r"^(?:$|[-_.]|\[[^]]*\])")
+    # `ResolutionRegex`, which is what elects the primary when no file is
+    # named exactly like its folder.
+    RESOLUTION = re.compile(r"[0-9]{2}[0-9]+[ip]", re.IGNORECASE)
+
+    def _names(self, table, base):
+        from stdjflib import libraries
+
+        return [libraries.version_path(base, tag, ext)
+                for tag, ext, _video, _audios in table]
+
+    def _tables(self):
+        from stdjflib import libraries
+
+        return {
+            "MOVIE_VERSIONS": libraries.MOVIE_VERSIONS,
+            "MOVIE_EDITIONS": libraries.MOVIE_EDITIONS,
+            "EPISODE_VERSIONS": libraries.EPISODE_VERSIONS,
+            "EPISODE_EDITIONS": libraries.EPISODE_EDITIONS,
+        }
+
+    def test_movie_versions_are_eligible_for_grouping(self):
+        """One ineligible filename disqualifies the whole folder, so the
+        fixture would silently become three separate films."""
+        from stdjflib import libraries
+
+        folder = "Multi Version Movie (2020)"
+        for name, table in (("MOVIE_VERSIONS", libraries.MOVIE_VERSIONS),
+                            ("MOVIE_EDITIONS", libraries.MOVIE_EDITIONS)):
+            for path in self._names(table, folder):
+                with self.subTest(name, path=path):
+                    stem = os.path.splitext(os.path.basename(path))[0]
+                    self.assertTrue(stem.startswith(folder), stem)
+                    rest = stem[len(folder):].strip()
+                    self.assertRegex(rest, self.ELIGIBLE)
+
+    def test_episode_versions_all_carry_one_episode_number(self):
+        """Episodes group on the parsed number, so every version has to agree
+        on it — and no two versions may parse to different episodes."""
+        from stdjflib import libraries
+
+        base = "Multi Version Show - S01E01 - Pilot"
+        for name, table in (("EPISODE_VERSIONS", libraries.EPISODE_VERSIONS),
+                            ("EPISODE_EDITIONS", libraries.EPISODE_EDITIONS)):
+            keys = {re.search(r"S(\d+)E(\d+)", path).groups()
+                    for path in self._names(table, base)}
+            self.assertEqual(len(keys), 1, name)
+
+    def test_resolution_tagged_sets_have_exactly_one_winner(self):
+        """The highest resolution is the primary, so a tie would make which
+        file plays depend on the filename sort instead."""
+        from stdjflib import libraries
+
+        for name, table in (("MOVIE_VERSIONS", libraries.MOVIE_VERSIONS),
+                            ("EPISODE_VERSIONS", libraries.EPISODE_VERSIONS)):
+            found = [self.RESOLUTION.search(tag) for tag, *_ in table]
+            self.assertTrue(all(found), f"{name}: a tag names no resolution")
+            values = [int(m.group()[:-1]) for m in found]
+            self.assertEqual(len(values), len(set(values)), name)
+            # Written highest-first, so the table reads as its own answer.
+            self.assertEqual(values, sorted(values, reverse=True), name)
+
+    def test_edition_tagged_sets_name_no_resolution(self):
+        """Their point is the other primary rule. A resolution in one of these
+        tags would quietly hand the decision back to the sort above."""
+        from stdjflib import libraries
+
+        for name, table in (("MOVIE_EDITIONS", libraries.MOVIE_EDITIONS),
+                            ("EPISODE_EDITIONS", libraries.EPISODE_EDITIONS)):
+            for tag, *_ in table:
+                self.assertIsNone(self.RESOLUTION.search(tag), f"{name}: {tag}")
+
+    def test_episode_editions_are_written_in_the_order_they_resolve(self):
+        """With no resolution anywhere the primary is the first filename in
+        sort order, so `Aired` has to come first in the table too."""
+        from stdjflib import libraries
+
+        tags = [tag for tag, *_ in libraries.EPISODE_EDITIONS]
+        self.assertEqual(tags, sorted(tags))
+
+    def test_versions_differ_in_what_a_client_would_show(self):
+        """A version picker listing three identical encodes tests nothing."""
+        for name, table in self._tables().items():
+            shapes = {(video.encoder, video.width, video.height, ext,
+                       tuple((a.encoder, a.channels) for a in audios))
+                      for _tag, ext, video, audios in table}
+            self.assertEqual(len(shapes), len(table), name)
+
+    def test_version_paths_are_distinct(self):
+        for name, table in self._tables().items():
+            paths = self._names(table, "Item (2020)")
+            self.assertEqual(len(set(paths)), len(table), name)
+
+    def test_every_version_encoder_is_within_its_channel_limit(self):
+        """The tables bypass `recipes.py`, so `test_recipes.py` never sees
+        them — and `eac3`/`truehd` refusing 7.1 is not discoverable from the
+        encoder list."""
+        for name, table in self._tables().items():
+            for _tag, _ext, _video, audios in table:
+                for audio in audios:
+                    cap = generate.MAX_CHANNELS.get(audio.encoder)
+                    if cap is not None:
+                        self.assertLessEqual(audio.channels, cap,
+                                             f"{name}: {audio.encoder}")
+
+    def test_both_movie_version_spellings_are_built(self):
+        from stdjflib import libraries
+
+        shapes = {shape for _key, _title, shape, _plot
+                  in libraries.NAMING_CASES}
+        self.assertIn("versions", shapes)
+        self.assertIn("editions", shapes)
+
+    def test_a_show_covers_multi_version_episodes(self):
+        from stdjflib import libraries
+
+        styles = {show["style"] for show in libraries.SHOWS}
+        self.assertIn("versions", styles)
+
+
+class TestMixedContent(unittest.TestCase):
+    """Naming rules `PhotoResolver` enforces silently.
+
+    A photograph that trips either of these is not resolved as a photo and
+    also not reported as anything — it simply is not in the library, and the
+    folder quietly holds fewer items than it has files.
+    """
+
+    # `PhotoResolver._ignoreFiles`, matched with StartsWith against the
+    # filename, so a photo called "cover story.jpg" is not a photo.
+    IGNORED_PREFIXES = ("folder", "thumb", "landscape", "fanart", "backdrop",
+                        "poster", "cover", "logo", "default")
+
+    def _folder(self, entry):
+        """The filenames `build_mixed_content` will write for one entry."""
+        folder, n_videos, n_photos, _dom, _odd, _note = entry
+        label = folder.replace("/", " ") or "Root"
+        videos = [f"{label} Clip {i}" for i in range(1, n_videos + 1)]
+        photos = [f"{label} Photo {i:02d}" for i in range(1, n_photos + 1)]
+        # What the builder writes beside each clip, for two clips in three.
+        stills = [f"{name}-thumb" for i, name in enumerate(videos, 1) if i % 3]
+        return videos, photos, stills
+
+    def test_no_photo_starts_with_an_ignored_prefix(self):
+        from stdjflib import libraries
+
+        for entry in libraries.MIXED_CONTENT:
+            _videos, photos, _stills = self._folder(entry)
+            for name in photos:
+                self.assertFalse(
+                    name.lower().startswith(self.IGNORED_PREFIXES),
+                    f"{name} would be dropped as artwork, not resolved")
+
+    def test_no_photo_is_mistaken_for_a_video_sidecar(self):
+        """`IsOwnedByResolvedMedia` drops any image whose name starts with a
+        video's name in the same folder — the rule that makes `<clip>-thumb`
+        artwork rather than a photograph, and that would just as happily eat
+        a real photograph filed next to a similarly named clip."""
+        from stdjflib import libraries
+
+        for entry in libraries.MIXED_CONTENT:
+            videos, photos, _stills = self._folder(entry)
+            for photo in photos:
+                for video in videos:
+                    self.assertFalse(
+                        photo.lower().startswith(video.lower()),
+                        f"{photo} would be read as artwork for {video}")
+
+    def test_every_still_is_owned_by_its_clip(self):
+        """The other direction: a sidecar that does *not* match its clip
+        becomes a stray photo item in among the videos."""
+        from stdjflib import libraries
+
+        for entry in libraries.MIXED_CONTENT:
+            videos, _photos, stills = self._folder(entry)
+            for still in stills:
+                self.assertTrue(
+                    any(still.lower().startswith(v.lower()) for v in videos),
+                    f"{still} belongs to no clip and would resolve as a photo")
+
+    def test_the_library_covers_all_four_folder_kinds(self):
+        from stdjflib import libraries
+
+        kinds = {(bool(v), bool(p))
+                 for _f, v, p, _d, _o, _n in libraries.MIXED_CONTENT}
+        self.assertIn((True, True), kinds)    # both
+        self.assertIn((True, False), kinds)   # video only
+        self.assertIn((False, True), kinds)   # photo only
+
+    def test_folders_sit_at_more_than_one_depth(self):
+        """A client that handles one level of nesting can still lose its way
+        at three, which is the reason for the uneven tree."""
+        from stdjflib import libraries
+
+        depths = {entry[0].count("/") + 1 if entry[0] else 0
+                  for entry in libraries.MIXED_CONTENT}
+        self.assertGreaterEqual(len(depths), 3)
+        self.assertIn(0, depths)  # the library root is itself a mixed folder
+
+    def test_every_folder_has_an_odd_shape_out(self):
+        """The median-aspect-ratio decision is only visible if something in
+        the row disagrees with it."""
+        from stdjflib import libraries
+
+        for folder, _v, photos, dominant, odd, _n in libraries.MIXED_CONTENT:
+            self.assertIn(dominant, libraries.MIXED_SHAPES, folder)
+            self.assertIn(odd, libraries.MIXED_SHAPES, folder)
+            if photos > 1:
+                self.assertNotEqual(dominant, odd, folder)
 
 
 class TestPartialBuildManifest(unittest.TestCase):

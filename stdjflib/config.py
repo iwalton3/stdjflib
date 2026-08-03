@@ -39,6 +39,11 @@ LIBRARIES = {
     "Music Videos": "musicvideos",
     "Photos": "homevideos",  # "Photos" in the UI is homevideos+photos
     "Home Videos": "homevideos",
+    # The same content type as the two above, and deliberately untidy where
+    # they are tidy: videos and photographs in one tree, at uneven depths,
+    # with folders that hold one kind, the other, or both. Separate so the
+    # tidy case stays available on its own.
+    "Mixed Content": "homevideos",
     "Books": "books",
 }
 

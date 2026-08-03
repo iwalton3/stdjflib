@@ -28,13 +28,16 @@ Movies/          Blender open movies, public-domain shorts, and one fixture
                  per path convention Jellyfin resolves
 Test Media/      the generated codec / container / subtitle / HDR / frame-rate /
                  scan-type / aspect-ratio matrix, 88 files
-Shows/           six series covering season folders, absolute numbering,
-                 date-based episodes, double episodes, gaps, flat layouts
+Shows/           seven series covering season folders, absolute numbering,
+                 date-based episodes, double episodes, gaps, flat layouts,
+                 multi-version episodes
 Music/           FLAC, MP3, Opus, ALAC; embedded and folder art; multi-disc,
                  various-artists, and a completely untagged album
 Music Videos/    artist/track layout with musicvideo NFOs
 Photos/          all eight EXIF orientations, and several image formats
 Home Videos/     dated folders of short clips
+Mixed Content/   videos and photographs in one tree, at uneven depths: folders
+                 that hold one kind, the other, or both
 Books/           EPUB and CBZ
 
 Bulk Movies/       at the full tier: ~1000 items per library, for scale
@@ -84,9 +87,9 @@ hear.
 
 | Tier | Downloads | Library | Items | Generate | What it adds |
 | --- | --- | --- | --- | --- | --- |
-| `minimal` | none | 0.3 GB | 172 | ~40 s | generated media only — the CI tier, works offline |
-| `standard` | 2.4 GB | 3.7 GB | 216 | ~2.5 min | the Blender open movies, 24 real subtitle files, public-domain shorts |
-| `full` | 3.4 GB | 8.4 GB | 4737 | ~4 min | 4K, 60 fps, stereoscopic 3D, MPEG-2 and Cinepak derivatives, 8K, and the six `Bulk *` libraries |
+| `minimal` | none | 0.4 GB | 209 | ~40 s | generated media only — the CI tier, works offline |
+| `standard` | 2.4 GB | 3.8 GB | 253 | ~2.5 min | the Blender open movies, 24 real subtitle files, public-domain shorts |
+| `full` | 3.4 GB | 8.5 GB | 4774 | ~4 min | 4K, 60 fps, stereoscopic 3D, MPEG-2 and Cinepak derivatives, 8K, and the six `Bulk *` libraries |
 
 Measured on a 16-core machine. "Library" excludes the download cache, which
 `.stdjflib/cache/` keeps so a rebuild needs no network, and "Generate" excludes
@@ -127,15 +130,28 @@ broadcast case) and an arbitrary 3:2 sample aspect MPEG-2 cannot express ·
 video with no audio · audio with no video · one-frame and three-hour runtimes ·
 a truncated file and a zero-byte file
 
-**Paths** loose files · folder/file name disagreement · multi-version ·
-multi-part stacking · trailers and extras folders · unicode and
-right-to-left titles · titles long enough to overflow any column
+**Paths** loose files · folder/file name disagreement · multi-version films,
+both spellings — resolution tags with no exact-name file, and named editions
+behind one · **multi-version episodes**, tagged by resolution and by cut, in a
+season folder and in a folder of their own · multi-part stacking · trailers
+and extras folders · unicode and right-to-left titles · titles long enough to
+overflow any column
+
+**Metadata** every field `MediaBrowser.XbmcMetadata`'s parsers actually read —
+taglines (including one absent and one far too long) · critic rating out of
+100 beside a community rating out of 10 · custom rating, which is parental
+control's field and not `mpaa` · production countries · per-episode cast and
+guest stars · specials that declare where in watch order they belong ·
+`displayorder` absolute, which changes how the *server* numbers episodes ·
+air day and time · series end dates
 
 **Artwork** every image type Jellyfin has, at the shape it expects it —
 Primary as a 2:3 poster, as a 1:1 album cover and as a 16:9 episode still ·
 Backdrop · Banner at 5.4:1 · transparent Logo and clearart · Disc · season
-posters in both places the server looks for them · sidecar naming beside
-loose files as well as folder naming · photos in a spread of aspect ratios
+posters in both places the server looks for them, on every season including
+the ones with no folder of their own · a landscape and a backdrop on every
+season as well as a poster · sidecar naming beside loose files as well as
+folder naming · photos in a spread of aspect ratios
 
 ## Artwork
 
@@ -440,6 +456,25 @@ Same tier, same ffmpeg build, same output. Concretely:
 output is **not** byte-identical to a software build, so it is opt-in, recorded
 in the manifest, and never used for the codec-matrix files whose exact encoding
 is the thing under test.
+
+### Rebuilding over an existing library
+
+`build` on a directory that already holds a library rewrites it in place, and
+`--only <folder>` limits it to the libraries you changed — the manifest carries
+the rest forward, so a partial rebuild does not forget what it did not touch.
+
+One thing to know if a server has already scanned it: **NFO changes do not
+reach an item Jellyfin already has.** `<lockdata>true</lockdata>` is what keeps
+this library reproducible, and the same flag makes
+`MetadataService.RefreshMetadata` return before it reads the NFO — so a rescan,
+and even a full refresh with "replace all metadata", both leave the old values
+in place. Artwork is the exception and refreshes normally. To pick up metadata
+changes the item has to be new to the database:
+
+```sh
+./stdjflib.py serve /srv/qa-library --replace-libraries   # recreate the libraries
+./stdjflib.py serve /srv/qa-library --fresh               # or discard server state
+```
 
 ## Adding it to Jellyfin
 

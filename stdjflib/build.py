@@ -176,6 +176,7 @@ BUILDERS = [
     ("Music Videos", libraries.build_music_videos),
     ("Photos", libraries.build_photos),
     ("Home Videos", libraries.build_home_videos),
+    ("Mixed Content", libraries.build_mixed_content),
     ("Books", libraries.build_books),
 ]
 
@@ -477,11 +478,15 @@ In the library's settings that means:
   scan-type and aspect-ratio matrix. Every clip burns its own description into
   the picture and repeats it in the item's plot, so you can see what a file is
   while it plays.
-- `Shows/` — six series covering season folders, absolute numbering,
-  date-based episodes, double episodes, missing episodes and flat layouts.
+- `Shows/` — seven series covering season folders, absolute numbering,
+  date-based episodes, double episodes, missing episodes, flat layouts and
+  episodes that exist in several versions.
 - `Music/` — FLAC, MP3, Opus and ALAC albums; embedded and folder artwork;
   multi-disc, various-artists and completely untagged cases.
 - `Photos/` — all eight EXIF orientations, and several image formats.
+- `Mixed Content/` — videos and photographs in one tree, at uneven depths,
+  with folders that hold one kind, the other, or both. The untidy counterpart
+  to `Home Videos/`.
 - `Books/`, `Home Videos/`, `Music Videos/` — smaller sets of the same idea.
 
 `{config.ATTRIBUTION}` credits every downloaded source.

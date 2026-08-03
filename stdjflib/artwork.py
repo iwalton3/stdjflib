@@ -150,7 +150,11 @@ SEASON_STEM = {
 SETS = {
     "movie":   ("poster", "backdrop", "logo"),
     "series":  ("poster", "backdrop", "logo", "banner", "thumb"),
-    "season":  ("poster", "backdrop"),
+    # A season gets a landscape as well as a poster and a backdrop. Jellyfin
+    # reads all three for a season — `SEASON_STEM` is the proof, it is the
+    # server's own list — and clients lean on the landscape wherever seasons
+    # are laid out in a wide row rather than as posters.
+    "season":  ("poster", "backdrop", "thumb"),
     "episode": ("thumb",),
     # Square on the server's own authority: `MusicAlbum` and `MusicArtist`
     # both override `GetDefaultPrimaryImageAspectRatio()` to return 1.
