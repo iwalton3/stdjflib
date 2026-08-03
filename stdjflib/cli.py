@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import os
 import shutil
+import signal
 import sys
 import time
 
@@ -413,6 +415,56 @@ def main(argv=None) -> int:
         return 130
 
 
+@contextlib.contextmanager
+def _stop_on_signals():
+    """Make SIGTERM and SIGHUP unwind the way Ctrl-C already does.
+
+    Python's default SIGTERM action kills the interpreter where it stands: no
+    exception is raised, so no `finally` runs and nothing is cleaned up. Every
+    child here is started with `start_new_session=True` — deliberately, so
+    that stopping one can signal a whole process group rather than leaving the
+    dotnet host behind — and that same isolation means a signal sent to *this*
+    process never reaches them.
+
+    Those two facts together are the bug: `kill <pid>` on a `serve` leaves a
+    Jellyfin holding port 8096 and a faketvsource holding 8409, both still
+    scanning the library, and the next run fails with "port is busy" rather
+    than with anything that points at the cause. Ctrl-C was fine and a kill
+    was not, which is the sort of difference nobody discovers until a script
+    is doing the killing.
+
+    SIGINT already arrives as KeyboardInterrupt, so raising the same exception
+    means there is one shutdown path to get right instead of two.
+
+    Each handler restores the default disposition before raising, so a second
+    signal kills outright — the escape hatch if the shutdown itself wedges.
+    """
+    handled = {}
+    for name in ("SIGTERM", "SIGHUP"):     # SIGHUP does not exist on Windows
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            handled[signum] = name
+
+    def handler(signum, _frame):
+        signal.signal(signum, signal.SIG_DFL)
+        raise KeyboardInterrupt(handled.get(signum, signum))
+
+    previous = {}
+    for signum in handled:
+        try:
+            previous[signum] = signal.signal(signum, handler)
+        except (OSError, ValueError):
+            # Not the main thread, or a platform without this signal. Losing
+            # the handler is worth less than refusing to run.
+            pass
+    try:
+        yield
+    finally:
+        for signum, old in previous.items():
+            with contextlib.suppress(OSError, ValueError):
+                signal.signal(signum, old)
+
+
 def _start_faketv(args, state: str, public_host: str | None):
     """Start faketvsource, or explain why it cannot be started.
 
@@ -454,6 +506,11 @@ def _provision_kwargs(args) -> dict:
 
 
 def cmd_provision(args) -> int:
+    with _stop_on_signals():
+        return _provision_run(args)
+
+
+def _provision_run(args) -> int:
     root = os.path.abspath(args.root)
     state = config.runtime_dir(root, "faketv")
     fake = None
@@ -484,6 +541,14 @@ def cmd_provision(args) -> int:
 
 
 def cmd_serve(args) -> int:
+    # The signal handlers go on outside everything, so they are already in
+    # place before the first child is started and still in place while the
+    # `finally` below is stopping it.
+    with _stop_on_signals():
+        return _serve(args)
+
+
+def _serve(args) -> int:
     root = os.path.abspath(args.root)
     state = os.path.abspath(args.state or config.runtime_dir(root, "jellyfin"))
     artifacts = os.path.abspath(args.artifacts or state + "-build")
@@ -597,6 +662,11 @@ def cmd_accounts(_args) -> int:
 
 
 def cmd_container(args) -> int:
+    with _stop_on_signals():
+        return _container_run(args)
+
+
+def _container_run(args) -> int:
     root = os.path.abspath(args.root)
     state = os.path.abspath(args.state or config.runtime_dir(root, "container"))
     try:

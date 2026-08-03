@@ -593,6 +593,81 @@ class TestMixedContent(unittest.TestCase):
                 self.assertNotEqual(dominant, odd, folder)
 
 
+class TestSignalHandling(unittest.TestCase):
+    """`serve` must clean up on a kill, not only on Ctrl-C.
+
+    Its children run in their own sessions so that stopping them can signal a
+    whole process group, which also means nothing else will ever reach them.
+    If the `finally` that stops them does not run, a Jellyfin is left holding
+    the port and the next run fails on that instead of on the real cause.
+    """
+
+    def setUp(self):
+        import signal
+
+        from stdjflib import cli
+
+        self.signal = signal
+        self.cli = cli
+        self.before = {s: signal.getsignal(s)
+                       for s in (signal.SIGTERM, signal.SIGHUP)}
+
+    def tearDown(self):
+        for signum, old in self.before.items():
+            self.signal.signal(signum, old)
+
+    def test_sigterm_unwinds_like_ctrl_c(self):
+        """Python's default SIGTERM kills the interpreter outright — no
+        exception, so no `finally`, so no cleanup."""
+        for name in ("SIGTERM", "SIGHUP"):
+            with self.subTest(name):
+                signum = getattr(self.signal, name)
+                cleaned = []
+                with self.assertRaises(KeyboardInterrupt):
+                    with self.cli._stop_on_signals():
+                        try:
+                            os.kill(os.getpid(), signum)
+                        finally:
+                            cleaned.append(name)
+                self.assertEqual(cleaned, [name],
+                                 "the finally block did not run")
+
+    def test_a_second_signal_is_not_caught(self):
+        """The escape hatch: if the shutdown itself wedges, killing again has
+        to work. So the handler puts the default back before it raises.
+
+        Checked from inside the block — on the way out the helper restores
+        whatever was there before, which would hide this.
+        """
+        disposition = "handler never ran"
+        with self.cli._stop_on_signals():
+            try:
+                os.kill(os.getpid(), self.signal.SIGTERM)
+            except KeyboardInterrupt:
+                disposition = self.signal.getsignal(self.signal.SIGTERM)
+        self.assertIs(disposition, self.signal.SIG_DFL)
+
+    def test_handlers_are_put_back_afterwards(self):
+        """A long-running command is not the only thing in the process; the
+        helper has to leave the disposition as it found it."""
+        original = self.signal.getsignal(self.signal.SIGTERM)
+        with self.cli._stop_on_signals():
+            self.assertNotEqual(self.signal.getsignal(self.signal.SIGTERM),
+                                original)
+        self.assertEqual(self.signal.getsignal(self.signal.SIGTERM), original)
+
+    def test_every_command_that_starts_a_child_installs_them(self):
+        """`serve`, `container` and `provision` all start processes that
+        outlive a bare kill. Adding a fourth without this is the way the bug
+        comes back."""
+        import inspect
+
+        for name in ("cmd_serve", "cmd_container", "cmd_provision"):
+            with self.subTest(name):
+                src = inspect.getsource(getattr(self.cli, name))
+                self.assertIn("_stop_on_signals()", src)
+
+
 class TestPartialBuildManifest(unittest.TestCase):
     """A `--only` build must not forget the libraries it did not rebuild."""
 

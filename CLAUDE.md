@@ -127,6 +127,19 @@ returns 0 on plenty of partial failures. The ProRes recipe originally declared
 `yuv420p` and ffmpeg silently produced `yuv422p10le`, which only `verify`
 caught.
 
+**A command that starts a child must go through `cli._stop_on_signals`.**
+Python's default SIGTERM action kills the interpreter where it stands, so no
+`finally` runs. Every child here is started with `start_new_session=True` —
+deliberately, so stopping one can signal a whole process group instead of
+leaving the dotnet host behind — and that isolation also means a signal aimed
+at the parent never reaches them. Together: `kill` on a `serve` left a
+Jellyfin on 8096 and a faketvsource on 8409, still scanning, and the next run
+failed with "port is busy" and nothing pointing at why. Ctrl-C was fine and a
+kill was not, which is a difference nobody finds until a script is doing the
+killing. `serve`, `container` and `provision` each wrap their body;
+`test_every_command_that_starts_a_child_installs_them` is what catches a
+fourth being added without it.
+
 **Server state never lives beside the library.** `config.runtime_dir()` puts
 the server's data, the dotnet artifacts and the faketvsource log under the
 system temp directory, keyed by a SHA-256 of the library root so two libraries
