@@ -63,20 +63,28 @@ def dll_path(artifacts: str, configuration: str = "Debug") -> str:
                         configuration.lower(), "jellyfin.dll")
 
 
-def find_web_client(source: str) -> str | None:
+def find_web_client(source: str, extra: str | None = None) -> str | None:
     """A built jellyfin-web, if there is one to be found.
 
     Entirely optional: the API is what a client talks to, and the web UI needs
     an npm build that has nothing to do with testing one. Without it the
     server runs with `--nowebclient`.
+
+    `extra` is looked at first and is where `web.py` puts a bundle it built in
+    a container. A `dist/` already sitting in the checkout wins over nothing
+    but loses to that, because the container build is the one whose provenance
+    this tool knows — an existing `dist/` was produced by an npm run somebody
+    else made, under rules nobody here can see.
     """
     candidates = [
+        extra,
         os.path.join(os.path.dirname(source.rstrip("/")), "jellyfin-web", "dist"),
         os.path.join(source, "web"),
         "/usr/share/jellyfin/web",
     ]
     for path in candidates:
-        if os.path.isdir(path) and os.path.exists(os.path.join(path, "index.html")):
+        if path and os.path.isdir(path) and os.path.exists(
+                os.path.join(path, "index.html")):
             return path
     return None
 

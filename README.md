@@ -487,6 +487,38 @@ library often sits on a network mount, and neither SQLite nor `dotnet build`
 tolerates one; the instances are disposable in any case, which is what
 `--fresh` is for. A reboot costs a rebuild and a factory-fresh server.
 
+### The browser UI, built where npm cannot reach you
+
+`serve` also builds jellyfin-web, so there is something to look at and not
+only an API to talk to. It does that **in a rootless podman container**, and
+that is the whole design rather than a packaging convenience.
+
+Building jellyfin-web means `npm ci` over about a hundred and thirty packages
+whose install scripts execute as whoever ran them. It is the one place this
+tool would run somebody else's code, in a project that otherwise has no
+dependencies beyond ffmpeg for exactly that reason. So the checkout is mounted
+read-only and copied to scratch inside the container, the only writable mount
+is the output directory under the system temp directory, capabilities are
+dropped, privilege escalation is off, and `npm ci` runs with
+`--ignore-scripts`. The network stays open because npm cannot work without it
+— that is the risk being contained, not removed.
+
+It is **podman or nothing**. Docker is fine in `./stdjflib.py container`,
+where the job is running a published image, and it is not a substitute here: a
+rootful daemon would run the build as root on the host, which is worse than
+running npm normally. With no podman, the server starts with `--nowebclient`
+and says so, which costs you the browser UI and nothing else. Pulling a
+prebuilt bundle from jellyfin-web's CI is deliberately not offered — it is the
+same trust, minus the ability to see what went in.
+
+The build is cached against the jellyfin-web commit, so it costs about two
+minutes once. A checkout with uncommitted changes always rebuilds, because
+serving yesterday's bundle from an edited checkout is indistinguishable from
+an edit that did nothing. `--no-web` skips it; `--web-dir` puts it elsewhere.
+
+`./stdjflib.py container` needs none of this: the official image ships its own
+web client.
+
 The web UI is optional and off unless a built `jellyfin-web/dist` is found —
 a client talks to the API, and building the web UI needs an npm toolchain that
 has nothing to do with testing one.
@@ -910,7 +942,7 @@ be checked mechanically. A QA library is not worth a copyright argument.
 python3 -m unittest discover -s tests -t .
 ```
 
-299 tests, well under a second, needing no ffmpeg, server or container
+320 tests, well under a second, needing no ffmpeg, server or container
 runtime. They cover the matrix's internal consistency, the licence rules, NFO
 output and determinism, ffmpeg argument assembly, the Books library's naming
 and archive rules, and the VobSub encoder.

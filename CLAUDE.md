@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (299 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (320 tests,
 well under a second, no ffmpeg). To try it for real, build the minimal tier —
 it downloads nothing and takes about 80 seconds on a 16-core machine:
 
@@ -50,6 +50,7 @@ filter or muxer problem.
 | `stdjflib/verify.py` | re-probe everything and compare against the recipes |
 | `stdjflib/jfapi.py` | the Jellyfin API client |
 | `stdjflib/jfserver.py` | building and running a server from source |
+| `stdjflib/web.py` | building jellyfin-web in a container, so npm never runs here |
 | `stdjflib/provision.py` | library options, the test accounts, setup |
 | `stdjflib/container.py` | running the official image under podman/docker |
 | `stdjflib/livetv.py` | optional faketvsource tuner and XMLTV guide |
@@ -308,6 +309,45 @@ in two collections at once — the case `GetCollectionsContainingItem`, new in
 friends on scan, and what the client sees then depends on the network, on the
 day, and on whatever a stranger last edited. That single field is what makes
 this a test fixture instead of a pile of files.
+
+**npm never runs on this machine, and that is what `web.py` is for.**
+Building jellyfin-web is `npm ci` over a hundred and thirty packages whose
+install scripts run as you — the one place this tool would execute somebody
+else's code, in a project whose entire dependency policy exists to avoid that.
+So it happens in a rootless podman container: the checkout is mounted **`:ro`**
+and copied to scratch inside, the only writable mount is the output directory
+under `config.runtime_dir()`, capabilities are dropped, `no-new-privileges` is
+set, and `npm ci` runs `--ignore-scripts`. The network cannot be closed —
+`npm ci` needs the registry — so it is contained rather than removed.
+
+**Podman only, and Docker is not a fallback.** They are interchangeable in
+`container.py`, where the job is running a published image. Here they are not:
+rootless podman builds in a user namespace as an unprivileged user, and a
+rootful Docker daemon would run the same build as **root on the host**, which
+is worse than running npm normally. With no podman, nothing is built and the
+server runs `--nowebclient`. Downloading a prebuilt bundle from jellyfin-web
+CI is deliberately not implemented either — it is the same trust decision
+without the ability to see what went in.
+
+Three things the container turns up that read as tooling faults:
+
+- **`-w /build` fails before anything runs.** podman refuses to start when the
+  working directory is absent from the image, exit **126**, "workdir does not
+  exist". The script makes its own directory and `cd`s there.
+- **Root cannot write to `/`.** The image's root is `dr-xr-xr-x` and
+  `--cap-drop=ALL` takes `CAP_DAC_OVERRIDE` with everything else, so
+  `mkdir /build` is "Permission denied" *because the hardening is working*.
+  The build lives in `/tmp/build`.
+- **The bundle is moved into place, never written in place.** An interrupted
+  build that left a half-populated `dist/` would satisfy `is_current` on the
+  next run and be served.
+
+The build is cached on the jellyfin-web commit, so it costs about two minutes
+once and nothing after. A checkout with local edits reports its revision as
+`<sha>-dirty` and therefore always rebuilds — serving yesterday's bundle from
+an edited checkout looks exactly like an edit that did nothing. A `dist/`
+already in the checkout is still used when there is no container build, but
+loses to one: its provenance is an npm run nobody here can see.
 
 **Nothing may depend on wall-clock time or `hash()`.** Dates derive from
 `config.EPOCH`; anything that needs a stable pseudo-random value derives it

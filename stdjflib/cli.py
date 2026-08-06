@@ -12,7 +12,7 @@ import sys
 import time
 
 from . import (build, catalog, config, container, fetch, ff, jfserver,
-               livetv, origin, provision, recipes, verify)
+               livetv, origin, provision, recipes, verify, web)
 from .jfapi import Jellyfin
 
 DEFAULT_ROOT = os.environ.get("STDJFLIB_ROOT", "")
@@ -169,6 +169,15 @@ def _parser() -> argparse.ArgumentParser:
                    help="delete the server state first, for a factory-fresh run")
     s.add_argument("--stop-after-setup", action="store_true",
                    help="shut the server down once it is provisioned")
+    s.add_argument("--no-web", action="store_true",
+                   help="do not build the browser UI. The API is all a client "
+                        "needs, and the server runs --nowebclient without it.")
+    s.add_argument("--web-dir", default=None, metavar="DIR",
+                   help="where to build jellyfin-web (default: beside the "
+                        "server state, under the system temp directory). The "
+                        "build runs in a rootless podman container so npm "
+                        "never executes on this machine; with no podman, "
+                        "nothing is built and the server runs without a UI.")
 
     pr = server_args(sub.add_parser(
         "provision", help="set up an already-running Jellyfin server"))
@@ -642,16 +651,24 @@ def _serve(args) -> int:
             print(f"\n{exc}", file=sys.stderr)
             return 1
 
-    web = jfserver.find_web_client(args.source)
-    instance = jfserver.Instance(dll, state, port=args.port, web_dir=web,
+    # Before the server starts, because the bundle is an argument to it. The
+    # build is cached on the jellyfin-web commit, so this is a no-op on every
+    # run after the first.
+    built, why = web.ensure(args.source,
+                            os.path.abspath(args.web_dir
+                                            or config.runtime_dir(root, "jellyfin-web")),
+                            enabled=not args.no_web, verbose=args.verbose)
+    found = jfserver.find_web_client(args.source, built)
+    instance = jfserver.Instance(dll, state, port=args.port, web_dir=found,
                                  ffmpeg=shutil.which("ffmpeg"),
                                  verbose=args.verbose)
     print(f"Starting the server on {instance.url}")
     print(f"  state {state}")
-    print(f"  web   {web or 'not built, running --nowebclient'}")
-    if not web:
-        print("        (the API is all a client needs; build jellyfin-web "
-              "only if you want the browser UI)")
+    print(f"  web   {found or 'not built, running --nowebclient'}")
+    print(f"        {why}")
+    if not found:
+        print("        (the API is all a client needs; the browser UI is for "
+              "looking at the library yourself)")
     instance.start()
 
     fake = None
