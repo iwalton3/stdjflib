@@ -266,6 +266,11 @@ collection is made of item ids and the items have to exist first.
 `Api Made Collection` deliberately holds the same three films as
 `The Linked Collection`, so the pair differs only in how it was made.
 
+Both of these are server bugs rather than facts of life, and
+`docs/COLLECTION_XML_BUGS.md` is the write-up: reproductions, what was
+measured against what was inferred, and the two candidate causes for the
+first one, whose root cause is **not** pinned down.
+
 **`<DisplayOrder>` is parsed, saved and can never take effect on a BoxSet.**
 `MergeDisplayOrder` copies the value only when `replaceData ||
 string.IsNullOrEmpty(target.DisplayOrder)`, and `BoxSet`'s constructor sets

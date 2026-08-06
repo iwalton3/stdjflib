@@ -811,6 +811,10 @@ members, 10.11 marks the collection — and `linkedChildAncestorIds`, which
 filters collections by the library their members came from, exists on 12.0
 only.
 
+Both the disappearing members and the ignored display order look like server
+bugs. `docs/COLLECTION_XML_BUGS.md` writes them up with reproductions, ready
+to file.
+
 **A collection's artwork is drawn here or it has none.** The provider that
 builds a collage out of a collection's members is a dynamic image provider,
 and this library switches those off along with the internet ones, so the
