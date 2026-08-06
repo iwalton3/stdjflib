@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 from . import boxsets, config, livetv
 from .jfapi import ApiError, Jellyfin
@@ -116,13 +117,21 @@ ACCOUNTS = [
         "password": DEFAULT_PASSWORD,
         "why": ("An ordinary user with everything a non-admin can have. The "
                 "control, and the non-admin that can manage recordings."),
-        # "Everything allowed" has to include this or it is not the control.
+        # "Everything allowed" has to include these or it is not the control.
+        # Both are permissions a *newly created* user does not get and no
+        # administrator bypasses, so without them the surface they gate is
+        # unreachable for every account on the server and a client has nothing
+        # to test against. Every other account still lacks them, which is the
+        # other state a client has to render.
+        #
         # EnableLiveTvManagement is a third Live TV permission, separate from
-        # EnableLiveTvAccess, and a new user does not get it — so without this
-        # no account on the server could schedule a recording and the entire
-        # DVR surface was unreachable for every client. Every other account
-        # still lacks it, which is the state a client has to render too.
-        "policy": {"EnableLiveTvManagement": True},
+        # EnableLiveTvAccess; without it nobody could schedule a recording.
+        # EnableCollectionManagement gates POST /Collections, PUT and DELETE
+        # on its items: without it no non-admin could create a collection or
+        # add anything to one, and 403 was the only answer this library could
+        # produce for the whole editing path.
+        "policy": {"EnableLiveTvManagement": True,
+                   "EnableCollectionManagement": True},
     },
     {
         "name": "qa-nopassword",
@@ -289,6 +298,90 @@ def library_options(*, chapter_images: bool = False,
             for item_type in ITEM_TYPES
         ],
     }
+
+
+#: How long to wait for a queued metadata refresh to put a collection's
+#: members back. Generous: the refresh is one library of a few folders, but
+#: it queues behind whatever else the server is doing after a full scan.
+REFRESH_TIMEOUT = 180
+
+
+def refresh_disk_collections(jf: Jellyfin, say=print) -> int:
+    """Re-read every `collection.xml` now that the films exist.
+
+    **Libraries are scanned in the order they were added, which is
+    alphabetical, so `Box Sets/` is read before `Movies/`.** At that moment
+    none of its members are in the database, every relative path resolves to
+    nothing, and on 12.0 a linked child that does not resolve is gone —
+    `LinkedChildEntity.ChildId` is a non-nullable Guid and a path has nowhere
+    to survive. So a first scan leaves every on-disk collection **empty**,
+    and nothing says so: the collection resolves, is named, draws its
+    artwork, and holds nothing.
+
+    This is the pass `boxsets.py` describes and that nothing was doing. One
+    `FullRefresh` per boxsets library, after the scan, finds the movies and
+    writes the links. `FullRefresh` rather than the default because
+    `BaseXmlProvider.HasChanged` compares the file's mtime against
+    `item.DateLastSaved` and would skip a file that has not changed — and
+    none of them have; what changed is the rest of the library.
+
+    It is also why `collection.xml` is the one metadata file here that does
+    not set `lockdata`: `RefreshMetadata` returns at `if (item.IsLocked)`
+    before the local providers run, so a locked collection could never be
+    re-read and this pass would do nothing.
+
+    The refresh is asynchronous — `POST /Items/{id}/Refresh` answers 204 and
+    queues the work — so this **waits for the members to appear** rather than
+    returning on the accepted request. An unverified refresh leaves exactly
+    the silent-empty state it is here to prevent, one race away.
+
+    Returns how many collections came back with members. Best-effort: a
+    library that will not refresh is worth a line, not a failed provision.
+    """
+    libraries = [folder for folder in jf.virtual_folders()
+                 if (folder.get("CollectionType") or "") == "boxsets"]
+    if not libraries:
+        return 0
+    say("Re-reading the on-disk collections (the films exist now)")
+    for folder in libraries:
+        item_id = folder.get("ItemId") or folder.get("Id")
+        if not item_id:
+            say(f"  ! {folder.get('Name')} has no item id to refresh")
+            continue
+        try:
+            jf.refresh_item(item_id)
+        except Exception as exc:                    # noqa: BLE001
+            say(f"  ! {folder.get('Name')}: {exc}")
+
+    # Lazily, and from `libraries`: the fixture list lives with the rest of
+    # the library definitions, and provision has no other reason to import
+    # the build side.
+    from . import libraries
+
+    expected = {spec["title"] for spec in libraries.BOX_SETS}
+    user_id = (jf.get("/Users/Me") or {}).get("Id")
+    if not user_id or not expected:
+        return 0
+    filled: dict[str, int] = {}
+    deadline = time.time() + REFRESH_TIMEOUT
+    while time.time() < deadline:
+        for box in jf.box_sets(user_id):
+            name = box.get("Name")
+            if name not in expected or name in filled:
+                continue
+            found = jf.get("/Items", params={"userId": user_id,
+                                             "parentId": box["Id"]}) or {}
+            if found.get("TotalRecordCount"):
+                filled[name] = found["TotalRecordCount"]
+        if len(filled) >= len(expected):
+            break
+        time.sleep(2)
+    for name in sorted(expected):
+        count = filled.get(name)
+        say(f"  + {name} ({count} members)" if count
+            else f"  ! {name} is still empty — it will read as a collection "
+                 f"that was built that way")
+    return len(filled)
 
 
 def create_api_collections(jf: Jellyfin, root: str, server_root: str,
@@ -539,6 +632,7 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
             on_progress=lambda p: print(f"\r  {p:5.1f}%", end="", flush=True))
         print("\r" + " " * 20 + "\r", end="")
         say("  scan finished" if done else "  scan still running (timed out)")
+        refresh_disk_collections(jf, say=say)
         # After the scan, because a collection is made of ids and the items
         # have to exist before they have any.
         if boxsets.API_COLLECTIONS:

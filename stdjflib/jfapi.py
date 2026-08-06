@@ -175,6 +175,23 @@ class Jellyfin:
     def refresh_library(self) -> None:
         self.post("/Library/Refresh", expect_json=False)
 
+    def refresh_item(self, item_id: str, *, mode: str = "FullRefresh",
+                     recursive: bool = True) -> None:
+        """Re-run the metadata providers over one item (and its children).
+
+        `FullRefresh` and not the default: `BaseXmlProvider.HasChanged`
+        compares the file's mtime against `item.DateLastSaved` and skips a
+        file that has not changed — and for the boxsets libraries nothing
+        has, which is the whole point. What changed is the rest of the
+        library.
+        """
+        self.post(f"/Items/{item_id}/Refresh",
+                  params={"metadataRefreshMode": mode,
+                          "imageRefreshMode": "None",
+                          "replaceAllMetadata": "false",
+                          "recursive": "true" if recursive else "false"},
+                  expect_json=False)
+
     # -- collections ------------------------------------------------------
 
     def item_id_at(self, path: str, user_id: str) -> str | None:

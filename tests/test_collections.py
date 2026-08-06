@@ -568,5 +568,114 @@ class TestApiProvisioning(unittest.TestCase):
                       asked)
 
 
+class TestTheRefreshThatFillsThemIn(unittest.TestCase):
+    """`refresh_disk_collections` — the pass that makes an on-disk collection
+    hold anything at all.
+
+    Libraries are scanned in the order they were added, which is
+    alphabetical, so `Box Sets/` is read before `Movies/` and every member
+    path resolves to nothing at the moment it is first read. On 12.0 that
+    linked child is then gone — `LinkedChildEntity.ChildId` is a non-nullable
+    Guid — so a first scan leaves all six collections **empty** and says
+    nothing about it. `boxsets.py` described this pass from the beginning;
+    nothing was running it, and a `--fresh` server shipped six collections
+    that resolve, are named, draw artwork and hold nothing.
+    """
+
+    def setUp(self):
+        import unittest.mock as mock
+        self.mock = mock
+
+    def client(self, folders=None, members=1):
+        jf = self.mock.Mock()
+        jf.virtual_folders.return_value = folders if folders is not None else [
+            {"Name": "Box Sets", "CollectionType": "boxsets", "ItemId": "lib1"},
+            {"Name": "Movies", "CollectionType": "movies", "ItemId": "lib2"},
+        ]
+        jf.get.return_value = {"Id": "user-1", "TotalRecordCount": members}
+        jf.box_sets.return_value = [{"Id": "b%d" % i, "Name": spec["title"]}
+                                    for i, spec in enumerate(
+                                        libraries.BOX_SETS)]
+        return jf
+
+    def test_only_the_boxsets_libraries_are_refreshed(self):
+        from stdjflib import provision
+
+        jf = self.client()
+        provision.refresh_disk_collections(jf, say=lambda *a: None)
+        self.assertEqual([c.args[0] for c in jf.refresh_item.call_args_list],
+                         ["lib1"])
+
+    def test_it_asks_for_a_full_refresh(self):
+        """The default mode compares the file's mtime against
+        `item.DateLastSaved` and skips a file that has not changed — and none
+        of them have. What changed is the rest of the library."""
+        from stdjflib import provision
+
+        jf = self.client()
+        provision.refresh_disk_collections(jf, say=lambda *a: None)
+        _args, kwargs = jf.refresh_item.call_args
+        self.assertEqual(kwargs.get("mode", "FullRefresh"), "FullRefresh")
+
+    def test_it_reports_every_collection_that_came_back(self):
+        from stdjflib import provision
+
+        said = []
+        count = provision.refresh_disk_collections(self.client(),
+                                                   say=said.append)
+        self.assertEqual(count, len(libraries.BOX_SETS))
+        for spec in libraries.BOX_SETS:
+            self.assertTrue(any(spec["title"] in line for line in said),
+                            "%s was not reported" % spec["title"])
+
+    def test_a_collection_that_stayed_empty_is_called_out(self):
+        """The whole failure mode is silence, so the one thing this must not
+        do is finish quietly when the members did not come back."""
+        from stdjflib import provision
+
+        jf = self.client(members=0)
+        said = []
+        with self.mock.patch.object(provision, "REFRESH_TIMEOUT", 0):
+            self.assertEqual(
+                provision.refresh_disk_collections(jf, say=said.append), 0)
+        self.assertTrue(any("still empty" in line for line in said))
+
+    def test_provision_actually_calls_it(self):
+        """The bug this pass fixes was not that it was wrong — it did not
+        run. `boxsets.py` described it from the first commit and nothing
+        called it, so every `--fresh` server shipped empty collections while
+        the documentation said otherwise. Source-level, because the caller
+        needs a server and this question does not."""
+        import inspect
+
+        from stdjflib import provision
+
+        source = inspect.getsource(provision.provision)
+        self.assertIn("refresh_disk_collections(", source,
+                      "provision() does not run the refresh pass, so the "
+                      "on-disk collections come out empty")
+
+    def test_no_boxsets_library_is_not_an_error(self):
+        from stdjflib import provision
+
+        jf = self.client(folders=[{"Name": "Movies",
+                                   "CollectionType": "movies"}])
+        said = []
+        self.assertEqual(
+            provision.refresh_disk_collections(jf, say=said.append), 0)
+        self.assertFalse(jf.refresh_item.called)
+        self.assertEqual(said, [])
+
+    def test_a_library_that_will_not_refresh_does_not_stop_provisioning(self):
+        from stdjflib import provision
+
+        jf = self.client()
+        jf.refresh_item.side_effect = RuntimeError("server said no")
+        said = []
+        with self.mock.patch.object(provision, "REFRESH_TIMEOUT", 0):
+            provision.refresh_disk_collections(jf, say=said.append)
+        self.assertTrue(any("server said no" in line for line in said))
+
+
 if __name__ == "__main__":
     unittest.main()
