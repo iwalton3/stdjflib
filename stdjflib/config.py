@@ -43,6 +43,11 @@ LIBRARIES = {
     # adds a `boxsets` library pointed at `<data>/collections` — and two
     # libraries wanting one name is not a fixture, it is a collision.
     "Box Sets": "boxsets",
+    # Movies whose NFOs carry a `<set>`, and the one library with
+    # `AutomaticallyAddToCollection` switched on — so the collections the
+    # *server* builds are reachable without turning the codec matrix, whose
+    # NFOs have carried a `<set>` since the first commit, into eight of them.
+    "Auto Collections": "movies",
     "Photos": "homevideos",  # "Photos" in the UI is homevideos+photos
     "Home Videos": "homevideos",
     # The same content type as the two above, and deliberately untidy where
@@ -52,6 +57,12 @@ LIBRARIES = {
     "Mixed Content": "homevideos",
     "Books": "books",
 }
+
+# The one library provisioned with `AutomaticallyAddToCollection` true.
+# `CollectionPostScanTask` skips every library where it is false, which is the
+# default and stays the default everywhere else: a `<set>` is a field a client
+# reads off a movie, and turning it into a box set is a separate decision.
+AUTO_COLLECTION_LIBRARY = "Auto Collections"
 
 # Scale libraries, kept entirely separate from the curated ones above. These
 # answer a different question: not "does the client handle this format" but

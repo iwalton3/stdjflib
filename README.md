@@ -40,6 +40,9 @@ Mixed Content/   videos and photographs in one tree, at uneven depths: folders
                  that hold one kind, the other, or both
 Books/           EPUB and CBZ
 Box Sets/        collections, whose members are paths into the libraries above
+Auto Collections/
+                 films whose NFOs carry a <set>, in the one library where the
+                 server turns that into a box set of its own
 
 Bulk Movies/       at the full tier: ~1000 items per library, for scale
 Bulk Shows/        rather than coverage — paging, virtualised scrolling,
@@ -88,7 +91,7 @@ hear.
 
 | Tier | Downloads | Library | Items | Generate | What it adds |
 | --- | --- | --- | --- | --- | --- |
-| `minimal` | none | 0.4 GB | 260 | ~40 s | generated media only — the CI tier, works offline |
+| `minimal` | none | 0.4 GB | 268 | ~40 s | generated media only — the CI tier, works offline |
 | `standard` | 2.4 GB | 3.8 GB | 278 | ~2.5 min | the Blender open movies, 24 real subtitle files, public-domain shorts |
 | `full` | 3.4 GB | 8.5 GB | 4799 | ~4 min | 4K, 60 fps, stereoscopic 3D, MPEG-2 and Cinepak derivatives, 8K, and the six `Bulk *` libraries |
 
@@ -144,7 +147,13 @@ book of every filename convention `BookFileNameParser` recognises
 in a `collection.xml` and one that is simply a folder of films — and both
 conditions `BoxSetResolver` accepts, the `[boxset]` suffix and the presence of
 the file · one collection in the movies library, which is the only place
-Jellyfin's own Movies → Collections tab looks
+Jellyfin's own Movies → Collections tab looks · a non-default `DisplayOrder`
+over members whose dates and names disagree · members drawn from two libraries
+and of two item types · both multi-version films, named by the file that is
+actually their item path · one member that deliberately resolves to nothing,
+which 12.0 drops for good and 10.11 keeps · and a library where the *server*
+builds the collections, from `<set>` tags, including a set of one that it
+refuses to build at all
 
 **Paths** loose files · folder/file name disagreement · multi-version films,
 both spellings — resolution tags with no exact-name file, and named editions
@@ -764,6 +773,58 @@ and this library switches those off along with the internet ones, so the
 poster, backdrop and logo beside each `collection.xml` are the only images the
 item can have.
 
+**`Ordered By Name` overrides the order its members appear in**, which is a
+field that fails to the default rather than failing. Jellyfin parses
+`DisplayOrder` as a sort key and falls back to `PremiereDate` when it cannot,
+so a typo is indistinguishable from a deliberate default. The two films in it
+have years running opposite to their names, so "the client honoured the field"
+and "the client ignored it" cannot look the same. Those two are also the
+contents of `The Legacy Shelf`, making them the one pair here that belongs to
+two collections at once.
+
+**`Two Libraries, One Collection`** holds a series and a film. A linked child
+can be any item, and a client that assumes a box set is a list of movies fails
+on it. It is also what `linkedChildAncestorIds` is for — the `/Items`
+parameter that filters collections by which library their members came from,
+which exists on 12.0 and in no 10.11.
+
+**`Versions Inside A Collection` names files, not folders.** A multi-version
+film's item path is its *primary version's* file, and the two spellings pick
+that differently — an exact-name file wins outright, and with none the highest
+resolution does. Naming the folder instead gives a member that resolves to
+nothing, so both films are in here named the way the server records them.
+
+**`One Member Is Missing` is broken on purpose**, and it is where the two
+server versions part company. One member resolves and one names a file that
+has never existed. On 12.0 the missing one is gone for good; on 10.11 it is
+kept and would start working the moment the file appeared. `verify` reports it
+as a note rather than a problem, and fails if something ever *does* turn up at
+that path.
+
+## Collections the server builds
+
+`Auto Collections/` is an ordinary movies library. Nothing in it says
+"collection" — the films are loose `.mkv` files with NFOs, and the only thing
+that distinguishes it is that three of its four NFOs carry a `<set>`, and that
+it is the one library provisioned with `AutomaticallyAddToCollection` on.
+
+After a scan, the server has built a box set called **The Automatic Set** out
+of the two films that name it. That box set is not in this library or in any
+folder on disk: it lives in the server's own data directory, inside a
+`boxsets` library the server adds for itself and calls "Collections". Deleting
+the database deletes it, and `serve --fresh` rebuilds it on the next scan.
+It is the one collection fixture here that cannot be verified offline.
+
+Two more of the films are there to cover what the server *does not* do.
+**The Set Of One** names a set that only one film belongs to, and Jellyfin
+refuses to create a collection for fewer than two — so that field is read,
+stored, and produces nothing a client can navigate to. **In No Set At All**
+carries no `<set>`, and must end up in no collection whatsoever.
+
+The option is off for every other library, deliberately. `Test Media/` has
+carried a `<set>` per codec group since the first commit; switching it on
+there would silently turn the codec matrix into eight box sets.
+
 ## Bitmap subtitles
 
 ffmpeg cannot produce image subtitles from text ones — it refuses with
@@ -849,7 +910,7 @@ be checked mechanically. A QA library is not worth a copyright argument.
 python3 -m unittest discover -s tests -t .
 ```
 
-290 tests, well under a second, needing no ffmpeg, server or container
+299 tests, well under a second, needing no ffmpeg, server or container
 runtime. They cover the matrix's internal consistency, the licence rules, NFO
 output and determinism, ffmpeg argument assembly, the Books library's naming
 and archive rules, and the VobSub encoder.

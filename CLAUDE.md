@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (290 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (299 tests,
 well under a second, no ffmpeg). To try it for real, build the minimal tier —
 it downloads nothing and takes about 80 seconds on a 16-core machine:
 
@@ -223,7 +223,11 @@ path would bake this machine's mount point in and fail *silently*: the
 collection still resolves, it is simply empty. The path has to be the item's
 path as Jellyfin recorded it — the media file, not the folder that names the
 movie — and a multi-version item's path is its **primary version's** file, not
-the folder the manifest records, which is why no version fixture is a member.
+the folder the manifest records. `build_movies` records that file as
+`primary` alongside the folder it calls `path`, and `build._member_paths`
+prefers it, which is what lets `Versions Inside A Collection` name both
+multi-version films — one whose primary is its exact-name file and one whose
+primary is its highest resolution — rather than avoiding them.
 
 **An unresolvable member is permanent on 12.0 and temporary on 10.11.** This
 is the collections half of the version split. 10.11 keeps `LinkedChildren` as
@@ -257,7 +261,48 @@ only images the item can ever have.
 bearing.** `CollectionManager.EnsureLibraryFolder` adds a `boxsets` library of
 its own, under the localized name **"Collections"**, pointed at
 `<data>/collections`, the first time anything creates a server-owned
-collection. Two libraries wanting one name is not a fixture.
+collection. Two libraries wanting one name is not a fixture. Provisioning
+`Auto Collections` makes that happen on the first scan, so the server's
+"Collections" library is expected to appear and is not ours.
+
+**A `<set>` does nothing until a library asks for it, and `Auto Collections`
+is the only one that does.** `CollectionPostScanTask` skips every library
+whose `AutomaticallyAddToCollection` is false — the first thing it tests — so
+everywhere else a `<set>` is a field a client can read off a movie and nothing
+more. That distinction matters here because `build_test_media` has passed
+`collection=rec.group` since the first commit: switch the option on for
+`Test Media` and eighty-seven matrix files become eight box sets built in the
+server's data directory, which is a different fixture wearing the matrix's
+clothes. `test_collections.py` forbids it.
+
+Two rules inside that task have fixtures, and the second is a trap:
+
+- **A set naming one movie creates nothing.** `if (movieIds.Count >= 2)`,
+  with the server's own comment above it. `The Set Of One` is that case: the
+  field is read, stored as `CollectionName`, and produces nothing to navigate
+  to.
+- **An existing box set of the same name is added to, not created.** The
+  lookup is `boxSets.FirstOrDefault(b => b.Name == collectionName)` over every
+  box set on the server, with **no scope of any kind** — so a `<set>` named
+  after a collection in `Box Sets/` pours movies into that fixture instead.
+  None of the names collide and a test says so. (`SaveLocalMetadata` is false,
+  so the fixture's `collection.xml` is not rewritten — only the database
+  diverges from it, which is worse, because the file still reads correctly.)
+
+What the task creates never lands in the library it read from, so this is the
+one collection fixture `verify` cannot check: it lives in the server's data
+directory, `--fresh` deletes it, and the next scan rebuilds it.
+
+**`DisplayOrder` fails to the default rather than failing.** `BoxSet.Sort`
+does `Enum.TryParse<ItemSortBy>(DisplayOrder, out var sortBy)` and falls back
+to `PremiereDate` when that fails, so a misspelled order is not an error — it
+is the default wearing the label of whatever was meant. `Ordered By Name`
+therefore asks for `SortName` over two films whose years run opposite to their
+names, which is the only way to tell "the client honoured the field" from "the
+client ignored it and the two happened to agree". Those two films are also the
+filesystem children of `The Legacy Shelf`, which makes them the one pair here
+in two collections at once — the case `GetCollectionsContainingItem`, new in
+12.0, exists to answer.
 
 **Every NFO sets `<lockdata>true`.** Without it Jellyfin queries TMDB and
 friends on scan, and what the client sees then depends on the network, on the

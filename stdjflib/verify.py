@@ -296,25 +296,42 @@ def check_box_sets(manifest, report) -> int:
                 f"{item['key']}: no {boxsets.FILENAME} ({item['path']})")
             continue
 
+        broken = item.get("unresolvable") or []
         got = boxsets.read_members(path)
-        if got != want:
+        if got != want + broken:
             report.problems.append(
                 f"{item['key']}: {boxsets.FILENAME} lists {got}, the manifest "
-                f"recorded {want}")
+                f"recorded {want + broken}")
             continue
 
         for member in got:
+            resolves = os.path.exists(os.path.join(item["path"], member))
             if os.path.isabs(member):
                 report.problems.append(
                     f"{item['key']}: member {member!r} is an absolute path — "
                     f"it resolves here and nowhere the library is mounted "
                     f"somewhere else, and an unresolved member is dropped "
                     f"silently")
-            elif not os.path.exists(os.path.join(item["path"], member)):
+            elif member in broken:
+                # The one member that is *meant* to name nothing. Checked in
+                # the other direction: a file appearing at that path would
+                # quietly convert the fixture into an ordinary collection and
+                # the version difference it exists to show would go with it.
+                if resolves:
+                    report.problems.append(
+                        f"{item['key']}: member {member!r} is supposed to "
+                        f"resolve to nothing and something is there")
+            elif not resolves:
                 report.problems.append(
                     f"{item['key']}: member {member!r} resolves to nothing, "
                     f"so the collection is short an item on 12.0 and "
                     f"eventually right on 10.11")
+
+        if broken:
+            report.notes.append(
+                f"{item['key']}: {len(broken)} member(s) deliberately name a "
+                f"file that does not exist — 12.0 drops them for good, 10.11 "
+                f"keeps them")
     return checked
 
 

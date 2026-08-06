@@ -178,6 +178,9 @@ BUILDERS = [
     ("Home Videos", libraries.build_home_videos),
     ("Mixed Content", libraries.build_mixed_content),
     ("Books", libraries.build_books),
+    # Before "Box Sets" below, though nothing links the two: this library's
+    # collections are built by the server during a scan, not by us.
+    ("Auto Collections", libraries.build_auto_collections),
 ]
 
 
@@ -357,11 +360,19 @@ def _member_paths(cfg, items: list[dict]) -> dict:
     This run's items win over the previous manifest's, so a rebuilt item is
     linked at wherever it landed this time. The manifest underneath is what
     makes `--only "Box Sets"` produce collections with members in them rather
-    than three empty folders.
+    than empty folders.
+
+    A multi-version item's manifest `path` is the folder the build wrote, and
+    the item's path on the server is its primary version's file. `primary` is
+    that file, recorded by the movies builder, and it is what a member has to
+    name — the folder resolves to nothing.
     """
-    paths = {item["key"]: item["path"]
+    def resolved(item):
+        return item.get("primary") or item["path"]
+
+    paths = {item["key"]: resolved(item)
              for item in _previous(cfg).get("items", []) if "key" in item}
-    paths.update({item["key"]: item["path"] for item in items})
+    paths.update({item["key"]: resolved(item) for item in items})
     return paths
 
 

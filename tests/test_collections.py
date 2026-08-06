@@ -256,40 +256,150 @@ class TestPlacement(unittest.TestCase):
 
 
 class TestBoxSetTable(unittest.TestCase):
-    def test_every_collection_declares_at_least_two_members(self):
+    def entries(self, spec) -> list:
+        """Everything that ends up in `<CollectionItems>`, in order."""
+        return list(spec["members"]) + list(spec.get("unresolvable", ()))
+
+    def test_every_collection_declares_at_least_two_entries(self):
         # One member is a collection that cannot show an ordering, a member
         # count or a collapse rule. It would look built and test nothing.
         for spec in libraries.BOX_SETS:
-            self.assertGreaterEqual(len(spec["members"]), 2, spec["key"])
+            self.assertGreaterEqual(len(self.entries(spec)), 2, spec["key"])
 
-    def test_members_name_items_that_exist(self):
+    def test_members_name_items_the_build_produces(self):
         built = {f"movie-{key}" for key, *_rest in libraries.NAMING_CASES}
+        built |= {key for key, *_rest in libraries.LEGACY_BOX_SET_FILMS}
+        built |= {show["key"] for show in libraries.SHOWS}
         for spec in libraries.BOX_SETS:
             for key in spec["members"]:
                 self.assertIn(key, built, f"{spec['key']} names {key}")
 
-    def test_members_are_not_multi_version_items(self):
-        # A multi-version movie's item path is its *primary version's* file,
-        # not the folder the manifest records for it, so naming one by its
-        # manifest path produces a member that resolves to nothing.
+    def test_a_multi_version_member_is_resolved_through_its_primary(self):
+        """The folder is not the item's path, so naming one needs `primary`.
+
+        `build_movies` records the folder as `path` and the primary version's
+        file as `primary`; `build._member_paths` prefers the second. A member
+        naming a multi-version item without that field would be pointed at the
+        folder, which resolves to nothing — silently, and only on a server.
+        """
         shapes = {f"movie-{key}": shape
                   for key, _title, shape, _plot in libraries.NAMING_CASES}
-        for spec in libraries.BOX_SETS:
-            for key in spec["members"]:
-                self.assertNotIn(shapes[key], ("versions", "editions"),
-                                 f"{spec['key']} names the folder of {key}")
+        named = {key for spec in libraries.BOX_SETS for key in spec["members"]}
+        multi = {key for key in named
+                 if shapes.get(key) in ("versions", "editions")}
+        self.assertTrue(multi, "no collection covers the multi-version case")
 
-    def test_exactly_one_collection_carries_the_marker(self):
-        # Both halves of BoxSetResolver's condition are covered, and each by
-        # exactly one fixture: the [boxset] suffix, and collection.xml alone.
+        source = _source()
+        movies = source[source.index("def build_movies"):
+                        source.index("def _legacy_box_set")]
+        self.assertIn('"primary":', movies)
+        build = open(
+            os.path.join(os.path.dirname(libraries.__file__), "build.py"),
+            encoding="utf-8")
+        with build as fh:
+            self.assertIn('item.get("primary")', fh.read())
+
+    def test_both_of_the_resolver_conditions_are_covered(self):
+        # `[boxset]` in the name, or a collection.xml inside. Either alone
+        # resolves, so a fixture is needed for each.
         marked = [s for s in libraries.BOX_SETS
                   if boxsets.MARKER in s["folder"]]
-        self.assertEqual(len(marked), 1)
+        self.assertTrue(marked)
         self.assertEqual(len(libraries.BOX_SETS) - len(marked), 1)
+
+    def test_exactly_one_collection_overrides_its_display_order(self):
+        ordered = [s for s in libraries.BOX_SETS if s.get("display_order")]
+        self.assertEqual(len(ordered), 1)
+        self.assertIn(ordered[0]["display_order"], boxsets.DISPLAY_ORDERS)
+        self.assertNotEqual(ordered[0]["display_order"], "PremiereDate",
+                            "overriding the default with the default")
+
+    def test_the_ordered_collection_can_tell_the_two_orders_apart(self):
+        spec, = [s for s in libraries.BOX_SETS if s.get("display_order")]
+        films = {key: (title, year)
+                 for key, title, year in libraries.LEGACY_BOX_SET_FILMS}
+        members = [films[key] for key in spec["members"]]
+        self.assertEqual(len(members), len(spec["members"]),
+                         "the ordered collection draws from another table now")
+        by_name = [t for t, _y in sorted(members)]
+        by_year = [t for t, _y in sorted(members, key=lambda m: m[1])]
+        self.assertNotEqual(by_name, by_year)
+
+    def test_exactly_one_collection_has_an_unresolvable_member(self):
+        broken = [s for s in libraries.BOX_SETS if s.get("unresolvable")]
+        self.assertEqual(len(broken), 1)
+        for path in broken[0]["unresolvable"]:
+            # Relative like every other member: the only thing wrong with it
+            # must be that the file is absent. An absolute one would fail for
+            # two reasons and prove neither.
+            self.assertFalse(posixpath.isabs(path), path)
+        # And it must still have something that does resolve, or "the
+        # collection is short an item" is indistinguishable from "the
+        # collection is empty".
+        self.assertTrue(broken[0]["members"])
+
+    def test_no_set_name_collides_with_a_collection_on_disk(self):
+        """`CollectionPostScanTask` adds to an existing box set by name.
+
+        The lookup is `boxSets.FirstOrDefault(b => b.Name == collectionName)`
+        over every box set on the server, with no scope of any kind. A `<set>`
+        named after one of the collections in `Box Sets/` would quietly pour
+        movies into that fixture instead of creating its own.
+        """
+        on_disk = {spec["title"] for spec in libraries.BOX_SETS}
+        on_disk.add("The Legacy Shelf")
+        sets = {collection for *_rest, collection
+                in libraries.AUTO_COLLECTION_MOVIES if collection}
+        self.assertFalse(sets & on_disk)
 
     def test_keys_are_unique(self):
         keys = [spec["key"] for spec in libraries.BOX_SETS]
         self.assertEqual(len(set(keys)), len(keys))
+
+
+class TestAutoCollections(unittest.TestCase):
+    """The library whose collections the server builds during a scan."""
+
+    def test_it_is_an_ordinary_movies_library(self):
+        # Nothing about the folder says "collections". The only difference is
+        # one library option and what the NFOs carry.
+        self.assertEqual(config.LIBRARIES[config.AUTO_COLLECTION_LIBRARY],
+                         "movies")
+
+    def test_a_set_of_two_and_a_set_of_one_are_both_covered(self):
+        # `if (movieIds.Count >= 2)` — a set naming one movie creates no
+        # collection at all, which is a state a client has to render too.
+        counts = {}
+        for *_rest, collection in libraries.AUTO_COLLECTION_MOVIES:
+            counts[collection] = counts.get(collection, 0) + 1
+        sizes = {name: n for name, n in counts.items() if name}
+        self.assertIn(2, sizes.values())
+        self.assertIn(1, sizes.values())
+
+    def test_one_film_carries_no_set_at_all(self):
+        # The control. It must end up in no collection whatsoever.
+        self.assertIn(None, [collection for *_rest, collection
+                             in libraries.AUTO_COLLECTION_MOVIES])
+
+    def test_only_this_library_switches_the_option_on(self):
+        from stdjflib import provision
+
+        self.assertTrue(
+            provision.library_options(
+                auto_collection=True)["AutomaticallyAddToCollection"])
+        self.assertFalse(
+            provision.library_options()["AutomaticallyAddToCollection"])
+
+    def test_the_codec_matrix_never_gets_it(self):
+        """`Test Media/` has carried a `<set>` per codec group all along.
+
+        `libraries.build_test_media` passes `collection=rec.group`, so every
+        matrix movie already names a set. Switching the option on for that
+        library would turn the matrix into eight box sets in the server's data
+        directory without a line of it being written down as a fixture.
+        """
+        self.assertNotEqual(config.AUTO_COLLECTION_LIBRARY, "Test Media")
+        self.assertIn("collection=rec.group", _source())
 
 
 if __name__ == "__main__":

@@ -529,7 +529,17 @@ def build_movies(root: str, cfg) -> list[dict]:
                           title=title, plot=plot, year=year, runtime_minutes=1,
                           tags=["stdjflib", "naming"])
                 artwork.folder_images(folder, rec.key, title, cfg)
-            made.append({"library": "Movies", "key": rec.key, "path": folder})
+            # `path` is the folder, which is what a build produced; `primary`
+            # is the file Jellyfin records as the *item's* path once
+            # `OrganizeAlternateVersions` has run, and the two are not the
+            # same thing. Anything naming this item by path — a collection
+            # member, for one — has to use the second, and the rule that picks
+            # it differs between the two spellings: an exact-name file wins
+            # outright, and with none the highest resolution does.
+            made.append({"library": "Movies", "key": rec.key, "path": folder,
+                         "primary": base + ".mkv" if shape == "editions"
+                         else version_path(base, MOVIE_VERSIONS[0][0],
+                                           MOVIE_VERSIONS[0][1])})
 
         elif shape == "strm-flat":
             name = f"{safe} ({year})"
@@ -785,15 +795,172 @@ BOX_SETS = [
                 "the file and the folder becomes an ordinary folder, which "
                 "in a boxsets library resolves to nothing.",
     },
+    {
+        "key": "boxset-display-order",
+        "folder": f"Ordered By Name {boxsets.MARKER}",
+        "title": "Ordered By Name",
+        "members": ["legacy-shelf-early", "legacy-shelf-late"],
+        "display_order": "SortName",
+        "plot": "A collection that overrides the order its members are shown "
+                "in. BoxSet.DisplayOrder defaults to PremiereDate and this "
+                "one asks for SortName, over two films whose years run "
+                "opposite to their names — so by date it is Zebra then "
+                "Aardvark, and here it must be Aardvark then Zebra. Anything "
+                "the server cannot parse as an ItemSortBy falls back to "
+                "PremiereDate silently, so a client showing the date order is "
+                "either ignoring the field or was handed a typo. Both films "
+                "are also the filesystem children of The Legacy Shelf, which "
+                "makes them the one pair here that belongs to two collections "
+                "at once.",
+    },
+    {
+        "key": "boxset-cross-library",
+        "folder": f"Two Libraries One Collection {boxsets.MARKER}",
+        "title": "Two Libraries, One Collection",
+        "members": ["standard-show", "movie-loose-file"],
+        "plot": "A collection whose members are not all the same type and do "
+                "not all come from the same library: a series from Shows and "
+                "a film from Movies. A linked child can be any item, and a "
+                "client that assumes a box set holds movies fails here. It is "
+                "also the fixture for linkedChildAncestorIds, the /Items "
+                "parameter that filters collections by the library their "
+                "members came from — which exists on 12.0 and in no 10.11.",
+    },
+    {
+        "key": "boxset-multi-version",
+        "folder": f"Versions Inside A Collection {boxsets.MARKER}",
+        "title": "Versions Inside A Collection",
+        "members": ["movie-multi-version", "movie-multi-version-editions"],
+        "plot": "Both multi-version films, each named by the file that is its "
+                "primary source rather than by the folder that holds its "
+                "three. The folder is not the item's path — Jellyfin records "
+                "the primary version's file — so naming the folder here "
+                "produces a member that resolves to nothing at all. The two "
+                "spellings also pick their primary differently: one by an "
+                "exact-name file, the other by the highest resolution. On "
+                "12.0 these two are additionally the films that "
+                "CollectionPostScanTask would refuse to add to an automatic "
+                "collection, because it skips anything with a "
+                "PrimaryVersionId; on 10.11 it adds them.",
+    },
+    {
+        "key": "boxset-broken-member",
+        "folder": f"One Member Is Missing {boxsets.MARKER}",
+        "title": "One Member Is Missing",
+        "members": ["movie-strm-loose"],
+        # Deliberately naming nothing. Relative to the collection's folder,
+        # like every other member, so the only thing wrong with it is that the
+        # file is not there.
+        "unresolvable": ["../../Movies/A Film Nobody Built (2020).mkv"],
+        "plot": "One member that resolves and one that names a file which has "
+                "never existed. This is the fixture for the difference "
+                "between the two server versions: on 12.0 the missing one is "
+                "dropped for good, because linked children live in a table "
+                "whose child column is a non-nullable id and a path has "
+                "nowhere to survive, so this collection holds one item "
+                "forever. On 10.11 the link is kept as JSON on the item and "
+                "would start working the moment the file appeared. Neither "
+                "server tells anybody, so a collection that is short an item "
+                "looks exactly like a collection that was built that way.",
+    },
 ]
+
+
+# --------------------------------------------------------------------------
+# Auto Collections — the box sets the *server* builds
+# --------------------------------------------------------------------------
+#
+# An ordinary movies library, distinguished only by what its NFOs say and by
+# the one option `provision.py` turns on for it. `<set><name>` is read by
+# `MovieNfoParser` into `Movie.CollectionName`; `CollectionPostScanTask` then
+# groups every movie by that name and creates a box set per group — but only
+# in libraries whose `AutomaticallyAddToCollection` is true, and it is false
+# everywhere else here on purpose.
+#
+# The result does not live in this library, or in any library on disk. It is
+# created through `CollectionManager.CreateCollectionAsync`, which puts a
+# `<name> [boxset]` folder under `<data>/collections` and adds a library
+# called "Collections" to hold it. So this is the one collection fixture that
+# `verify` cannot check and `--fresh` rebuilds from nothing.
+#
+# Two rules in that task are worth having a fixture for, and the second one is
+# a trap:
+#
+#   * **A set naming only one movie creates nothing.** The task's own comment
+#     says so — `if (movieIds.Count >= 2)` — so a lone `<set>` is a field with
+#     no visible effect anywhere.
+#   * **An existing box set of the same name is added to rather than created.**
+#     The lookup is `boxSets.FirstOrDefault(b => b.Name == collectionName)`
+#     across *every* box set on the server, with no scope. Name a `<set>` after
+#     one of the collections in `Box Sets/` and the task quietly pours movies
+#     into that fixture. None of these names collide, and none of them should
+#     be made to.
+
+AUTO_SET = "The Automatic Set"
+AUTO_SET_OF_ONE = "The Set Of One"
+
+AUTO_COLLECTION_MOVIES = [
+    ("auto-set-first", "First Of The Automatic Set", 2011, AUTO_SET),
+    ("auto-set-second", "Second Of The Automatic Set", 2012, AUTO_SET),
+    ("auto-set-lonely", "The Only Film In Its Set", 2013, AUTO_SET_OF_ONE),
+    # No `<set>` at all, so nothing should sweep it up. A client showing this
+    # one inside a collection is reading something other than the NFO.
+    ("auto-set-none", "In No Set At All", 2014, None),
+]
+
+AUTO_SET_PLOT = (
+    "One of two films whose NFO carries the same <set>. Nothing on disk says "
+    "they belong together — no collection.xml, no shared folder — so the box "
+    "set holding them exists only because the server built it during the scan "
+    "that followed, and it lives in the server's own data directory rather "
+    "than in this library. Delete the database and it is gone until the next "
+    "scan; nothing here can be verified offline."
+)
+
+AUTO_SET_OF_ONE_PLOT = (
+    "The only film naming its <set>, which is why that set does not exist. "
+    "CollectionPostScanTask refuses to create a collection for fewer than two "
+    "movies, so this NFO field is read, stored on the item as CollectionName, "
+    "and produces nothing a client can navigate to."
+)
+
+AUTO_SET_NONE_PLOT = (
+    "No <set> at all, in the one library where sets become collections. The "
+    "control: it must appear in no box set whatsoever."
+)
+
+
+def build_auto_collections(root: str, cfg) -> list[dict]:
+    made = []
+    plots = {AUTO_SET: AUTO_SET_PLOT, AUTO_SET_OF_ONE: AUTO_SET_OF_ONE_PLOT,
+             None: AUTO_SET_NONE_PLOT}
+    for key, title, year, collection in AUTO_COLLECTION_MOVIES:
+        plot = plots[collection]
+        rec = _short(title, key, notes=plot)
+        name = f"{title} ({year})"
+        media = os.path.join(root, f"{name}.mkv")
+        if _emit(rec, media, cfg) and not cfg.dry_run:
+            nfo.movie(os.path.join(root, f"{name}.nfo"), key=rec.key,
+                      title=title, plot=plot, year=year, runtime_minutes=1,
+                      tags=["stdjflib", "collection"], collection=collection)
+            artwork.sidecar_images(media, rec.key, title, cfg,
+                                   kinds=artwork.SETS["movie"])
+        made.append({"library": "Auto Collections", "key": rec.key,
+                     "path": media, "set": collection})
+    return made
 
 
 def build_box_sets(root: str, cfg, members: dict) -> list[dict]:
     """Collections whose members are paths into the other libraries.
 
-    `members` maps a manifest key to the path recorded for that item, which is
-    the path Jellyfin resolves the item at — the media file, not the folder
-    that holds it.
+    `members` maps a manifest key to the path Jellyfin resolves that item at —
+    the media file, and for a multi-version item its primary version's file
+    rather than the folder the build recorded.
+
+    A spec's `unresolvable` entries are written verbatim and are meant to
+    resolve to nothing. They go into the file after the real members so that
+    the ones which do resolve are not reordered by the presence of one that
+    does not.
     """
     made = []
     for spec in BOX_SETS:
@@ -805,11 +972,13 @@ def build_box_sets(root: str, cfg, members: dict) -> list[dict]:
                 print(f"    ! {spec['folder']}: no item built for {key!r}")
                 continue
             paths.append(boxsets.member_path(folder, target))
+        broken = list(spec.get("unresolvable", ()))
 
         if not cfg.dry_run:
             os.makedirs(folder, exist_ok=True)
             boxsets.write(folder, title=spec["title"], plot=spec["plot"],
-                          members=paths, year=YEAR,
+                          members=paths + broken, year=YEAR,
+                          display_order=spec.get("display_order"),
                           tags=["stdjflib", "collection", spec["key"]])
             # A collection has no media to extract an image from, and
             # `CollectionImageProvider` — which would build a collage out of
@@ -818,8 +987,11 @@ def build_box_sets(root: str, cfg, members: dict) -> list[dict]:
             # These drawn images are the only ones the item can have.
             artwork.folder_images(folder, spec["key"], spec["title"], cfg,
                                   kinds=artwork.SETS["movie"])
-        made.append({"library": "Box Sets", "key": spec["key"],
-                     "path": folder, "members": paths})
+        entry = {"library": "Box Sets", "key": spec["key"], "path": folder,
+                 "members": paths}
+        if broken:
+            entry["unresolvable"] = broken
+        made.append(entry)
     return made
 
 

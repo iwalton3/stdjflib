@@ -209,7 +209,8 @@ ACCOUNTS = [
 
 
 def library_options(*, chapter_images: bool = False,
-                    trickplay: bool = False) -> dict:
+                    trickplay: bool = False,
+                    auto_collection: bool = False) -> dict:
     """Library options with internet metadata genuinely off.
 
     The obvious switch does not work. `LibraryOptions.EnableInternetProviders`
@@ -264,7 +265,20 @@ def library_options(*, chapter_images: bool = False,
         "SubtitleDownloadLanguages": [],
         "RequirePerfectSubtitleMatch": True,
         "SaveSubtitlesWithMedia": False,
-        "AutomaticallyAddToCollection": False,
+        # `CollectionPostScanTask` skips every library where this is false —
+        # it is the first thing the task tests — so a `<set>` in an NFO does
+        # nothing but set `Movie.CollectionName` unless a library asks for it.
+        # Exactly one does: `config.AUTO_COLLECTION_LIBRARY`. The codec matrix
+        # has carried a `<set>` per codec group since the first commit, and
+        # switching this on there would turn it into eight box sets built in
+        # the server's data directory, which is a different fixture wearing
+        # the matrix's clothes.
+        #
+        # What the task creates does not land in the library it read from. It
+        # goes through `CreateCollectionAsync` into `<data>/collections`,
+        # under a `boxsets` library the server adds for itself and calls
+        # "Collections" — which is why ours is called "Box Sets".
+        "AutomaticallyAddToCollection": auto_collection,
         "AllowEmbeddedSubtitles": "AllowAll",
         "TypeOptions": [
             {"Type": item_type,
@@ -384,8 +398,10 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
                 continue
             jf.remove_library(name)
         jf.add_library(name, kind, [os.path.join(server_root, name)],
-                       library_options(chapter_images=chapter_images,
-                                       trickplay=trickplay))
+                       library_options(
+                           chapter_images=chapter_images,
+                           trickplay=trickplay,
+                           auto_collection=name == config.AUTO_COLLECTION_LIBRARY))
         say(f"  + {name} ({kind})")
 
     say(f"Accounts ({len(ACCOUNTS)})")
