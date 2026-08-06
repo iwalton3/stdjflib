@@ -404,6 +404,9 @@ def cmd_verify(args) -> int:
     if report.streams:
         print(f"re-read {report.streams} stream files for the URL Jellyfin "
               f"would take from each")
+    if report.box_sets:
+        print(f"re-read {report.box_sets} collection(s) and resolved every "
+              f"member the way the server resolves a linked child")
     for note in report.notes:
         print(f"  note: {note}")
     if not report.problems:

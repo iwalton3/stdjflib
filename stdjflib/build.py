@@ -249,6 +249,17 @@ def run(cfg) -> dict:
         items += made
         _say(f"  {len(made)} items")
 
+    # After every library that owns media, because a collection is a list of
+    # paths into them and has nothing of its own to build. `--only "Box Sets"`
+    # is still meant to work, so the members it cannot see in this run are
+    # looked up in the manifest the last build left behind.
+    if cfg.wants("Box Sets"):
+        _say("Box Sets")
+        made = libraries.build_box_sets(
+            cfg.path("Box Sets"), cfg, _member_paths(cfg, items))
+        items += made
+        _say(f"  {len(made)} items")
+
     if cfg.bulk:
         _say()
         _say(f"Bulk libraries — {cfg.bulk} items each, media shared by hard link")
@@ -338,6 +349,20 @@ def _remember_artwork_choice(cfg) -> None:
 
 def _previous(cfg) -> dict:
     return read_manifest(cfg.root)
+
+
+def _member_paths(cfg, items: list[dict]) -> dict:
+    """Item key -> path, for the collections to point at.
+
+    This run's items win over the previous manifest's, so a rebuilt item is
+    linked at wherever it landed this time. The manifest underneath is what
+    makes `--only "Box Sets"` produce collections with members in them rather
+    than three empty folders.
+    """
+    paths = {item["key"]: item["path"]
+             for item in _previous(cfg).get("items", []) if "key" in item}
+    paths.update({item["key"]: item["path"] for item in items})
+    return paths
 
 
 def read_manifest(root: str) -> dict:

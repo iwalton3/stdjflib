@@ -39,6 +39,7 @@ Home Videos/     dated folders of short clips
 Mixed Content/   videos and photographs in one tree, at uneven depths: folders
                  that hold one kind, the other, or both
 Books/           EPUB and CBZ
+Box Sets/        collections, whose members are paths into the libraries above
 
 Bulk Movies/       at the full tier: ~1000 items per library, for scale
 Bulk Shows/        rather than coverage — paging, virtualised scrolling,
@@ -87,7 +88,7 @@ hear.
 
 | Tier | Downloads | Library | Items | Generate | What it adds |
 | --- | --- | --- | --- | --- | --- |
-| `minimal` | none | 0.4 GB | 234 | ~40 s | generated media only — the CI tier, works offline |
+| `minimal` | none | 0.4 GB | 260 | ~40 s | generated media only — the CI tier, works offline |
 | `standard` | 2.4 GB | 3.8 GB | 278 | ~2.5 min | the Blender open movies, 24 real subtitle files, public-domain shorts |
 | `full` | 3.4 GB | 8.5 GB | 4799 | ~4 min | 4K, 60 fps, stereoscopic 3D, MPEG-2 and Cinepak derivatives, 8K, and the six `Bulk *` libraries |
 
@@ -138,6 +139,12 @@ resolve with full metadata and which no client can open · **audiobooks in
 both shapes**: one chaptered `.m4b` that comes back as a single item with
 real chapter rows, and a six-part rip that comes back as six items · and one
 book of every filename convention `BookFileNameParser` recognises
+
+**Collections** both shapes a box set comes in — one whose members are paths
+in a `collection.xml` and one that is simply a folder of films — and both
+conditions `BoxSetResolver` accepts, the `[boxset]` suffix and the presence of
+the file · one collection in the movies library, which is the only place
+Jellyfin's own Movies → Collections tab looks
 
 **Paths** loose files · folder/file name disagreement · multi-version films,
 both spellings — resolution tags with no exact-name file, and named editions
@@ -699,6 +706,64 @@ resolves each file on its own. Put a *seventh* audio file in that folder that
 does not stack with the rest and the folder yields one item, the early return
 fires, and the six parts vanish from the library with nothing logged.
 
+## Collections
+
+A collection is the one item here made entirely of references. It owns no
+media, its content is a list of other items, and every way it can be wrong is
+a way that produces a collection which resolves, renders, and is quietly
+missing things.
+
+**There are two shapes, and they are in different libraries because they have
+to be.** `Box Sets/` holds collections that name their members in a
+`collection.xml`; `Movies/The Legacy Shelf [boxset]/` is a collection that is
+simply a folder of films, with its children read off the disk. The split is
+not tidiness: `MovieResolver` refuses a `boxsets` library outright — its list
+of valid collection types is movies, homevideos, musicvideos, tvshows, photos
+— so a film inside a box set in `Box Sets/` would resolve to nothing at all.
+Jellyfin tells the two shapes apart by absence, in `BoxSet.IsLegacyBoxSet`: no
+linked children, and a path outside the server's own data directory.
+
+Being in the movies library is also what puts the legacy one on jellyfin-web's
+**Movies → Collections** tab, which queries box sets parented to that library.
+A collection in `Box Sets/` appears in its own library's tabs and not there.
+
+**A folder becomes a collection two ways, and both are covered.** Either the
+directory name contains `[boxset]`, or it holds a `collection.xml` — one
+fixture each, which is why one of them is called `Collection Without The
+Marker`. `BoxSetResolver` runs ahead of every media resolver and applies in
+any library type, not just a `boxsets` one.
+
+**`collection.xml` is not an NFO.** It is the older Emby XML — rooted at
+`<Item>`, PascalCase — and the element that sets the name is `<LocalTitle>`.
+A `<title>` written in the Kodi dialect the rest of this library uses is read
+by nobody. The whole file is written against `BaseItemXmlParser`'s case list
+in the same way the NFOs are written against theirs.
+
+**Members are relative paths, deliberately.** Jellyfin resolves a member
+against the collection's own folder, so `../../Movies/Loose File Movie
+(2020).mkv` works at whatever path the library is mounted at — including
+`/media` inside a container, where an absolute host path would resolve to
+nothing. That failure is silent: the collection is still there, still named,
+simply empty. `verify` resolves every member the way the server does for
+exactly that reason.
+
+**One difference between server versions is worth knowing before you file a
+bug.** On 12.0 a member that resolves to nothing is dropped permanently — the
+linked children live in a database table whose child column is a non-nullable
+id, and a path has nowhere to survive. On 10.11 the same link is kept as JSON
+on the item and starts working on a later scan. So an identical library can
+show a collection short an item on one server and complete on the other, and
+neither logs anything a user would see. `MarkPlayed` on a collection also
+differs — 12.0 marks the members, 10.11 marks the collection — and
+`linkedChildAncestorIds`, which filters collections by the library their
+members came from, exists on 12.0 only.
+
+**A collection's artwork is drawn here or it has none.** The provider that
+builds a collage out of a collection's members is a dynamic image provider,
+and this library switches those off along with the internet ones, so the
+poster, backdrop and logo beside each `collection.xml` are the only images the
+item can have.
+
 ## Bitmap subtitles
 
 ffmpeg cannot produce image subtitles from text ones — it refuses with
@@ -784,7 +849,7 @@ be checked mechanically. A QA library is not worth a copyright argument.
 python3 -m unittest discover -s tests -t .
 ```
 
-266 tests, well under a second, needing no ffmpeg, server or container
+290 tests, well under a second, needing no ffmpeg, server or container
 runtime. They cover the matrix's internal consistency, the licence rules, NFO
 output and determinism, ffmpeg argument assembly, the Books library's naming
 and archive rules, and the VobSub encoder.

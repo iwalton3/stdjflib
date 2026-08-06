@@ -37,6 +37,12 @@ LIBRARIES = {
     "Shows": "tvshows",
     "Music": "music",
     "Music Videos": "musicvideos",
+    # Collections. Named "Box Sets" rather than "Collections" because the
+    # server creates a library of its own under that name the moment anything
+    # makes a server-owned collection — `CollectionManager.EnsureLibraryFolder`
+    # adds a `boxsets` library pointed at `<data>/collections` — and two
+    # libraries wanting one name is not a fixture, it is a collision.
+    "Box Sets": "boxsets",
     "Photos": "homevideos",  # "Photos" in the UI is homevideos+photos
     "Home Videos": "homevideos",
     # The same content type as the two above, and deliberately untidy where

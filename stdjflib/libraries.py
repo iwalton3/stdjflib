@@ -17,7 +17,7 @@ import concurrent.futures as futures
 import dataclasses
 import os
 
-from . import artwork, catalog, ff, generate, nfo, origin, recipes, strm
+from . import artwork, boxsets, catalog, ff, generate, nfo, origin, recipes, strm
 from .recipes import Audio, Recipe, Video
 
 YEAR = 2020
@@ -661,6 +661,165 @@ def build_movies(root: str, cfg) -> list[dict]:
                                       kinds=artwork.SETS["everything"])
             made.append({"library": "Movies", "key": rec.key, "path": folder})
 
+    made += _legacy_box_set(root, cfg)
+    return made
+
+
+# --------------------------------------------------------------------------
+# The collection that is a folder of films
+# --------------------------------------------------------------------------
+#
+# This one lives in the *Movies* library and it has to. `MovieResolver`
+# refuses a `boxsets` library outright — `_validCollectionTypes` is movies,
+# homevideos, musicvideos, tvshows, photos, and `IsInvalid` returns true for
+# anything else — so a media file inside a box set in the Box Sets library
+# resolves to nothing at all. (The comment above the file branch in
+# `MovieResolver.Resolve` says "the collection type must be movies or
+# boxsets". The code it sits on top of tests only for movies. The comment is
+# wrong.)
+#
+# So the two shapes a collection comes in are split across two libraries, not
+# by preference but by what resolves:
+#
+#   `Box Sets/`  collection.xml, members by path -> LinkedChildren
+#   `Movies/`    a folder of films, no XML        -> children from the disk
+#
+# `BoxSet.IsLegacyBoxSet` is what tells them apart: a path outside the
+# server's data directory **and** no linked children. Give this folder a
+# collection.xml and it stops being this case.
+#
+# It is also the fixture that reaches Movies -> Collections in jellyfin-web,
+# whose tab is `itemType: [BoxSet]` parented to the movies library — a
+# collection in the Box Sets library is not in scope for that query and does
+# not appear there.
+
+LEGACY_BOX_SET = "The Legacy Shelf [boxset]"
+
+# Different years on purpose: `DisplayOrder` defaults to PremiereDate, so a
+# client ordering these by name instead is visibly wrong rather than
+# ambiguous. Sort names are the reverse of the years for the same reason.
+LEGACY_BOX_SET_FILMS = [
+    ("legacy-shelf-late", "Zebra, The Last Film On The Shelf", 2014),
+    ("legacy-shelf-early", "Aardvark, The First Film On The Shelf", 2019),
+]
+
+LEGACY_BOX_SET_PLOT = (
+    "A collection with no collection.xml: the folder is the box set and the "
+    "films inside it are its children, read off the disk on every scan rather "
+    "than out of a metadata file. Jellyfin calls this shape a legacy box set "
+    "and decides it by absence — no linked children, and a path outside its "
+    "own data directory. Both films are ordinary Movie items as well, so they "
+    "appear here and in the movie list unless the client collapses items that "
+    "belong to a box set."
+)
+
+FILM_IN_BOX_SET_PLOT = (
+    "One of the two films inside a box set folder. It resolves as a Movie in "
+    "its own right — the box set is its parent, not its owner — so a client "
+    "that does not collapse box set members shows it twice."
+)
+
+
+def _legacy_box_set(root: str, cfg) -> list[dict]:
+    folder = os.path.join(root, LEGACY_BOX_SET)
+    made = []
+    for key, title, year in LEGACY_BOX_SET_FILMS:
+        rec = _short(title, key, notes=FILM_IN_BOX_SET_PLOT)
+        name = f"{title} ({year})"
+        media = os.path.join(folder, f"{name}.mkv")
+        if _emit(rec, media, cfg) and not cfg.dry_run:
+            nfo.movie(os.path.join(folder, f"{name}.nfo"), key=rec.key,
+                      title=title, plot=FILM_IN_BOX_SET_PLOT, year=year,
+                      runtime_minutes=1, tags=["stdjflib", "collection"])
+            # Loose files sharing a folder, so every image is prefixed —
+            # the box set itself owns the folder and takes the unprefixed
+            # names below.
+            artwork.sidecar_images(media, rec.key, title, cfg,
+                                   kinds=("poster",))
+        made.append({"library": "Movies", "key": rec.key, "path": media})
+
+    if made and not cfg.dry_run:
+        artwork.folder_images(folder, "legacy-shelf", "The Legacy Shelf", cfg,
+                              kinds=artwork.SETS["movie"])
+    return made
+
+
+# --------------------------------------------------------------------------
+# Box Sets — collections that are a list of paths
+# --------------------------------------------------------------------------
+#
+# Every collection here owns no media. Its members are films that already
+# exist in `Movies/`, named by a path relative to the collection's own folder,
+# which is what makes the library portable between a host path and the
+# container's `/media`. See `boxsets.py` for the parser these are written
+# against.
+#
+# Members are declared by manifest key rather than by path so that renaming a
+# fixture in `NAMING_CASES` cannot silently empty a collection — a key that no
+# longer exists is a build warning and then a `verify` failure, where a stale
+# path would be neither.
+
+BOX_SETS = [
+    {
+        "key": "boxset-linked",
+        "folder": f"The Linked Collection {boxsets.MARKER}",
+        "title": "The Linked Collection",
+        "members": ["movie-loose-file", "movie-folder-mismatch",
+                    "movie-unicode-title"],
+        "plot": "A collection that owns no files. Its three members live in "
+                "the Movies library and are named here by relative path, "
+                "which is what Jellyfin stores as linked children. The name "
+                "on screen comes from <LocalTitle> in collection.xml and not "
+                "from the folder, whose [boxset] suffix is stripped before "
+                "either is considered.",
+    },
+    {
+        "key": "boxset-xml-only",
+        "folder": "Collection Without The Marker",
+        "title": "Collection Without The Marker",
+        "members": ["movie-very-long-title", "movie-bracket-id"],
+        "plot": "The same thing with no [boxset] in the folder name. "
+                "BoxSetResolver takes a directory on either condition — the "
+                "suffix or the presence of collection.xml — so this resolves "
+                "as a collection on the strength of the file alone. Remove "
+                "the file and the folder becomes an ordinary folder, which "
+                "in a boxsets library resolves to nothing.",
+    },
+]
+
+
+def build_box_sets(root: str, cfg, members: dict) -> list[dict]:
+    """Collections whose members are paths into the other libraries.
+
+    `members` maps a manifest key to the path recorded for that item, which is
+    the path Jellyfin resolves the item at — the media file, not the folder
+    that holds it.
+    """
+    made = []
+    for spec in BOX_SETS:
+        folder = os.path.join(root, spec["folder"])
+        paths = []
+        for key in spec["members"]:
+            target = members.get(key)
+            if not target:
+                print(f"    ! {spec['folder']}: no item built for {key!r}")
+                continue
+            paths.append(boxsets.member_path(folder, target))
+
+        if not cfg.dry_run:
+            os.makedirs(folder, exist_ok=True)
+            boxsets.write(folder, title=spec["title"], plot=spec["plot"],
+                          members=paths, year=YEAR,
+                          tags=["stdjflib", "collection", spec["key"]])
+            # A collection has no media to extract an image from, and
+            # `CollectionImageProvider` — which would build a collage out of
+            # its members — is an IDynamicImageProvider, so the empty
+            # `ImageFetchers` that keeps TMDB out switches it off as well.
+            # These drawn images are the only ones the item can have.
+            artwork.folder_images(folder, spec["key"], spec["title"], cfg,
+                                  kinds=artwork.SETS["movie"])
+        made.append({"library": "Box Sets", "key": spec["key"],
+                     "path": folder, "members": paths})
     return made
 
 

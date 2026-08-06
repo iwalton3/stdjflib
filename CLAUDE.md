@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (266 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (290 tests,
 well under a second, no ffmpeg). To try it for real, build the minimal tier —
 it downloads nothing and takes about 80 seconds on a 16-core machine:
 
@@ -36,6 +36,7 @@ filter or muxer problem.
 | `stdjflib/vobsub.py` | the hand-written VobSub (.idx/.sub) encoder |
 | `stdjflib/subs.py` | subtitle sample text and the SRT/ASS/VTT writers |
 | `stdjflib/books.py` | the hand-written EPUB, PDF, CBZ/CBT and comic-metadata writers |
+| `stdjflib/boxsets.py` | `collection.xml`, and the Emby-dialect parser it is written against |
 | `stdjflib/strm.py` | `.strm` stream files, and the parsing rule they are written against |
 | `stdjflib/origin.py` | the local HTTP origin those stream files can point at |
 | `stdjflib/catalog.py` | what gets downloaded, and under what licence |
@@ -164,6 +165,99 @@ which produce `Book`. Measured: null on all seven audiobook items. A
 multi-file audiobook is joined by its `album` tag and by nothing else, which
 is why the rip's parts carry one, and why `docs/COVERAGE_GAPS.md` is wrong
 where it says otherwise.
+
+**A collection is not an NFO and not the Kodi dialect.** `collection.xml` is
+read by `BoxSetXmlParser`, which subclasses `BaseItemXmlParser` — the older
+Emby XML, rooted at `<Item>`, PascalCase, with its own vocabulary. The element
+that sets the name is **`<LocalTitle>`**; `<title>` is not a case in that
+parser and does nothing. So the rule that governs `nfo.py` governs `boxsets.py`
+too, against a different parser: write what has a `case`. Two fields that do
+have one are still left out — `Shares` and `OwnerUserId` are `IHasShares`, and
+`Playlist` is the only class in the tree that implements it (the comment at
+`Folder.cs:934` claiming BoxSets have per-user visibility is wrong; theirs is
+`IsVisibleStandalone` plus the parental check, neither of which is per-user);
+and there is no `uniqueid` equivalent, because provider ids here are matched
+against `ProviderManager.GetExternalIdInfos`, so a made-up namespace is
+dropped rather than round-tripped. The fixture key travels in `<Tags>`.
+
+`v10.11.0` and `master` parse an identical field set — the `case` lists diff
+clean — so nothing in that file needs a version guard.
+
+**`BoxSetResolver` takes a folder on either of two conditions, and both are
+fixtures.** `[boxset]` in the directory name **or** a `collection.xml` inside
+it; either alone is enough, and the suffix is stripped from the resolved name
+before `<LocalTitle>` overrides it anyway. It also runs at `ResolverPriority.
+First` with no collection-type gate, so it beats `MovieResolver` (Fourth) in
+*any* library — which is what puts a working box set inside `Movies/`.
+
+**The two shapes a collection comes in cannot live in the same library.**
+`MovieResolver._validCollectionTypes` is movies, homevideos, musicvideos,
+tvshows, photos; `IsInvalid` returns true for everything else. So in a
+`boxsets` library **no media file resolves to anything at all**, and a
+collection whose children come from the disk is empty there. (The comment
+above the file branch in `MovieResolver.Resolve` says "the collection type
+must be movies or boxsets". The code under it tests only for movies. Believe
+the code.) Hence the split, which is not a preference:
+
+| | where | children from |
+| --- | --- | --- |
+| `collection.xml`, members by path | `Box Sets/` | `LinkedChildren` |
+| a folder of films, no XML | `Movies/` | the filesystem |
+
+`BoxSet.IsLegacyBoxSet` is what tells them apart: a path outside the server's
+data directory **and** no linked children. Adding a `collection.xml` to
+`The Legacy Shelf [boxset]` converts it into the other case and deletes the
+one it covers, so `test_collections.py` forbids the movies builder writing
+one. Being in the movies library is also what puts it on jellyfin-web's Movies
+→ Collections tab, whose query is `itemType: [BoxSet]` parented to that
+library — a collection in `Box Sets/` is not in scope there and does not
+appear.
+
+**Member paths are relative, and that is the whole reason they survive a
+container.** `BaseItem.GetLinkedChild` resolves one through
+`FileSystem.MakeAbsolutePath(ContainingFolderPath, path)`, which for anything
+unrooted is `Path.GetFullPath(Path.Join(...))` — identical code in 10.11 and
+12.0. So `../../Movies/Foo.mkv` is resolved against the collection's own
+folder and the library works at a host path and at `/media` both. An absolute
+path would bake this machine's mount point in and fail *silently*: the
+collection still resolves, it is simply empty. The path has to be the item's
+path as Jellyfin recorded it — the media file, not the folder that names the
+movie — and a multi-version item's path is its **primary version's** file, not
+the folder the manifest records, which is why no version fixture is a member.
+
+**An unresolvable member is permanent on 12.0 and temporary on 10.11.** This
+is the collections half of the version split. 10.11 keeps `LinkedChildren` as
+JSON in `BaseItems.Data`, path and all, so a member that resolves to nothing
+today resolves on a later scan. 12.0 moved them into a `LinkedChildren` table
+whose `ChildId` is a **non-nullable Guid** — there is no column a path could
+survive in, and the migration that moved them counts what it had to throw
+away. So the same file is a collection that is short an item forever on one
+server and eventually correct on the other, with a log line nobody reads as
+the only difference. `verify.check_box_sets` resolves every member the way the
+server would, because nothing else in the build would notice.
+
+Four smaller differences in the same area, all measured off the same diff:
+`CollectionPostScanTask` skips items with a `PrimaryVersionId` on 12.0 and
+adds them on 10.11; `AddToCollectionAsync` deduplicates by ItemId only on 12.0
+and by ItemId *or Path* on 10.11; `MarkPlayed` on a box set cascades to its
+children on 12.0 and marks the box set itself on 10.11; and
+`linkedChildAncestorIds` — the `GET /Items` parameter that filters collections
+by which library their members came from — exists on 12.0 and nowhere in
+10.11.
+
+**A collection's artwork is drawn or absent; there is no third option.**
+`CollectionImageProvider` builds a collage from an item's members, and it is a
+`BaseDynamicImageProvider`, so the empty `ImageFetchers` that keeps TMDB out
+switches it off with everything else — the same asymmetry documented above for
+Books, landing the other way. A collection has no media to grab a frame from
+either, so the drawn `poster.jpg`/`backdrop.jpg`/`logo.png` beside it are the
+only images the item can ever have.
+
+**The library is called `Box Sets`, not `Collections`, and the name is load
+bearing.** `CollectionManager.EnsureLibraryFolder` adds a `boxsets` library of
+its own, under the localized name **"Collections"**, pointed at
+`<data>/collections`, the first time anything creates a server-owned
+collection. Two libraries wanting one name is not a fixture.
 
 **Every NFO sets `<lockdata>true`.** Without it Jellyfin queries TMDB and
 friends on scan, and what the client sees then depends on the network, on the

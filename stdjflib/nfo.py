@@ -28,6 +28,12 @@ keeping:
 `outline` is the odd one: `BaseNfoSaver` writes it and `BaseNfoParser` has no
 case for it, so Jellyfin round-trips it without ever using it. It stays,
 because it costs a line and it is what the server's own saver would produce.
+
+Collections are **not** here. A `collection.xml` is read by a different parser
+in a different dialect — `BoxSetXmlParser`, rooted at `<Item>`, where the name
+comes from `<LocalTitle>` — so it lives in `boxsets.py`. This module wrote one
+in the Kodi dialect for a long time, called by nobody, and it would have
+produced a file the server recognised nothing in.
 """
 
 from __future__ import annotations
@@ -347,14 +353,4 @@ def musicvideo(path: str, *, key: str, title: str, artist: str, album: str,
             runtime_minutes=runtime_minutes, tags=tags or [])
     _text(root, "artist", artist)
     _text(root, "album", album)
-    return _write(root, path)
-
-
-def collection(path: str, *, key: str, title: str, plot: str) -> str:
-    root = ET.Element("collection")
-    _text(root, "title", title)
-    _text(root, "plot", plot)
-    _text(root, "uniqueid", key)
-    root.find("uniqueid").set("type", "stdjflib")
-    _text(root, "lockdata", "true")
     return _write(root, path)

@@ -263,6 +263,61 @@ def check_streams(root: str, manifest, report) -> int:
     return checked
 
 
+def check_box_sets(manifest, report) -> int:
+    """Re-read every `collection.xml` and resolve its members the way the
+    server would.
+
+    A collection is the one fixture here whose content is entirely references,
+    so nothing else notices when it breaks. Every failure mode is silent on
+    the server: a member path that resolves nowhere is dropped by
+    `BaseItem.GetLinkedChild` with a log line nobody reads, and on 12.0 it is
+    dropped for good, because `LinkedChildEntity.ChildId` is a non-nullable
+    Guid and there is no column a path could survive in. On 10.11 the same
+    link is kept as JSON on the item and quietly starts working again on a
+    later scan. So an unresolvable member is a collection that is empty on one
+    server and correct on the other, and neither says why.
+
+    The paths are resolved here exactly as `FileSystem.MakeAbsolutePath` does
+    it — joined onto the collection's own folder — which is also what proves
+    they stayed relative. An absolute path would still verify on this machine
+    and be empty inside a container.
+    """
+    from . import boxsets
+
+    checked = 0
+    for item in manifest.get("items", []):
+        want = item.get("members")
+        if want is None:
+            continue
+        checked += 1
+        path = os.path.join(item["path"], boxsets.FILENAME)
+        if not os.path.exists(path):
+            report.problems.append(
+                f"{item['key']}: no {boxsets.FILENAME} ({item['path']})")
+            continue
+
+        got = boxsets.read_members(path)
+        if got != want:
+            report.problems.append(
+                f"{item['key']}: {boxsets.FILENAME} lists {got}, the manifest "
+                f"recorded {want}")
+            continue
+
+        for member in got:
+            if os.path.isabs(member):
+                report.problems.append(
+                    f"{item['key']}: member {member!r} is an absolute path — "
+                    f"it resolves here and nowhere the library is mounted "
+                    f"somewhere else, and an unresolved member is dropped "
+                    f"silently")
+            elif not os.path.exists(os.path.join(item["path"], member)):
+                report.problems.append(
+                    f"{item['key']}: member {member!r} resolves to nothing, "
+                    f"so the collection is short an item on 12.0 and "
+                    f"eventually right on 10.11")
+    return checked
+
+
 def check_books(manifest, report) -> int:
     """Re-read the books whose whole point is a number the server will report.
 
@@ -335,6 +390,7 @@ class Report:
     images: int = 0
     streams: int = 0
     books: int = 0
+    box_sets: int = 0
     problems: list = dataclasses.field(default_factory=list)
     notes: list = dataclasses.field(default_factory=list)
 
@@ -388,5 +444,6 @@ def run(cfg) -> Report:
         cfg, manifest.get("libraries") or cfg.libraries(), report)
     report.streams = check_streams(cfg.root, manifest, report)
     report.books = check_books(manifest, report)
+    report.box_sets = check_box_sets(manifest, report)
     report.files = checked
     return report
