@@ -17,6 +17,7 @@ kinds of check take the place of probing:
   collection types and nothing at build time would notice it drifting.
 """
 
+import json
 import os
 import posixpath
 import tempfile
@@ -110,8 +111,34 @@ class TestDialect(unittest.TestCase):
         self.assertEqual(got["LocalTitle"], "The Linked Collection")
         self.assertNotIn("title", got["elements"])
 
-    def test_lockdata_is_always_set(self):
-        self.assertEqual(self.write()["LockData"], "true")
+    def test_lockdata_is_never_set(self):
+        """The one metadata file here that must not lock.
+
+        Scan order puts `Box Sets/` before `Movies/`, so on a fresh database
+        every member resolves to nothing and 12.0 drops the link for good.
+        `LockData` would make that permanent by sending `RefreshMetadata` down
+        the `if (item.IsLocked)` early return, so the file could never be read
+        a second time. `provision.refresh_collections` is the second pass this
+        absence makes possible.
+        """
+        self.assertNotIn("LockData", self.write()["elements"])
+
+    def test_display_order_is_written_even_though_it_is_discarded(self):
+        """`MergeDisplayOrder` never copies it onto a BoxSet.
+
+        It is gated on `replaceData || string.IsNullOrEmpty(target.
+        DisplayOrder)` and `BoxSet`'s constructor pre-sets it to
+        "PremiereDate", so the target is never empty and the first merge runs
+        with `replaceData: false`. Measured as PremiereDate on a collection
+        asking for SortName, on both versions.
+
+        The field stays because the parser has a `case` for it and the
+        server's own saver writes it, which is the bar this module is written
+        to — and because a fixed merge should make the fixture start working
+        rather than need rediscovering.
+        """
+        self.assertEqual(
+            self.write(display_order="SortName")["DisplayOrder"], "SortName")
 
     def test_members_are_written_as_Path_entries(self):
         got = self.write(members=["../Movies/One.mkv", "../Movies/Two.mkv"])
@@ -400,6 +427,145 @@ class TestAutoCollections(unittest.TestCase):
         """
         self.assertNotEqual(config.AUTO_COLLECTION_LIBRARY, "Test Media")
         self.assertIn("collection=rec.group", _source())
+
+
+# --------------------------------------------------------------------------
+# The other mechanism
+# --------------------------------------------------------------------------
+
+class TestApiCollections(unittest.TestCase):
+    """`POST /Collections` — the route whose membership persists.
+
+    A `collection.xml` is parsed into the item and never written to the
+    `LinkedChildren` table, so its members are in memory only: right after a
+    scan, gone after a restart, and `ChildCount` reports 0 the whole time.
+    Both mechanisms are shipped because that difference is a thing a client
+    has to cope with, not a thing to pick a winner from.
+    """
+
+    def test_the_two_tables_do_not_share_a_name(self):
+        # Side by side is the point. A collection that is empty after a
+        # restart has to be tellable from one that is not, on screen, without
+        # going and looking at where it came from.
+        on_disk = {spec["title"] for spec in libraries.BOX_SETS}
+        on_disk.add("The Legacy Shelf")
+        by_api = {spec["name"] for spec in boxsets.API_COLLECTIONS}
+        self.assertFalse(on_disk & by_api)
+
+    def test_api_names_say_so(self):
+        for spec in boxsets.API_COLLECTIONS:
+            self.assertTrue(spec["name"].startswith("Api"), spec["name"])
+
+    def test_keys_are_unique_across_both_tables(self):
+        keys = ([s["key"] for s in libraries.BOX_SETS]
+                + [s["key"] for s in boxsets.API_COLLECTIONS])
+        self.assertEqual(len(set(keys)), len(keys))
+
+    def test_members_name_items_the_build_produces(self):
+        built = {f"movie-{key}" for key, *_rest in libraries.NAMING_CASES}
+        built |= {key for key, *_rest in libraries.LEGACY_BOX_SET_FILMS}
+        built |= {show["key"] for show in libraries.SHOWS}
+        for spec in boxsets.API_COLLECTIONS:
+            for key in spec["members"]:
+                self.assertIn(key, built, f"{spec['key']} names {key}")
+
+    def test_one_api_collection_mirrors_an_xml_one(self):
+        """The controlled comparison: same films, different mechanism.
+
+        Without a pair that differs *only* in how it was made, "this
+        collection is empty" is not attributable to anything.
+        """
+        xml = {spec["key"]: spec["members"] for spec in libraries.BOX_SETS}
+        mirrors = [s for s in boxsets.API_COLLECTIONS
+                   if s["members"] == xml.get("boxset-linked")]
+        self.assertEqual(len(mirrors), 1)
+
+
+class TestApiProvisioning(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+
+        self.mock = mock
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.root = self.dir.name
+        os.makedirs(os.path.join(self.root, ".stdjflib"))
+        manifest = {"items": [
+            {"key": k, "path": os.path.join(self.root, "Movies", f"{k}.mkv")}
+            for k in ("movie-loose-file", "movie-folder-mismatch",
+                      "movie-unicode-title")]}
+        with open(os.path.join(self.root, config.MANIFEST), "w") as fh:
+            json.dump(manifest, fh)
+
+    def client(self, existing=()):
+        jf = self.mock.Mock()
+        jf.get.return_value = {"Id": "user-1"}
+        jf.box_sets.return_value = [{"Name": n} for n in existing]
+        jf.item_id_at.side_effect = lambda path, uid: "id-" + os.path.basename(path)
+        jf.create_collection.return_value = "made"
+        return jf
+
+    def test_it_looks_the_members_up_at_the_server_path(self):
+        # Inside a container the library is at /media. Asking for a host path
+        # finds nothing, and would build an empty collection in silence.
+        from stdjflib import provision
+
+        jf = self.client()
+        provision.create_api_collections(jf, self.root, "/media",
+                                         say=lambda *a: None)
+        asked = [c.args[0] for c in jf.item_id_at.call_args_list]
+        self.assertTrue(asked)
+        for path in asked:
+            self.assertTrue(path.startswith("/media/"), path)
+
+    def test_an_existing_collection_is_left_alone(self):
+        from stdjflib import provision
+
+        names = [s["name"] for s in boxsets.API_COLLECTIONS]
+        jf = self.client(existing=names)
+        made = provision.create_api_collections(jf, self.root, self.root,
+                                                say=lambda *a: None)
+        self.assertEqual(made, {})
+        jf.create_collection.assert_not_called()
+
+    def test_a_member_that_resolves_to_nothing_is_named(self):
+        from stdjflib import provision
+
+        jf = self.client()
+        jf.item_id_at.side_effect = lambda path, uid: None
+        said = []
+        provision.create_api_collections(jf, self.root, self.root,
+                                         say=said.append)
+        self.assertTrue(any("no item found" in line for line in said))
+        # Nothing resolved, so nothing is created — an empty collection would
+        # look like a fixture rather than a failure.
+        jf.create_collection.assert_not_called()
+
+    def test_no_manifest_is_reported_and_not_a_crash(self):
+        from stdjflib import provision
+
+        os.unlink(os.path.join(self.root, config.MANIFEST))
+        said = []
+        self.assertEqual(
+            provision.create_api_collections(self.client(), self.root,
+                                             self.root, say=said.append), {})
+        self.assertTrue(any("manifest" in line for line in said))
+
+    def test_a_multi_version_member_is_looked_up_by_its_primary(self):
+        from stdjflib import provision
+
+        with open(os.path.join(self.root, config.MANIFEST), "w") as fh:
+            json.dump({"items": [{"key": "movie-multi-version",
+                                  "path": os.path.join(self.root, "Movies", "MV"),
+                                  "primary": os.path.join(self.root, "Movies",
+                                                          "MV", "primary.mkv")}]},
+                      fh)
+        jf = self.client()
+        provision.create_api_collections(jf, self.root, self.root,
+                                         say=lambda *a: None)
+        asked = [c.args[0] for c in jf.item_id_at.call_args_list]
+        self.assertIn(os.path.join(self.root, "Movies", "MV", "primary.mkv"),
+                      asked)
 
 
 if __name__ == "__main__":

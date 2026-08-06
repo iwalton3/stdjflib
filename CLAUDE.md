@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (320 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (331 tests,
 well under a second, no ffmpeg). To try it for real, build the minimal tier —
 it downloads nothing and takes about 80 seconds on a 16-core machine:
 
@@ -230,16 +230,52 @@ prefers it, which is what lets `Versions Inside A Collection` name both
 multi-version films — one whose primary is its exact-name file and one whose
 primary is its highest resolution — rather than avoiding them.
 
-**An unresolvable member is permanent on 12.0 and temporary on 10.11.** This
-is the collections half of the version split. 10.11 keeps `LinkedChildren` as
-JSON in `BaseItems.Data`, path and all, so a member that resolves to nothing
-today resolves on a later scan. 12.0 moved them into a `LinkedChildren` table
-whose `ChildId` is a **non-nullable Guid** — there is no column a path could
-survive in, and the migration that moved them counts what it had to throw
-away. So the same file is a collection that is short an item forever on one
-server and eventually correct on the other, with a log line nobody reads as
-the only difference. `verify.check_box_sets` resolves every member the way the
-server would, because nothing else in the build would notice.
+**A `collection.xml`'s members are never written to the database, and that
+governs everything about these fixtures.** Measured on 12.0: zero
+`LinkedChildren` rows for all six on-disk collections, while the API-made and
+auto-made ones have theirs. The parse happens — `BoxSetXmlProvider` runs, and
+name, overview and tags all arrive — but the members live only on the
+in-memory item. So:
+
+| | after a scan | after a restart | after another scan |
+| --- | --- | --- | --- |
+| `collection.xml` | correct | **empty** | correct again |
+| `POST /Collections` | correct | correct | correct |
+| `<set>` + auto | correct | correct | correct |
+| a folder of films | correct | correct | correct |
+
+`ChildCount` is read off the database, so it reports **0 the whole time**,
+including while a `GET /Items?parentId=` on the same item returns every
+member. Do not measure a collection with `ChildCount` — that mistake is what
+made this look broken when it was not.
+
+The recovery in the third column is the reason **`collection.xml` is the one
+metadata file here that must not set `lockdata`**. `RefreshMetadata` returns
+at `if (item.IsLocked)` before the local providers run, so a locked
+collection can never be re-read and its members never come back. Unlocked, a
+scan re-parses and repopulates them. Nothing is lost by leaving it out:
+remote fetchers are already off for `BoxSet` in both provider layers, the
+same argument that applies to Books.
+
+**So both mechanisms are shipped, and neither is the spare.** The on-disk
+files cover `BoxSetResolver`, the XML dialect and this bug; `POST /Collections`
+covers what a client's own "new collection" button does and is the only route
+whose membership survives a restart. `boxsets.API_COLLECTIONS` is that table,
+created by `provision.create_api_collections` after the scan, because a
+collection is made of item ids and the items have to exist first.
+`Api Made Collection` deliberately holds the same three films as
+`The Linked Collection`, so the pair differs only in how it was made.
+
+**`<DisplayOrder>` is parsed, saved and can never take effect on a BoxSet.**
+`MergeDisplayOrder` copies the value only when `replaceData ||
+string.IsNullOrEmpty(target.DisplayOrder)`, and `BoxSet`'s constructor sets
+`DisplayOrder = "PremiereDate"` — so the target is never empty, the first
+merge runs with `replaceData: false`, and the parsed value is gone before
+anything else sees it. `BaseXmlSaver` writes it back out, so it round-trips
+and does nothing, exactly like `outline` in the NFO world. Identical code in
+`v10.11.0` and on `master`; measured as `PremiereDate` on a file asking for
+`SortName`. `Display Order Is Ignored` is that fixture, and it is named for
+what it does.
 
 Four smaller differences in the same area, all measured off the same diff:
 `CollectionPostScanTask` skips items with a `PrimaryVersionId` on 12.0 and

@@ -270,12 +270,15 @@ def check_box_sets(manifest, report) -> int:
     A collection is the one fixture here whose content is entirely references,
     so nothing else notices when it breaks. Every failure mode is silent on
     the server: a member path that resolves nowhere is dropped by
-    `BaseItem.GetLinkedChild` with a log line nobody reads, and on 12.0 it is
-    dropped for good, because `LinkedChildEntity.ChildId` is a non-nullable
-    Guid and there is no column a path could survive in. On 10.11 the same
-    link is kept as JSON on the item and quietly starts working again on a
-    later scan. So an unresolvable member is a collection that is empty on one
-    server and correct on the other, and neither says why.
+    `BaseItem.GetLinkedChild` with a log line nobody reads, and the item still
+    resolves, still has a name and still draws its artwork — it is simply one
+    row short, which looks exactly like a collection that was meant to be that
+    size.
+
+    Checking it here is the only place it *is* noticed, because the server
+    never persists these members at all: they live on the in-memory item until
+    the next restart, and `ChildCount` reports 0 even while they are there.
+    See `boxsets.py` for the measurement.
 
     The paths are resolved here exactly as `FileSystem.MakeAbsolutePath` does
     it — joined onto the collection's own folder — which is also what proves
@@ -330,8 +333,8 @@ def check_box_sets(manifest, report) -> int:
         if broken:
             report.notes.append(
                 f"{item['key']}: {len(broken)} member(s) deliberately name a "
-                f"file that does not exist — 12.0 drops them for good, 10.11 "
-                f"keeps them")
+                f"file that does not exist, so this collection is one short "
+                f"of its list on purpose")
     return checked
 
 

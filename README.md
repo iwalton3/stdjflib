@@ -40,6 +40,7 @@ Mixed Content/   videos and photographs in one tree, at uneven depths: folders
                  that hold one kind, the other, or both
 Books/           EPUB and CBZ
 Box Sets/        collections, whose members are paths into the libraries above
+                 (the ones the API makes live in the server, not here)
 Auto Collections/
                  films whose NFOs carry a <set>, in the one library where the
                  server turns that into a box set of its own
@@ -788,16 +789,27 @@ nothing. That failure is silent: the collection is still there, still named,
 simply empty. `verify` resolves every member the way the server does for
 exactly that reason.
 
-**One difference between server versions is worth knowing before you file a
-bug.** On 12.0 a member that resolves to nothing is dropped permanently — the
-linked children live in a database table whose child column is a non-nullable
-id, and a path has nowhere to survive. On 10.11 the same link is kept as JSON
-on the item and starts working on a later scan. So an identical library can
-show a collection short an item on one server and complete on the other, and
-neither logs anything a user would see. `MarkPlayed` on a collection also
-differs — 12.0 marks the members, 10.11 marks the collection — and
-`linkedChildAncestorIds`, which filters collections by the library their
-members came from, exists on 12.0 only.
+**A collection.xml's members do not survive a server restart, and that is the
+single most useful thing to know here.** They are parsed into the item and
+never written to the database, so on 12.0 the sequence is: scan and every
+member is there, restart and the collection is empty, scan again and it is
+back. Worse, `ChildCount` is read from the database, so it reports **0 the
+whole time** — including while the item genuinely has its members. If you are
+checking a collection, ask for its children; do not trust the count. (That
+mistake is why this section originally claimed the fixtures were broken.)
+
+Because of that, **the same collections exist twice, by two mechanisms**.
+`Api Made Collection` holds the same three films as `The Linked Collection`
+and was created through `POST /Collections` — the call a client's own "new
+collection" button makes — so its membership is stored as rows and is still
+there tomorrow. Side by side they answer a question a client has to survive:
+whether what is on screen came from something durable. The API-made ones are
+listed under names beginning `Api` so you can tell at a glance.
+
+`MarkPlayed` on a collection also differs between versions — 12.0 marks the
+members, 10.11 marks the collection — and `linkedChildAncestorIds`, which
+filters collections by the library their members came from, exists on 12.0
+only.
 
 **A collection's artwork is drawn here or it has none.** The provider that
 builds a collage out of a collection's members is a dynamic image provider,
@@ -805,12 +817,12 @@ and this library switches those off along with the internet ones, so the
 poster, backdrop and logo beside each `collection.xml` are the only images the
 item can have.
 
-**`Ordered By Name` overrides the order its members appear in**, which is a
-field that fails to the default rather than failing. Jellyfin parses
-`DisplayOrder` as a sort key and falls back to `PremiereDate` when it cannot,
-so a typo is indistinguishable from a deliberate default. The two films in it
-have years running opposite to their names, so "the client honoured the field"
-and "the client ignored it" cannot look the same. Those two are also the
+**`Display Order Is Ignored` is named for what it does.** Its file asks for
+`SortName` and the server sorts by premiere date anyway, on both 10.11 and
+12.0: the parser reads `DisplayOrder` and the saver writes it back, but the
+merge only copies it when the target's is empty and `BoxSet`'s constructor has
+already filled it in. Its two films have years running opposite to their
+names, so the order on screen says which rule won. Those two are also the
 contents of `The Legacy Shelf`, making them the one pair here that belongs to
 two collections at once.
 
@@ -942,7 +954,7 @@ be checked mechanically. A QA library is not worth a copyright argument.
 python3 -m unittest discover -s tests -t .
 ```
 
-320 tests, well under a second, needing no ffmpeg, server or container
+331 tests, well under a second, needing no ffmpeg, server or container
 runtime. They cover the matrix's internal consistency, the licence rules, NFO
 output and determinism, ffmpeg argument assembly, the Books library's naming
 and archive rules, and the VobSub encoder.

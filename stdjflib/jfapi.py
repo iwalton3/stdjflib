@@ -175,6 +175,46 @@ class Jellyfin:
     def refresh_library(self) -> None:
         self.post("/Library/Refresh", expect_json=False)
 
+    # -- collections ------------------------------------------------------
+
+    def item_id_at(self, path: str, user_id: str) -> str | None:
+        """The id of the item Jellyfin resolved at exactly this path.
+
+        `path` is a filter and not a lookup — the server matches loosely
+        enough that a folder query can come back with its children — so the
+        result is checked against the path that was asked for. A collection
+        built from the wrong id is worse than one built from none.
+        """
+        found = self.get("/Items", params={"userId": user_id,
+                                           "recursive": "true",
+                                           "path": path,
+                                           "fields": "Path"}) or {}
+        for item in found.get("Items", []):
+            if item.get("Path") == path:
+                return item["Id"]
+        return None
+
+    def create_collection(self, name: str, item_ids: list[str]) -> str | None:
+        """`POST /Collections`, which is what a client's "new collection" does.
+
+        Unlike a `collection.xml`, what this produces is persisted: the
+        members land in the `LinkedChildren` table keyed by item id and
+        survive a restart. Measured both ways — see `boxsets.py`.
+        """
+        made = self.post("/Collections", params={"name": name,
+                                                 "ids": ",".join(item_ids)})
+        return (made or {}).get("Id")
+
+    def add_to_collection(self, collection_id: str, item_ids: list[str]) -> None:
+        self.post(f"/Collections/{collection_id}/Items",
+                  params={"ids": ",".join(item_ids)}, expect_json=False)
+
+    def box_sets(self, user_id: str) -> list:
+        found = self.get("/Items", params={"userId": user_id,
+                                           "recursive": "true",
+                                           "includeItemTypes": "BoxSet"}) or {}
+        return found.get("Items", [])
+
     def scheduled_tasks(self) -> list:
         return self.get("/ScheduledTasks") or []
 

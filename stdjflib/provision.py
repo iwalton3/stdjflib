@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 
-from . import config, livetv
+from . import boxsets, config, livetv
 from .jfapi import ApiError, Jellyfin
 
 
@@ -291,6 +291,81 @@ def library_options(*, chapter_images: bool = False,
     }
 
 
+def create_api_collections(jf: Jellyfin, root: str, server_root: str,
+                           say=print) -> dict:
+    """Create the collections that cannot be built on disk.
+
+    A `collection.xml` is parsed into the item and never written to the
+    `LinkedChildren` table, so its membership is in memory only: correct on a
+    freshly scanned server, gone after a restart, and reported as
+    `ChildCount: 0` throughout. `POST /Collections` is the route that
+    persists, and it is also what a client's own "new collection" button
+    calls. Both are shipped; `boxsets.py` has the table and the measurement.
+
+    Members are named by manifest key and resolved to item ids here, because
+    an id is the only thing this endpoint takes and ids are not knowable at
+    build time. The path handed to the server is translated to `server_root`
+    first — inside a container the library is at `/media`, and looking up a
+    host path there finds nothing and would build an empty collection without
+    saying so.
+
+    Idempotent: a collection whose name is already on the server is left
+    alone, so a second `provision` against a live server does not duplicate
+    them.
+    """
+    items = {}
+    try:
+        with open(os.path.join(root, config.MANIFEST), encoding="utf-8") as fh:
+            for item in json.load(fh).get("items", []):
+                if "key" in item:
+                    # A multi-version item's path is its primary version's
+                    # file, which is not the folder the build recorded.
+                    items[item["key"]] = item.get("primary") or item["path"]
+    except (OSError, ValueError):
+        say("  ! no manifest to read collection members from")
+        return {}
+
+    user_id = (jf.get("/Users/Me") or {}).get("Id")
+    if not user_id:
+        say("  ! could not identify the current user")
+        return {}
+
+    existing = {b["Name"] for b in jf.box_sets(user_id)}
+    made = {}
+    for spec in boxsets.API_COLLECTIONS:
+        if spec["name"] in existing:
+            say(f"  = {spec['name']} (already there)")
+            continue
+
+        ids, missing = [], []
+        for key in spec["members"]:
+            built = items.get(key)
+            if not built:
+                missing.append(key)
+                continue
+            server_path = os.path.join(
+                server_root, os.path.relpath(built, os.path.abspath(root)))
+            item_id = jf.item_id_at(server_path, user_id)
+            if item_id:
+                ids.append(item_id)
+            else:
+                missing.append(key)
+
+        if missing:
+            # Named rather than passed over. A collection quietly short a
+            # member looks exactly like one that was meant to be that size.
+            say(f"  ! {spec['name']}: no item found for "
+                f"{', '.join(sorted(missing))}")
+        if not ids:
+            continue
+
+        collection_id = jf.create_collection(spec["name"], ids)
+        if collection_id:
+            made[spec["key"]] = collection_id
+            say(f"  + {spec['name']} ({len(ids)} members)")
+    return made
+
+
 def disable_remote_providers(jf: Jellyfin) -> int:
     """Switch the internet providers off server-wide, as well as per library.
 
@@ -464,6 +539,12 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
             on_progress=lambda p: print(f"\r  {p:5.1f}%", end="", flush=True))
         print("\r" + " " * 20 + "\r", end="")
         say("  scan finished" if done else "  scan still running (timed out)")
+        # After the scan, because a collection is made of ids and the items
+        # have to exist before they have any.
+        if boxsets.API_COLLECTIONS:
+            say("Collections the API makes (the ones that survive a restart)")
+            result["api_collections"] = create_api_collections(
+                jf, root, server_root, say=say)
         counts = jf.counts()
         result["counts"] = counts
         interesting = [(k, v) for k, v in sorted(counts.items()) if v]

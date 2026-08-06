@@ -797,21 +797,22 @@ BOX_SETS = [
     },
     {
         "key": "boxset-display-order",
-        "folder": f"Ordered By Name {boxsets.MARKER}",
-        "title": "Ordered By Name",
+        "folder": f"Display Order Is Ignored {boxsets.MARKER}",
+        "title": "Display Order Is Ignored",
         "members": ["legacy-shelf-early", "legacy-shelf-late"],
         "display_order": "SortName",
-        "plot": "A collection that overrides the order its members are shown "
-                "in. BoxSet.DisplayOrder defaults to PremiereDate and this "
-                "one asks for SortName, over two films whose years run "
-                "opposite to their names — so by date it is Zebra then "
-                "Aardvark, and here it must be Aardvark then Zebra. Anything "
-                "the server cannot parse as an ItemSortBy falls back to "
-                "PremiereDate silently, so a client showing the date order is "
-                "either ignoring the field or was handed a typo. Both films "
-                "are also the filesystem children of The Legacy Shelf, which "
-                "makes them the one pair here that belongs to two collections "
-                "at once.",
+        "plot": "This collection.xml asks for SortName and the server sorts "
+                "by premiere date anyway, on both 10.11 and 12.0. The parser "
+                "reads DisplayOrder and the saver writes it back out, but "
+                "MergeDisplayOrder only copies the value when the target's is "
+                "empty — and BoxSet's constructor has already set it to "
+                "PremiereDate, so the parsed value is discarded before "
+                "anything sees it. Its two films have years running opposite "
+                "to their names, so the order on screen says which rule won: "
+                "Zebra then Aardvark is the date, and the reverse would mean "
+                "somebody fixed the merge. Both are also the filesystem "
+                "children of The Legacy Shelf, which makes them the one pair "
+                "here belonging to two collections at once.",
     },
     {
         "key": "boxset-cross-library",
