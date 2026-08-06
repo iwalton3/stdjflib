@@ -51,6 +51,14 @@ MUXERS = {
     "wmv": "asf",
     "ogv": "ogg",
     "3gp": "3gp",
+    # An audiobook. `-f m4b` fails the same way `-f mkv` does — "Error
+    # initializing the muxer for x.m4b: Invalid argument", which says nothing
+    # about muxers — and `ipod` is what ffmpeg picks for the extension when
+    # `-f` is absent. `mp4` also works and writes the same chapters; `ipod` is
+    # here because it stamps the MPEG-4 audio brand rather than `isom`, which
+    # is what a real `.m4b` carries.
+    "m4b": "ipod",
+    "m4a": "ipod",
 }
 
 # Codecs that ffmpeg refuses without an explicit opt-in.
@@ -226,8 +234,29 @@ def describe(rec: Recipe) -> str:
     return "\n".join(lines)
 
 
+def _ffmetadata_escape(value: str) -> str:
+    """FFMETADATA treats `= ; # \\` and a newline as syntax.
+
+    Nothing here contains any of them today, and a title that did would not
+    fail — it would produce a file tagged with something subtly different from
+    what the recipe asked for, which is the failure this whole module is
+    written to avoid.
+    """
+    for ch in ("\\", "=", ";", "#", "\n"):
+        value = value.replace(ch, "\\" + ch)
+    return value
+
+
 def _chapter_metadata(rec: Recipe) -> str:
-    out = [";FFMETADATA1", f"title={rec.title}"]
+    out = [";FFMETADATA1", f"title={_ffmetadata_escape(rec.title)}"]
+    # Global container tags. The same file carries these and the chapters
+    # because `-map_metadata` takes one input, and a second metadata input
+    # would replace the first rather than merge with it.
+    for name, value in rec.container_tags:
+        if name == "title":
+            out[1] = f"title={_ffmetadata_escape(value)}"
+        else:
+            out.append(f"{name}={_ffmetadata_escape(str(value))}")
     if not rec.chapters:
         return "\n".join(out) + "\n"
     per = (rec.duration * 1000) // rec.chapters
@@ -463,7 +492,7 @@ def build_command(rec: Recipe, out_path: str, workdir: str, *,
 
     muxer = muxer_for(rec.container)
     argv += ["-f", muxer]
-    if muxer in ("mp4", "mov", "3gp"):
+    if muxer in ("mp4", "mov", "3gp", "ipod"):
         # Put the index at the front so the file is seekable without a range
         # request for the tail.
         argv += ["-movflags", "+faststart"]

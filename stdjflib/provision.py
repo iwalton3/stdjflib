@@ -46,6 +46,29 @@ REMOTE_PROVIDERS = [
     "TheAudioDB",
 ]
 
+# `ImageFetchers` is not only the internet's list. `ProviderManager.
+# CanRefreshImages` returns early for an `ILocalImageProvider` and *nothing
+# else*, so an `IDynamicImageProvider` — one that derives a picture from the
+# file itself, with no network anywhere — is gated by the same empty array
+# that keeps the remote art off. Emptying it for every type therefore switches
+# off a cover extractor as surely as it switches off TMDB.
+#
+# For most types that is the right answer: this library ships its own drawn
+# artwork, and an embedded thumbnail winning over it would be a fixture
+# quietly replaced. Books are the exception and it is not a preference — a
+# book's cover *is* the extractor's output, there is no NFO to put one in
+# (`MediaBrowser.XbmcMetadata` has no Book parser at all), and the comic
+# fixtures exist precisely to test which entry of an archive gets picked. With
+# these off, every book in the library comes back with no artwork and the
+# whole of that case is unreachable.
+#
+# Both names are read out of the providers. Neither reaches the network:
+# `ComicImageProvider` opens the archive, `EpubImageProvider` reads the OPF.
+# They do not exist before 12.0, and a name nothing matches is simply inert.
+LOCAL_IMAGE_EXTRACTORS = {
+    "Book": ["Comic Book Archive Cover Extractor", "EPUB Metadata"],
+}
+
 # Types the server keeps global metadata options for. Wider than ITEM_TYPES on
 # purpose: this list is the fallback that catches anything whose library
 # options come back null.
@@ -246,7 +269,8 @@ def library_options(*, chapter_images: bool = False,
         "TypeOptions": [
             {"Type": item_type,
              "MetadataFetchers": [], "MetadataFetcherOrder": [],
-             "ImageFetchers": [], "ImageFetcherOrder": [],
+             "ImageFetchers": LOCAL_IMAGE_EXTRACTORS.get(item_type, []),
+             "ImageFetcherOrder": LOCAL_IMAGE_EXTRACTORS.get(item_type, []),
              "ImageOptions": []}
             for item_type in ITEM_TYPES
         ],

@@ -130,7 +130,11 @@ def build_test_media(root: str, cfg) -> list[dict]:
                     "group": rec.group}
         return run
 
-    ordered = sorted(recipes.for_tier(cfg.tier),
+    # `library` is what keeps the audiobooks out of here: they are declared as
+    # recipes so `verify` re-probes them, and placed by `build_books`, because
+    # an audiobook only resolves as one inside a `books` library.
+    ordered = sorted((r for r in recipes.for_tier(cfg.tier)
+                      if r.library == "Test Media"),
                      key=lambda r: -(r.duration * (r.video.height if r.video else 1)))
     return [item for item in _run_all([task(r) for r in ordered], cfg) if item]
 
@@ -1531,87 +1535,437 @@ def build_mixed_content(root: str, cfg) -> list[dict]:
     return [item for group in groups for item in (group or [])]
 
 
-def build_books(root: str, cfg) -> list[dict]:
-    """EPUB and CBZ, both of which are zip files this can write directly."""
-    import zipfile
+# --------------------------------------------------------------------------
+# Books
+# --------------------------------------------------------------------------
+#
+# The whole library is filenames and archive members, so the tables below are
+# the deliverable. Four rules of Jellyfin's decide every one of them, and none
+# of them is guessable from the outside:
+#
+# 1. **A directory holding exactly one supported file is one book**, named
+#    after the *directory* (`BookResolver.GetBook`). Only `.azw .azw3 .cb7
+#    .cbr .cbt .cbz .epub .mobi .pdf` count towards the "exactly one", so an
+#    NFO, a `.xml` sidecar or a poster beside it is invisible to the tally.
+#    Two supported files and the rule stops applying to the whole folder, and
+#    every file in it is resolved on its own instead.
+#
+# 2. So **the filename parser is only reachable in a folder that holds more
+#    than one book.** `BOOK_SHELF` is that folder, and it is the only place
+#    `BookFileNameParser` runs at all.
+#
+# 3. **The two paths disagree about SeriesName.** A loose file falls back to
+#    its parent directory's name; a directory-book falls back to the empty
+#    string. Same file, different answer, depending only on what else is in
+#    the folder.
+#
+# 4. **Books read no NFO.** There is no `BookNfoParser` and no `BookNfoSaver`
+#    in `MediaBrowser.XbmcMetadata` — nothing parses one for a Book or an
+#    AudioBook. Metadata comes from the formats themselves, which is why the
+#    dialect tables below exist and why there are no `.nfo` files here.
 
-    made = []
+# The shelf: one folder holding several books, which is what switches the
+# resolver from the directory rule to per-file parsing. Everything about these
+# filenames is load-bearing — they are the test.
+#
+# `BookFileNameParser` tries five regexes in order and takes the first that
+# matches, so the shape of the name decides which fields exist at all.
+BOOK_SHELF = "Ines Imani"
+
+# **`dc:title` in an EPUB beats the filename.** `EpubProvider` reads the OPF
+# and overwrites `Name`, so an EPUB whose internal title disagrees with its
+# filename hides whatever the parser made of the filename — which is exactly
+# how the three author folders above come back named after their books rather
+# than after their folders. That case is worth having and it is theirs. Here
+# it would destroy the fixture, so every EPUB below embeds **the name the
+# parser should produce**, and `test_books.py` holds the two to each other.
+#
+# The one row the parser gives *no* name to cannot be an EPUB at all — any
+# `dc:title` would invent one — so it is a PDF, which no provider reads.
+#
+# (stem, extension, key, the title to embed / None where the parser gives none,
+#  pages for a PDF, what the parser should make of it)
+BOOK_SHELF_FILES = [
+    # Regex 2 — the Goodreads spelling, and the only one that yields all four
+    # fields at once. This is the case a client's series grouping should work
+    # from.
+    ("Ascent (The Meridian Cycle, #1) (2018)", "epub", "book-shelf-vol1",
+     "Ascent", None,
+     "name, series, index and year, all four from the filename"),
+    ("Descent (The Meridian Cycle, #2) (2019)", "epub", "book-shelf-vol2",
+     "Descent", None,
+     "the second volume of the same series, so the grouping has something "
+     "to group"),
+    # Regex 1 — matches first and has **no `name` group at all**, so
+    # `BookResolver` sets `Name` to the empty string and
+    # `ResolverHelper.EnsureName` then backfills it from the filename. The
+    # result is an item whose *title is a filename*, `#` and bracketed year
+    # and all, sitting in a series with an index and a year that were parsed
+    # correctly. Measured on 12.0.
+    #
+    # A PDF rather than an EPUB because a `dc:title` would land on top of the
+    # backfill and hide it — which is what this fixture did until it was
+    # measured.
+    ("The Meridian Cycle #3 (2020)", "pdf", "book-shelf-vol3", None, 3,
+     "series, index and year, and a Name that is the raw filename — regex 1 "
+     "has no name group, so the server backfills one"),
+    # Regex 3 — index and name, and no series, so SeriesName falls back to
+    # the parent directory. That fallback is the rule this file proves.
+    ("01 - The Early Years (2015)", "epub", "book-shelf-numbered",
+     "The Early Years", None,
+     "index and name; no series in the filename, so SeriesName falls back "
+     "to the parent folder"),
+    # The comic volume/chapter convention, which is a second regex applied to
+    # whatever the first one called the name. The suffix is *not* stripped, so
+    # the name it produces still carries "v02 c015".
+    ("Adrift v02 c015", "epub", "book-shelf-volume-chapter",
+     "Adrift v02 c015", None,
+     "ParentIndexNumber 2 and IndexNumber 15 from the v/c suffix, which "
+     "stays in the name"),
+    # Regex 4 — name and year only. A PDF, so the page-count case lands on
+    # the loose-file path rather than the directory one, and with a different
+    # page count from the other one so the number is visibly read rather than
+    # echoed.
+    ("The Standard Manual (1994)", "pdf", "book-pdf", "The Standard Manual", 6,
+     "a PDF: the server counts its pages with PDFium and stores "
+     "pageCount * 10000 as RunTimeTicks, and extracts no cover at all"),
+]
+
+# One book alone in a folder of its own — the directory rule, deliberately
+# rather than by accident. The *folder* name is what gets parsed, and
+# SeriesName comes back empty rather than falling back to the parent, which
+# is the opposite of what the same filename does on the shelf above.
+BOOK_ALONE_AUTHOR = "Jo Jansen"
+BOOK_ALONE = "The Solitary Volume (2001)"
+# What `BookFileNameParser` makes of that folder name, and therefore what the
+# EPUB inside must call itself.
+BOOK_ALONE_PARSED_NAME = "The Solitary Volume"
+
+# The formats Jellyfin catalogues and nothing can open. `BookResolver` takes
+# them, so they browse with metadata and artwork like any other book, and
+# then every client dead-ends: jellyfin-web's three players claim epub, pdf
+# and the comic archives, and nothing else. What a client does at that point —
+# offer a download, say the format is unsupported, hide the play button — is
+# the decision this folder exists to be tested against.
+#
+# Two files, so the folder is not itself a one-file directory-book.
+#
+# NOT `.cba`: it looks like it belongs and the server does not accept it.
+# `_validExtensions` is exactly `.azw .azw3 .cb7 .cbr .cbt .cbz .epub .mobi
+# .pdf` — a `.cba` resolves to nothing and would sit in the library as an
+# invisible file, which is a worse fixture than none.
+UNOPENABLE_FOLDER = "Unopenable Formats"
+UNOPENABLE_FILES = [
+    ("A Kindle Format Book (2011)", "azw3", "book-azw3"),
+    ("A Mobipocket Book (2005)", "mobi", "book-mobi"),
+]
+
+# --- comics ---------------------------------------------------------------
+#
+# Jellyfin reads comic metadata three ways, and which one wins is decided by
+# registration order in `ApplicationHost`, not by merit: ComicBookInfo, then
+# the external `ComicInfo.xml`, then the internal one, **first with any
+# metadata wins outright**. So each archive below carries exactly one dialect;
+# an archive with two would only ever prove which one is first.
+#
+# Two of the three are hard-restricted to `.cbz` by extension, which is what
+# `Ignored Internal Info 005.cbt` is for — the same bytes, in an archive
+# Jellyfin can otherwise read perfectly well, ignored on the strength of the
+# extension alone.
+#
+# Every one of these sets `Title`, and every Title says which dialect it came
+# from. A comic whose name on screen is its filename is a comic whose metadata
+# was not read, and you can see that without opening anything.
+COMICS_FOLDER = "Comics"
+
+# Pages are 1200x1800 JPEGs. Four is enough: the page count is what is
+# checked, and it is checked against this number.
+COMIC_PAGES = 4
+
+# The two cover rules, which are the whole of `ComicImageProvider`:
+#   1. an entry named exactly `cover.<ext>` at the archive root, tried in the
+#      order .png .jpeg .jpg .webp .bmp .gif — exact, case-sensitive, no path;
+#   2. failing that, the alphabetically first entry by full key.
+#
+# Rule 2 is right by luck whenever page one happens to sort first, which is
+# why `A Test Comic 001.cbz` proves nothing about it. `Scan Credits Cover`
+# is the realistic way it goes wrong: a scanlator credit page filed as `000 -`
+# sorts ahead of page one and becomes the cover. `Named Cover` is the same
+# archive with `cover.jpg` added, and nothing else changed.
+SCAN_CREDITS_PAGE = "000 - Scan Credits.jpg"
+
+# The series every dialect claims, so a comic showing it got its metadata from
+# somewhere and a comic showing its filename did not.
+COMIC_SERIES = "The Signal Archive"
+
+
+def _comic_pages(folder: str, key: str, cfg, count: int = COMIC_PAGES,
+                 credits_page: bool = False) -> list[tuple[str, str]]:
+    """Draw a comic's pages and return (name-in-archive, path-on-disk).
+
+    The images are hidden temporaries beside the archive, keyed by the comic
+    so two of them being built at once cannot collide, and removed once the
+    archive is written — a loose page in a library folder would be an item.
+    """
+    pages = []
+    if credits_page:
+        path = os.path.join(folder, f".{key}-credits.jpg")
+        if artwork.draw("photo", f"{key}-credits", "Scan Credits", path, cfg,
+                        size=(1200, 1800), stamp=False):
+            pages.append((SCAN_CREDITS_PAGE, path))
+    for n in range(1, count + 1):
+        path = os.path.join(folder, f".{key}-page{n}.jpg")
+        if artwork.draw("photo", f"{key}-{n}", f"Page {n}", path, cfg,
+                        size=(1200, 1800), stamp=False):
+            pages.append((f"{n:03d}.jpg", path))
+    return pages
+
+
+def build_books(root: str, cfg) -> list[dict]:
+    """EPUB, PDF, comic archives and audiobooks.
+
+    None of it is media except the audiobooks, so almost all of it is written
+    directly by `books.py` rather than by ffmpeg.
+    """
+    from . import books
+
+    made: list[dict] = []
     if cfg.dry_run:
         return made
 
+    # --- the three author folders, each a directory-book -------------------
+    #
+    # One epub alone in a folder is the directory rule, so the *folder* name is
+    # what the resolver parses. These come back named after the book anyway,
+    # because `EpubProvider` reads `content.opf` and `dc:title` overrides the
+    # resolver — which is worth knowing, and is the reason a Books library can
+    # look correct while the path convention behind it is doing something else.
     for i, (title, author) in enumerate(
             [("The Standard Reference", "Ada Alvarez"),
              ("A Second Volume", "Bo Brandt"),
              ("日本語の本", "Cai Chen")], 1):
-        folder = os.path.join(root, author)
-        os.makedirs(folder, exist_ok=True)
-        epub = os.path.join(folder, f"{title}.epub")
-        _write_epub(epub, title, author, cfg)
+        epub = os.path.join(root, author, f"{title}.epub")
+        if not cfg.artwork_only or not os.path.exists(epub):
+            books.write_epub(epub, title, author)
         made.append({"library": "Books", "key": f"book-{i}", "path": epub})
 
-    # A comic archive: a zip of numbered images, which is all a CBZ is.
-    comics = os.path.join(root, "Comics")
-    os.makedirs(comics, exist_ok=True)
-    cbz = os.path.join(comics, "A Test Comic 001.cbz")
-    pages = []
-    for p in range(1, 5):
-        page = os.path.join(comics, f".page{p}.jpg")
-        if artwork.draw("photo", f"cbz-{p}", f"Page {p}", page, cfg,
-                        size=(1200, 1800), stamp=False):
-            pages.append(page)
-    if pages:
-        with zipfile.ZipFile(cbz, "w") as zf:
-            for p, page in enumerate(pages, 1):
-                zf.write(page, f"{p:03d}.jpg")
-        for page in pages:
-            os.unlink(page)
-        made.append({"library": "Books", "key": "cbz-1", "path": cbz})
+    # --- the shelf: several books in one folder, so filenames are parsed ---
+    shelf = os.path.join(root, BOOK_SHELF)
+    for stem, ext, key, title, pages, _why in BOOK_SHELF_FILES:
+        path = os.path.join(shelf, f"{stem}.{ext}")
+        if cfg.artwork_only and os.path.exists(path):
+            pass
+        elif ext == "pdf":
+            books.write_pdf(path, title or stem, BOOK_SHELF, pages)
+        else:
+            books.write_epub(path, title, BOOK_SHELF)
+        entry = {"library": "Books", "key": key, "path": path}
+        if ext == "pdf":
+            # Recorded so `verify` can re-count them rather than trust that
+            # the writer was asked for the right number.
+            entry["pages"] = pages
+        made.append(entry)
+
+    # --- one book alone in its own directory ------------------------------
+    alone = os.path.join(root, BOOK_ALONE_AUTHOR, BOOK_ALONE,
+                         f"{BOOK_ALONE}.epub")
+    if not cfg.artwork_only or not os.path.exists(alone):
+        # The name the *folder* parses to, for the same reason as the shelf:
+        # a `dc:title` that disagreed would be the thing on screen, and the
+        # directory rule would be invisible behind it.
+        books.write_epub(alone, BOOK_ALONE_PARSED_NAME, BOOK_ALONE_AUTHOR)
+    made.append({"library": "Books", "key": "book-alone", "path": alone})
+
+    # --- the formats that resolve and cannot be opened --------------------
+    for stem, ext, key in UNOPENABLE_FILES:
+        path = os.path.join(root, UNOPENABLE_FOLDER, f"{stem}.{ext}")
+        if not cfg.artwork_only or not os.path.exists(path):
+            books.write_palmdb(path, stem, UNOPENABLE_FOLDER)
+        made.append({"library": "Books", "key": key, "path": path})
+
+    made += _build_comics(os.path.join(root, COMICS_FOLDER), cfg)
+    made += _build_audiobooks(root, cfg)
     return made
 
 
-def _write_epub(path: str, title: str, author: str, cfg=None) -> None:
-    import zipfile
+# One row per archive. `dialect` is the single metadata convention it carries,
+# and "single" is the point: `ComicProvider` walks its providers in a fixed
+# order — ComicBookInfo, then the external `ComicInfo.xml`, then the internal
+# one — and returns the **first** that finds anything. An archive carrying two
+# would only ever demonstrate which one is first, so each here carries one and
+# `test_books.py` holds it to that.
+#
+#   dialect  "none"      no metadata anywhere; the name comes from the filename
+#            "external"  ComicInfo.xml beside the archive, as `<name>.xml`
+#            "internal"  ComicInfo.xml inside the archive — .cbz only
+#            "bookinfo"  ComicBookInfo JSON in the zip's archive comment — .cbz only
+#            "ignored"   internal metadata in a container that is not .cbz, so
+#                        it is never read
+COMICS = [
+    {"key": "cbz-1", "file": "A Test Comic 001.cbz", "dialect": "none",
+     "credits_page": False, "named_cover": False,
+     "why": "the plain case: no metadata, and pages that happen to sort so "
+            "that the cover rule is right by luck"},
+    {"key": "cbz-external-info", "file": "The Signal Archive 002.cbz",
+     "dialect": "external", "credits_page": False, "named_cover": False,
+     "title": "Sidecar ComicInfo Dialect", "number": 2, "year": 2017,
+     "publisher": "Standard QA Pictures", "genres": ["Adventure", "Mystery"],
+     "writer": "Ada Alvarez", "penciller": "Bo Brandt", "colourist": "Cai Chen",
+     "summary": "Read from a ComicInfo.xml file next to the archive. This is "
+                "the only one of the three providers with no extension "
+                "restriction.",
+     "why": "ComicInfo.xml beside the archive"},
+    {"key": "cbz-internal-info", "file": "The Signal Archive 003.cbz",
+     "dialect": "internal", "credits_page": False, "named_cover": False,
+     "title": "Internal ComicInfo Dialect", "number": 3, "year": 2018,
+     "publisher": "Testcard Studios", "genres": ["Sci-Fi"],
+     "writer": "Dara Dahl",
+     "summary": "Read from a ComicInfo.xml inside the archive. Only a .cbz is "
+                "opened for this. Its page count is one more than its pages, "
+                "because the server counts every entry in the archive.",
+     "why": "ComicInfo.xml inside the archive, which is .cbz only"},
+    {"key": "cbz-book-info", "file": "The Signal Archive 004.cbz",
+     "dialect": "bookinfo", "credits_page": False, "named_cover": False,
+     "title": "ComicBookInfo Dialect", "number": 4, "year": 2019, "month": 6,
+     "publisher": "Reference Media Group", "genre": "Fantasy",
+     "credits": [("Eli Eriksen", "Writer"), ("Fay Farrow", "Penciller")],
+     "summary": "Read from JSON in the zip's archive comment — a trailer "
+                "nothing else looks at, which is why the convention could be "
+                "bolted on to an existing format at all. .cbz only.",
+     "why": "ComicBookInfo JSON in the zip comment"},
+    {"key": "cbt-ignored-info", "file": "Ignored Internal Info 005.cbt",
+     "dialect": "ignored", "credits_page": False, "named_cover": False,
+     "title": "THIS TITLE MUST NOT APPEAR", "number": 99, "year": 1999,
+     "publisher": "Wrong Publisher", "genres": ["Horror"],
+     "writer": "Nobody At All",
+     "summary": "If you can read this in Jellyfin, the .cbz-only restriction "
+                "on InternalComicInfoProvider is gone.",
+     "why": "the same internal metadata in a .cbt, which is read as an "
+            "archive and ignored as metadata"},
+    {"key": "cbz-sorted-cover", "file": "Scan Credits Cover 006.cbz",
+     "dialect": "none", "credits_page": True, "named_cover": False,
+     "why": "no cover.jpg, and a scan-credits page that sorts ahead of page "
+            "one — so the cover rule picks the wrong page"},
+    {"key": "cbz-named-cover", "file": "Named Cover 007.cbz",
+     "dialect": "none", "credits_page": True, "named_cover": True,
+     "why": "the same archive with cover.jpg added and nothing else changed, "
+            "so the difference between the two covers is the rule"},
+]
 
-    # An EPUB holds no artwork, so a redraw has nothing to change in one —
-    # and rewriting it would only churn the zip's timestamps and send
-    # Jellyfin off to rescan a file that is identical in every way that
-    # matters.
-    if cfg is not None and cfg.artwork_only and os.path.exists(path):
-        return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with zipfile.ZipFile(path, "w") as zf:
-        # mimetype must be first and stored uncompressed — that is what makes
-        # the file identifiable as an EPUB by its first bytes.
-        zf.writestr(zipfile.ZipInfo("mimetype"), "application/epub+zip",
-                    compress_type=zipfile.ZIP_STORED)
-        zf.writestr("META-INF/container.xml",
-                    '<?xml version="1.0"?>\n'
-                    '<container version="1.0" '
-                    'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n'
-                    '  <rootfiles><rootfile full-path="OEBPS/content.opf" '
-                    'media-type="application/oebps-package+xml"/></rootfiles>\n'
-                    '</container>\n')
-        zf.writestr("OEBPS/content.opf",
-                    f'<?xml version="1.0" encoding="utf-8"?>\n'
-                    f'<package xmlns="http://www.idpf.org/2007/opf" version="3.0" '
-                    f'unique-identifier="bookid">\n'
-                    f'  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
-                    f'    <dc:identifier id="bookid">stdjflib-{title}</dc:identifier>\n'
-                    f'    <dc:title>{title}</dc:title>\n'
-                    f'    <dc:creator>{author}</dc:creator>\n'
-                    f'    <dc:language>en</dc:language>\n'
-                    f'  </metadata>\n'
-                    f'  <manifest><item id="c1" href="ch1.xhtml" '
-                    f'media-type="application/xhtml+xml"/></manifest>\n'
-                    f'  <spine><itemref idref="c1"/></spine>\n'
-                    f'</package>\n')
-        zf.writestr("OEBPS/ch1.xhtml",
-                    f'<?xml version="1.0" encoding="utf-8"?>\n'
-                    f'<html xmlns="http://www.w3.org/1999/xhtml"><head>'
-                    f'<title>{title}</title></head><body>\n'
-                    f'<h1>{title}</h1><p>By {author}.</p>\n'
-                    f'<p>Generated by stdjflib as library test content.</p>\n'
-                    f'</body></html>\n')
+# Which dialects put a member inside the archive, and which put one beside it.
+# `ignored` is `internal` in a container the provider refuses to open, so it
+# writes the same member and expects it to do nothing.
+DIALECTS_INSIDE = ("internal", "ignored")
+DIALECTS_BESIDE = ("external",)
+DIALECTS_IN_COMMENT = ("bookinfo",)
+
+
+def comic_entries(comic: dict) -> list[str]:
+    """Every entry the archive will hold, in the order they are written.
+
+    Spelled out here rather than measured off the file, so the expectation
+    exists before the archive does — `verify` compares the built archive
+    against it, and the cover rule is applied to it in `test_books.py`.
+    """
+    names = []
+    if comic["credits_page"]:
+        names.append(SCAN_CREDITS_PAGE)
+    names += [f"{n:03d}.jpg" for n in range(1, COMIC_PAGES + 1)]
+    if comic["named_cover"]:
+        names.append("cover.jpg")
+    if comic["dialect"] in DIALECTS_INSIDE:
+        names.append("ComicInfo.xml")
+    return names
+
+
+def _build_comics(folder: str, cfg) -> list[dict]:
+    """One archive per metadata dialect, plus the two cover rules."""
+    from . import books
+
+    os.makedirs(folder, exist_ok=True)
+    made = []
+    for comic in COMICS:
+        path = os.path.join(folder, comic["file"])
+        entries = comic_entries(comic)
+        made.append({"library": "Books", "key": comic["key"], "path": path,
+                     "archive": {"entries": len(entries),
+                                 "cover": books.archive_cover(entries)}})
+        if cfg.artwork_only and os.path.exists(path):
+            continue
+
+        pages = _comic_pages(folder, comic["key"], cfg,
+                             credits_page=comic["credits_page"])
+        if not pages:
+            continue
+        if comic["named_cover"]:
+            cover = os.path.join(folder, f".{comic['key']}-cover.jpg")
+            if artwork.draw("photo", f"{comic['key']}-cover", "Cover", cover,
+                            cfg, size=(1200, 1800), stamp=False):
+                pages.append(("cover.jpg", cover))
+
+        extra = None
+        comment = None
+        if comic["dialect"] in DIALECTS_INSIDE:
+            extra = {"ComicInfo.xml": _comicinfo_for(comic)}
+        elif comic["dialect"] in DIALECTS_BESIDE:
+            sidecar = os.path.splitext(path)[0] + ".xml"
+            with open(sidecar, "w", encoding="utf-8") as fh:
+                fh.write(_comicinfo_for(comic))
+        elif comic["dialect"] in DIALECTS_IN_COMMENT:
+            comment = books.comicbookinfo_json(
+                title=comic["title"], series=COMIC_SERIES,
+                issue=comic["number"], year=comic["year"],
+                month=comic["month"], publisher=comic["publisher"],
+                genre=comic["genre"], comments=comic["summary"],
+                credits=comic["credits"], tags=["stdjflib", "comic"])
+
+        if path.endswith(".cbt"):
+            books.write_cbt(path, pages, extra=extra)
+        else:
+            books.write_cbz(path, pages, extra=extra, comment=comment)
+        for _name, page in pages:
+            # A loose page left in a library folder would be an item.
+            if os.path.exists(page):
+                os.unlink(page)
+    return made
+
+
+def _comicinfo_for(comic: dict) -> str:
+    from . import books
+
+    return books.comicinfo_xml(
+        title=comic["title"],
+        series="Wrong Series" if comic["dialect"] == "ignored" else COMIC_SERIES,
+        number=comic["number"], year=comic["year"], summary=comic["summary"],
+        publisher=comic["publisher"], genres=comic["genres"],
+        writer=comic["writer"], penciller=comic.get("penciller", ""),
+        colourist=comic.get("colourist", ""))
+
+
+def _build_audiobooks(root: str, cfg) -> list[dict]:
+    """The two shapes, each alone in a folder of its own.
+
+    A folder rather than a loose file for both, because that is what the
+    server's own directory branch is for and because it is how audiobooks
+    arrive. The single `.m4b` takes its name from the folder; the rip's six
+    parts take theirs from their filenames.
+    """
+    by_key = {r.key: r for r in recipes.all_recipes()}
+    made = []
+
+    single = by_key["book-m4b"]
+    folder = os.path.join(root, recipes.AUDIOBOOK_AUTHOR, single.title)
+    path = os.path.join(folder, f"{single.title}.{single.container}")
+    if _emit(single, path, cfg):
+        made.append({"library": "Books", "key": single.key, "path": path})
+
+    rip = os.path.join(root, recipes.RIP_AUTHOR, recipes.RIP_TITLE)
+    for part in range(1, recipes.RIP_PARTS + 1):
+        rec = by_key[f"book-rip-{part:02d}"]
+        path = os.path.join(rip, f"{rec.title}.{rec.container}")
+        if _emit(rec, path, cfg):
+            made.append({"library": "Books", "key": rec.key, "path": path})
+    return made
 
 
 # --------------------------------------------------------------------------
@@ -1990,6 +2344,7 @@ def build_bulk_photos(root: str, cfg) -> list[dict]:
 
 def build_bulk_books(root: str, cfg) -> list[dict]:
     """EPUBs are pure zip writes, so these cost almost nothing to produce."""
+    from . import books
     count = max(1, cfg.bulk // 4)
 
     def task(i):
@@ -2001,7 +2356,12 @@ def build_bulk_books(root: str, cfg) -> list[dict]:
             if cfg.dry_run:
                 return {"library": "Bulk Books", "key": meta["key"],
                         "path": path}
-            _write_epub(path, meta["title"], author, cfg)
+            # An EPUB holds no artwork, so a redraw has nothing to change
+            # in one — and rewriting it would churn the zip's timestamps and
+            # send Jellyfin off to rescan a file identical in every way that
+            # matters.
+            if not (cfg.artwork_only and os.path.exists(path)):
+                books.write_epub(path, meta["title"], author)
             return {"library": "Bulk Books", "key": meta["key"], "path": path}
         return run
 

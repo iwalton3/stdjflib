@@ -263,6 +263,64 @@ def check_streams(root: str, manifest, report) -> int:
     return checked
 
 
+def check_books(manifest, report) -> int:
+    """Re-read the books whose whole point is a number the server will report.
+
+    Two of them, and neither is checkable by probing with ffmpeg — a PDF and a
+    comic archive are not media. So the files are re-read here:
+
+    * a PDF's **page count**, because Jellyfin stores `pageCount * 10000` as
+      `RunTimeTicks` and that number is the only thing a client can read back
+      off a book. Counted by walking the page objects in the file, which is a
+      second statement of the format rather than a call back into the writer —
+      a check that inherits its expectations from the thing it checks is not a
+      check.
+    * a comic archive's **entry count and cover**, because the server counts
+      every non-directory entry as a page (so a `ComicInfo.xml` inside one
+      inflates it, deliberately) and picks the cover by two rules that a
+      renamed or reordered entry silently changes. An archive whose pages
+      sorted differently after a rebuild would still open, still show a cover,
+      and no longer be testing what it says it tests.
+    """
+    from . import books
+
+    checked = 0
+    for item in manifest.get("items", []):
+        path = item["path"]
+        want_pages = item.get("pages")
+        if want_pages is not None:
+            checked += 1
+            got = books.pdf_page_count(path)
+            if got is None:
+                report.problems.append(
+                    f"{item['key']}: not a readable PDF ({path})")
+            elif got != want_pages:
+                report.problems.append(
+                    f"{item['key']}: PDF has {got} pages, expected "
+                    f"{want_pages} — a server would report "
+                    f"RunTimeTicks {got * 10000}")
+
+        archive = item.get("archive")
+        if archive:
+            checked += 1
+            names = books.archive_entries(path)
+            if names is None:
+                report.problems.append(
+                    f"{item['key']}: unreadable archive ({path})")
+                continue
+            if len(names) != archive["entries"]:
+                report.problems.append(
+                    f"{item['key']}: {len(names)} archive entries, expected "
+                    f"{archive['entries']} — the server counts every one of "
+                    f"them as a page")
+            cover = books.archive_cover(names)
+            if cover != archive["cover"]:
+                report.problems.append(
+                    f"{item['key']}: the server would take {cover!r} as the "
+                    f"cover, expected {archive['cover']!r}")
+    return checked
+
+
 @dataclasses.dataclass
 class Report:
     """What a verify run found.
@@ -276,6 +334,7 @@ class Report:
     files: int = 0
     images: int = 0
     streams: int = 0
+    books: int = 0
     problems: list = dataclasses.field(default_factory=list)
     notes: list = dataclasses.field(default_factory=list)
 
@@ -328,5 +387,6 @@ def run(cfg) -> Report:
     report.images = check_artwork(
         cfg, manifest.get("libraries") or cfg.libraries(), report)
     report.streams = check_streams(cfg.root, manifest, report)
+    report.books = check_books(manifest, report)
     report.files = checked
     return report

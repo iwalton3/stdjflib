@@ -398,6 +398,9 @@ def cmd_verify(args) -> int:
     report = verify.run(cfg)
     print(f"re-probed {report.files} generated files against their recipes "
           f"and {report.images} images against the shape their type calls for")
+    if report.books:
+        print(f"re-read {report.books} book(s) for the page count and cover "
+              f"the server would take from them")
     if report.streams:
         print(f"re-read {report.streams} stream files for the URL Jellyfin "
               f"would take from each")

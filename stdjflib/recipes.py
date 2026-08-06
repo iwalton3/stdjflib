@@ -75,6 +75,22 @@ class Recipe:
     tier: str = "minimal"
     year: int = 2020
     broken: str | None = None       # "truncate" | "empty" | "zero"
+    # Which library builder places this file. Everything in the matrix lands
+    # in `Test Media/`; a recipe naming anything else is placed by that
+    # library's own builder, because where it sits in the tree *is* what it
+    # tests. It still belongs here rather than in `libraries.py` so that
+    # `verify` re-probes it against a declared codec, channel count and
+    # chapter count like everything else — `verify` looks a manifest entry up
+    # by key in `all_recipes()`, and a recipe kept out of that list is a file
+    # nothing ever checks.
+    library: str = "Test Media"
+    # Global container tags, written through the same FFMETADATA file the
+    # chapters go in. Only the audiobooks use them, and they are not
+    # decoration: `AudioFileProber` reads an audiobook's `album_artist` as its
+    # Author, its `composer` as the Narrator and any remaining `artist` as
+    # cast, and `album` is the only thing that groups the files of a
+    # multi-file rip — the server sets no `SeriesName` on an AudioBook.
+    container_tags: tuple[tuple[str, str], ...] = ()
 
     @property
     def encoders(self) -> tuple[str, ...]:
@@ -688,6 +704,111 @@ def _structure() -> list[Recipe]:
     ]
 
 
+# --------------------------------------------------------------------------
+# Audiobooks
+# --------------------------------------------------------------------------
+#
+# These are declared here, and placed by `libraries.build_books`, because an
+# audiobook is only an audiobook inside a `books` library: the *same* file in
+# the Music library resolves as ordinary `Audio` and takes a different path
+# through every client. They stay in this module so `verify` re-probes them
+# against a declared codec, channel count and chapter count like everything
+# else — a file with no recipe is a file nothing checks.
+#
+# Two shapes, because the server produces two and they are not variations on
+# one another:
+#
+#   A single `.m4b` with embedded chapter markers is **one** item whose
+#   chapters are rows in the database. Chapter extraction is enabled for this
+#   type and no other (`AudioFileProber`: `ExtractChapters = item is
+#   AudioBook`), and it does nothing more than add `-show_chapters` to
+#   ffprobe — so markers the container does not carry are markers that do not
+#   exist. There is no per-file, cue-sheet or filename fallback anywhere.
+#
+#   A multi-file rip is **N** items. `StackResolver.ResolveAudioBooks` groups
+#   by directory, so all six parts become one stack of six files, and
+#   `AudioResolver` then drops any stack holding more than one file ("For now,
+#   until we sort out naming for multi-part books"). That leaves zero items,
+#   which is exactly what saves them: `LibraryManager.ResolvePaths` only takes
+#   a multi-item resolver's answer `if (result?.Items.Count > 0)`, so it falls
+#   through and resolves each file on its own. Add a *seventh* file that does
+#   not stack and the folder would produce one item and hide the other six.
+#
+# So "chapter 7" is a marker in the first case and item 7 in the second — two
+# code paths for one gesture, and only the first reuses a client's chapter UI.
+
+AUDIOBOOK_AUTHOR = "Elena Farrow"
+AUDIOBOOK_NARRATOR = "Noa Nakamura"
+AUDIOBOOK_TITLE = "The Lantern Keeper"
+AUDIOBOOK_CHAPTERS = 8
+
+# The multi-file rip: a different book, so the two shapes cannot be confused
+# for two spellings of one.
+RIP_AUTHOR = "Gus Gupta"
+RIP_NARRATOR = "Mira Moreau"
+RIP_TITLE = "The Divided Account"
+RIP_PARTS = 6
+
+
+def _audiobook_tags(title: str, author: str, narrator: str, year: int,
+                    **extra: str) -> tuple[tuple[str, str], ...]:
+    """The tags `AudioFileProber` reads off an audiobook.
+
+    `album_artist` is the Author, `composer` the Narrator — Audiobookshelf's
+    convention, which the server adopted — and `artist` is left as the author
+    so a client that reads the ordinary music tags shows the same name rather
+    than nothing.
+    """
+    tags = {
+        "title": title, "album": title, "album_artist": author,
+        "artist": author, "composer": narrator, "genre": "Audiobook",
+        "date": str(year),
+    }
+    tags.update(extra)
+    return tuple(tags.items())
+
+
+def _audiobooks() -> list[Recipe]:
+    out = [
+        Recipe(
+            key="book-m4b", title=AUDIOBOOK_TITLE, group="Audiobooks",
+            library="Books", container="m4b",
+            notes=f"One `.m4b` with {AUDIOBOOK_CHAPTERS} embedded chapter "
+                  f"markers, alone in its own folder. The server returns a "
+                  f"single AudioBook whose Chapters are real rows — the only "
+                  f"way to reach the chapter-extraction path, which is "
+                  f"switched on for this item type and no other. Its name "
+                  f"comes from the *folder*, not the file.",
+            video=None,
+            audios=(Audio(encoder="aac", channels=2, rate=44100,
+                          bitrate="64k", lang="eng"),),
+            duration=240, chapters=AUDIOBOOK_CHAPTERS, year=2019,
+            container_tags=_audiobook_tags(
+                AUDIOBOOK_TITLE, AUDIOBOOK_AUTHOR, AUDIOBOOK_NARRATOR, 2019),
+        ),
+    ]
+    for part in range(1, RIP_PARTS + 1):
+        out.append(Recipe(
+            key=f"book-rip-{part:02d}",
+            title=f"Chapter {part:02d}", group="Audiobooks",
+            library="Books", container="mp3",
+            notes=f"Part {part} of {RIP_PARTS} of a multi-file audiobook rip. "
+                  f"Each part is its own AudioBook item — the parts stack at "
+                  f"scan time and the stack is then dropped, so they survive "
+                  f"only through the per-file fall-through. Nothing sets "
+                  f"SeriesName on an AudioBook, so `album` is all that joins "
+                  f"them. No chapter markers: here a chapter is a file.",
+            video=None,
+            audios=(Audio(encoder="libmp3lame", channels=2, rate=44100,
+                          bitrate="64k", lang="eng"),),
+            duration=20, chapters=0, year=2016,
+            container_tags=_audiobook_tags(
+                f"Chapter {part:02d}", RIP_AUTHOR, RIP_NARRATOR, 2016,
+                album=RIP_TITLE, track=f"{part}/{RIP_PARTS}"),
+        ))
+    return out
+
+
 def all_recipes() -> list[Recipe]:
     out: list[Recipe] = []
     out += _video_codecs()
@@ -696,6 +817,7 @@ def all_recipes() -> list[Recipe]:
     out += _subtitles()
     out += _color_and_motion()
     out += _structure()
+    out += _audiobooks()
     _check_unique(out)
     return out
 

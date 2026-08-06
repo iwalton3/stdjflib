@@ -130,6 +130,15 @@ broadcast case) and an arbitrary 3:2 sample aspect MPEG-2 cannot express ·
 video with no audio · audio with no video · one-frame and three-hour runtimes ·
 a truncated file and a zero-byte file
 
+**Books** EPUB · PDF, whose page count is the only number a client can read
+back off a book · CBZ and CBT · the three comic metadata dialects, two of
+which the server reads **only** from a `.cbz` · both comic cover rules,
+including the one that picks the wrong page · `.azw3` and `.mobi`, which
+resolve with full metadata and which no client can open · **audiobooks in
+both shapes**: one chaptered `.m4b` that comes back as a single item with
+real chapter rows, and a six-part rip that comes back as six items · and one
+book of every filename convention `BookFileNameParser` recognises
+
 **Paths** loose files · folder/file name disagreement · multi-version films,
 both spellings — resolution tags with no exact-name file, and named editions
 behind one · **multi-version episodes**, tagged by resolution and by cut, in a
@@ -579,6 +588,117 @@ the per-library switch being set correctly. Closing it needs the *server-wide*
 `MetadataOptions` to list each remote provider as disabled as well. Both layers
 are applied; either alone is insufficient.
 
+## Books
+
+The Books library is the one place where the *files* are not media, and where
+almost everything a client has to get right is decided before a byte is read.
+Six things are worth knowing, all of them read out of the server and then
+measured against a running one.
+
+**A folder holding exactly one book *is* the book.** `BookResolver` counts the
+files whose extension is on its list — `.azw .azw3 .cb7 .cbr .cbt .cbz .epub
+.mobi .pdf`, and nothing else counts, so an NFO or a sidecar XML is invisible
+to the tally. Exactly one, and the folder resolves as a single book named
+after the **folder**. Two, and the rule stops applying: every file is resolved
+on its own and named after **itself**. Nothing warns at the boundary, and the
+two paths disagree about `SeriesName` — a loose file falls back to its parent
+directory's name, a directory-book to the empty string.
+
+So `Ines Imani/` holds six books precisely so that the filename parser runs at
+all; in a library of one-book folders it never does.
+
+**Books read no NFO.** There is no `BookNfoParser` and no `BookNfoSaver` in
+`MediaBrowser.XbmcMetadata` — nothing parses one for a `Book` or an
+`AudioBook`. This is the one library here whose metadata does not come from an
+NFO and cannot; it comes from the formats themselves. What keeps it off the
+internet is the per-library `TypeOptions` and the server-wide `MetadataOptions`
+instead, which is why both are set for `Book` and `AudioBook`.
+
+**`.cba` is not a book.** It looks like it belongs beside `.cbz` and `.cbr`,
+and the server has never accepted it. A `.cba` in a books library resolves to
+nothing at all and sits there as a file with no item.
+
+**The three comic dialects, and which of them your archive gets.**
+
+| Where the metadata is | Restriction | Fixture |
+| --- | --- | --- |
+| `ComicInfo.xml` **beside** the archive | any archive type | `The Signal Archive 002.cbz` |
+| `ComicInfo.xml` **inside** the archive | **`.cbz` only** | `The Signal Archive 003.cbz` |
+| ComicBookInfo JSON in the **zip comment** | **`.cbz` only** | `The Signal Archive 004.cbz` |
+
+The server asks them in a fixed order — ComicBookInfo, external, internal —
+and takes the **first** that finds anything, so each fixture carries exactly
+one dialect and every one of them sets a `Title` naming the dialect it came
+from. A comic showing its filename is a comic whose metadata was not read, and
+you can see that without opening anything.
+
+`Ignored Internal Info 005.cbt` is the restriction itself: the same
+`ComicInfo.xml`, in an archive the server reads perfectly well — it still
+extracts a cover and counts the pages — and ignores as metadata purely because
+the extension is not `.cbz`.
+
+**The cover is an exact name or an alphabetical accident.** `ComicImageProvider`
+looks for an entry called exactly `cover.<ext>` at the archive root (tried
+`.png`, `.jpeg`, `.jpg`, `.webp`, `.bmp`, `.gif`, so `.png` beats `.jpg`; no
+path prefix, and `Cover.jpg` does not match), and failing that takes the
+**alphabetically first image by entry key**. A comic whose pages are `001.jpg`
+onwards passes that by luck. `Scan Credits Cover 006.cbz` is the realistic way
+it goes wrong — a scanlator credit page filed as `000 - ` sorts ahead of page
+one and becomes the cover — and `Named Cover 007.cbz` is the identical archive
+with `cover.jpg` added and nothing else changed, so the difference between the
+two covers is the rule rather than the artwork.
+
+**Page counts are entry counts.** For a comic archive the server counts every
+non-directory entry, so an internal `ComicInfo.xml` makes a four-page comic
+report five. That is stated rather than corrected: a client showing five is
+reading the server correctly. A PDF is counted properly with PDFium, and an
+EPUB gets a flat `TimeSpan.TicksPerSecond` — page position in an EPUB is a
+percentage, not a page.
+
+**A PDF is the one book type with no artwork at all.** There is no PDF image
+provider, so `The Standard Manual (1994).pdf` renders with whatever a client
+draws when there is no poster — which is otherwise never exercised, because
+every comic here has a cover extracted from its own pages.
+
+### Audiobooks
+
+`AudioBook` is `Audio` with a different resolve, and it only happens inside a
+**books** library: the same file in `Music/` is an ordinary track and takes a
+different path through every client. The server produces two shapes and they
+are not variations on one another.
+
+| Fixture | What comes back |
+| --- | --- |
+| `Elena Farrow/The Lantern Keeper/The Lantern Keeper.m4b` | **one** AudioBook, 8 real chapter rows, named after the *folder* |
+| `Gus Gupta/The Divided Account/Chapter 01–06.mp3` | **six** AudioBooks, one per file |
+
+So "chapter 7" is a marker in the first case and item 7 in the second — two
+code paths for one gesture, and only the first reuses a client's existing
+chapter UI.
+
+Chapter extraction is enabled for this item type and no other
+(`ExtractChapters = item is AudioBook`), and it does nothing more than add
+`-show_chapters` to ffprobe. There is no per-file, cue-sheet or filename
+fallback anywhere, so markers the container does not carry are markers that do
+not exist — which is why the six-part rip reports no chapters at all.
+
+**The six parts are joined by their `album` tag and by nothing else.**
+`AudioBook` implements `IHasSeries` and **nothing in the server ever sets
+`SeriesName` on one** — measured, it comes back null. Group a multi-file
+audiobook by `Album`/`AlbumArtist`; `SeriesName` is a field that exists and is
+always empty. The author is the `album_artist` tag and the narrator is
+`composer` (Audiobookshelf's convention, which the server adopted), and they
+arrive as `Author` and `Narrator` people.
+
+**Why six files become six items is worth knowing, because it is fragile.**
+The parts stack at scan time into one six-file audiobook, which the server
+then drops outright — "until we sort out naming for multi-part books". Zero
+items is what saves them: the library manager only takes a multi-item
+resolver's answer when it produced at least one, so it falls through and
+resolves each file on its own. Put a *seventh* audio file in that folder that
+does not stack with the rest and the folder yields one item, the early return
+fires, and the six parts vanish from the library with nothing logged.
+
 ## Bitmap subtitles
 
 ffmpeg cannot produce image subtitles from text ones — it refuses with
@@ -664,9 +784,18 @@ be checked mechanically. A QA library is not worth a copyright argument.
 python3 -m unittest discover -s tests -t .
 ```
 
-138 tests, well under a second, needing no ffmpeg, server or container runtime. They cover the matrix's
-internal consistency, the licence rules, NFO output and determinism, ffmpeg
-argument assembly, and the VobSub encoder — including a round-trip of the RLE
-against an independent reference decoder written in the test, which is the only
-thing that would catch a wrong nibble producing a file that still parses and
-renders garbage.
+266 tests, well under a second, needing no ffmpeg, server or container
+runtime. They cover the matrix's internal consistency, the licence rules, NFO
+output and determinism, ffmpeg argument assembly, the Books library's naming
+and archive rules, and the VobSub encoder.
+
+Two of them are round-trips against a reference implementation written in the
+test rather than a call back into the writer, because both formats are ones a
+wrong byte leaves *parseable*: the VobSub RLE, where a wrong nibble produces a
+file that still renders — as garbage — and the hand-written PDF, whose
+cross-reference table a real reader silently recovers from by scanning, so
+wrong offsets look perfect everywhere else.
+
+`BookFileNameParser` is ported into the tests and pinned against Jellyfin's
+own vectors, so a drift in what this library believes about filenames fails
+here rather than in a fixture nobody re-reads.

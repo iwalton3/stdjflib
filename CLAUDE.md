@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (138 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (266 tests,
 well under a second, no ffmpeg). To try it for real, build the minimal tier —
 it downloads nothing and takes about 80 seconds on a 16-core machine:
 
@@ -35,6 +35,7 @@ filter or muxer problem.
 | `stdjflib/generate.py` | Recipe → ffmpeg invocation → file |
 | `stdjflib/vobsub.py` | the hand-written VobSub (.idx/.sub) encoder |
 | `stdjflib/subs.py` | subtitle sample text and the SRT/ASS/VTT writers |
+| `stdjflib/books.py` | the hand-written EPUB, PDF, CBZ/CBT and comic-metadata writers |
 | `stdjflib/strm.py` | `.strm` stream files, and the parsing rule they are written against |
 | `stdjflib/origin.py` | the local HTTP origin those stream files can point at |
 | `stdjflib/catalog.py` | what gets downloaded, and under what licence |
@@ -107,6 +108,62 @@ Not what Kodi documents and not what `BaseNfoSaver` writes — the two disagree.
 under `lockdata`), and `namedseason` on a series (Jellyfin parses it with
 `reader.Skip()`; season names come from `season.nfo`'s `seasonname`). Adding a
 field means finding its `case` first.
+
+**Books are the exception to every NFO rule here, because the server has no
+Book NFO parser at all.** `MediaBrowser.XbmcMetadata` has no `BookNfoParser`
+and no `BookNfoSaver`, and `BaseNfoProvider<T>` is subclassed for Movie,
+Video, MusicVideo, Series, Season, Episode, MusicAlbum and MusicArtist —
+nothing else. A `.nfo` beside a `.epub` is read by nobody, so `lockdata` is
+never set on a Book, `IsLocked` is never true, and an NFO written there would
+be a file that looks like coverage and is inert. `build_books` writes none.
+
+What keeps that library off the internet instead is the two provider layers
+that are already there — the per-library `TypeOptions` entry and the
+server-wide `MetadataOptions`, both of which already list `Book` and
+`AudioBook`. And it means the usual "an NFO change never reaches an item the
+server already scanned" does *not* apply to Books: with nothing setting
+`IsLocked`, a book's local providers re-run on an ordinary scan.
+
+**`ImageFetchers` is not the internet's list alone, and Books need theirs.**
+`ProviderManager.CanRefreshImages` returns early for an `ILocalImageProvider`
+and *nothing else*, so an `IDynamicImageProvider` — one that derives a picture
+from the file itself, with no network anywhere — is gated by the same array
+that keeps TMDB out. Emptying it for every type therefore switched off
+`ComicImageProvider` and `EpubImageProvider`, and every book in the library
+came back with no artwork at all; measured before and after. For every other
+type the empty list is still right, because this library ships its own drawn
+artwork and an embedded thumbnail winning over it would be a fixture quietly
+replaced. `provision.LOCAL_IMAGE_EXTRACTORS` is the exception and it names
+`Book` only; `test_server.py` forbids a remote provider ever appearing there.
+
+**A Books folder changes meaning at its second book.** `BookResolver` counts
+the files whose extension is on its own list — `.azw .azw3 .cb7 .cbr .cbt
+.cbz .epub .mobi .pdf`, and an NFO, a `.xml` sidecar or a poster does not
+count. Exactly one and the *folder* is the book, named after the folder, with
+`SeriesName` empty. Two and every file resolves on its own, named after
+itself, with `SeriesName` falling back to the parent directory. Nothing warns
+at the boundary, so adding a book to a one-book folder silently deletes the
+case that folder was covering — `test_books.py:TestFolderShapes` is what
+catches it. It also means `BookFileNameParser` is unreachable in a library of
+one-book folders, which is what `Ines Imani/` exists to fix.
+
+**An EPUB's `dc:title` beats whatever the filename parsed to.**
+`EpubProvider` reads the OPF and overwrites `Name`. That is why the three
+author folders come back named after their books rather than their folders,
+and it is worth having — but it silently hid the entire filename-parsing
+fixture until it was measured against a running server. Every EPUB on the
+shelf therefore embeds *the name the parser should produce*, and the one row
+the parser gives no name to is a PDF, because no provider reads one.
+`test_books.py:test_every_epub_embeds_the_name_its_filename_parses_to` holds
+the two to each other.
+
+**Nothing in the server sets `SeriesName` on an `AudioBook`.** It implements
+`IHasSeries`, so the field is there and a client will find it, and the only
+writers in the tree are `BookResolver` and the comic and OPF readers — all of
+which produce `Book`. Measured: null on all seven audiobook items. A
+multi-file audiobook is joined by its `album` tag and by nothing else, which
+is why the rip's parts carry one, and why `docs/COVERAGE_GAPS.md` is wrong
+where it says otherwise.
 
 **Every NFO sets `<lockdata>true`.** Without it Jellyfin queries TMDB and
 friends on scan, and what the client sees then depends on the network, on the
@@ -471,6 +528,20 @@ empty body, and treating that as "up" makes the next call fail with a
 connection error pointing nowhere near the cause.
 
 ## ffmpeg gotchas, all learned the hard way
+
+**`-f m4b` fails exactly like `-f mkv`.** "Error initializing the muxer for
+x.m4b: Invalid argument", which says nothing about muxers. Both `mp4` and
+`ipod` write a `.m4b` with working chapters; `MUXERS` maps it to **`ipod`**,
+which is what ffmpeg itself picks from the extension and which stamps the
+MPEG-4 audio brand rather than `isom`. `ipod` had to be added to the
+`+faststart` list at the same time — it is not one of `mp4`/`mov`/`3gp`.
+
+**Global container tags go through the same FFMETADATA file as the chapters.**
+`-map_metadata` takes one input and a second would replace the first rather
+than merge with it, so `Recipe.container_tags` is written into the chapter
+file. Values are escaped: `= ; # \` and a newline are FFMETADATA syntax, and
+a title containing one would not fail the build — it would produce a file
+tagged with something other than what the recipe asked for.
 
 **The muxer for `.mkv` is `matroska`.** `-f mkv` fails with "Requested output
 format 'mkv' is not known" — which says nothing about muxers and sends you

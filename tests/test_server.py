@@ -52,7 +52,32 @@ class TestLibraryOptions(unittest.TestCase):
         for entry in self.options["TypeOptions"]:
             with self.subTest(entry["Type"]):
                 self.assertEqual(entry["MetadataFetchers"], [])
-                self.assertEqual(entry["ImageFetchers"], [])
+
+    def test_no_remote_image_provider_is_ever_listed(self):
+        """`ImageFetchers` is the one list that is not simply emptied.
+
+        `CanRefreshImages` returns early for an `ILocalImageProvider` and
+        nothing else, so a *local* extractor — one that derives a picture from
+        the file on disk — is gated by the same array as TMDB. Books need
+        theirs: a book's cover is the extractor's output and there is no NFO
+        to put one in. The invariant is therefore not "empty" but "nothing
+        here talks to the internet".
+        """
+        for entry in self.options["TypeOptions"]:
+            with self.subTest(entry["Type"]):
+                for name in entry["ImageFetchers"]:
+                    self.assertNotIn(name, provision.REMOTE_PROVIDERS)
+                # Order has to name the same providers, or a fetcher that is
+                # enabled sits at the bottom of a list it is not on.
+                self.assertEqual(entry["ImageFetchers"],
+                                 entry["ImageFetcherOrder"])
+
+    def test_only_books_get_a_local_image_extractor(self):
+        """Everywhere else the drawn artwork is the fixture, and an embedded
+        thumbnail winning over it would replace one quietly."""
+        enabled = {t["Type"] for t in self.options["TypeOptions"]
+                   if t["ImageFetchers"]}
+        self.assertEqual(enabled, {"Book"})
 
     def test_nfo_reader_stays_enabled(self):
         """Local providers must survive; the NFOs are the whole metadata source."""
