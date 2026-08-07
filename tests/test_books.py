@@ -428,6 +428,7 @@ def book_tree() -> dict:
         add(libraries.UNOPENABLE_FOLDER, f"{stem}.{ext}")
     add(libraries.EPUB2_FOLDER, f"{libraries.EPUB2_METADATA_STEM}.epub")
     add(libraries.EPUB2_FOLDER, f"{libraries.EPUB2_CREDITS_STEM}.epub")
+    add(libraries.EPUB2_FOLDER, f"{libraries.EPUB2_CONFLICT_STEM}.epub")
     add(libraries.LONG_BOOKS_FOLDER, f"{libraries.LONG_BOOK_STEM}.epub")
     add(libraries.LONG_BOOKS_FOLDER, f"{libraries.LONG_PDF_STEM}.pdf")
     for comic in libraries.COMICS:
@@ -1054,10 +1055,25 @@ class TestEpub2Dialect(unittest.TestCase):
             with self.subTest(stem):
                 self.assertEqual(parse_book_name(stem)["name"], name)
 
+    def test_the_conflict_fixture_disagrees_in_both_fields(self):
+        """A conflict where the two sources happened to agree would look like
+        an answer and be none — the sort-title lesson, one field over."""
+        parsed = parse_book_name(libraries.EPUB2_CONFLICT_STEM)
+        self.assertEqual(parsed["name"], libraries.EPUB2_CONFLICT_NAME)
+        self.assertEqual(parsed["series"],
+                         libraries.EPUB2_CONFLICT_FILENAME_SERIES)
+        self.assertEqual(parsed["index"],
+                         libraries.EPUB2_CONFLICT_FILENAME_INDEX)
+        self.assertNotEqual(libraries.EPUB2_CONFLICT_FILENAME_SERIES,
+                            libraries.EPUB2_CONFLICT_OPF_SERIES)
+        self.assertNotEqual(libraries.EPUB2_CONFLICT_FILENAME_INDEX,
+                            libraries.EPUB2_CONFLICT_OPF_INDEX)
+
     def test_the_filenames_carry_no_series_so_the_opf_is_the_only_source(self):
         """`calibre:series` has no OPF 3 spelling at all. If the filename also
         carried a series there would be no way to tell which one a client
         read."""
+        # Deliberately not EPUB2_CONFLICT_STEM, which carries one on purpose.
         for stem in (libraries.EPUB2_METADATA_STEM,
                      libraries.EPUB2_CREDITS_STEM):
             with self.subTest(stem):

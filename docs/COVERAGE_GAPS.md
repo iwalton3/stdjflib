@@ -379,46 +379,32 @@ archive in the wild. Closing it means either a checked-in fixture or a
 hand-written RAR store-mode writer; the first breaks "everything is generated
 or licence-checked", the second is a real piece of work for one file.
 
-## The calibre:series conflict, half measured
+## The calibre:series conflict — SETTLED
 
 A Book gets a `SeriesName` from its path via `BookFileNameParser` and another
-from `calibre:series` via the OPF.
+from `calibre:series` via the OPF. **The OPF wins, and so does its
+`series_index`.** Measured on 12.0 against
+`The Contested Field (Filename Series, #4) (2011).epub`, whose filename parses
+`Filename Series` / 4 and whose OPF names `Opf Series` / 9: the item comes
+back `Opf Series` / 9, and stays there across a second `FullRefresh`.
 
-**Measured on 12.0:** with no series in the filename, the OPF wins.
-`The Older Format (2004).epub` comes back as `The Archive Editions`, while
-`The Contributors (2006).epub` beside it — same folder, no `calibre:series` —
-falls back to the parent folder, `Epub Two Dialect`.
+**The earlier prediction here was wrong.** This document previously reasoned
+from `BookMetadataService.MergeData`'s guard —
+`replaceData || string.IsNullOrEmpty(target.Item.SeriesName)` — that a
+filename-parsed series would block the OPF. The guard is real and
+`BookResolver` really does set `SeriesName` at resolve time, but
+`MetadataService.RefreshMetadata` never merges into the resolved item: it
+merges into `new MetadataResult<T> { Item = CreateNew() }`, copying across
+only `Path`, `Id`, `ParentIndexNumber` and the two metadata-language fields.
+The target is therefore empty of both fields no matter what the filename said,
+and the OPF always lands.
 
-**Not measured, and the source predicts the opposite:**
-`BookMetadataService.MergeData` gates the field on
-
-```csharp
-if (replaceData || string.IsNullOrEmpty(target.Item.SeriesName))
-```
-
-A series parsed out of the *filename* is set at resolve time, so by the time
-the provider merges, `target.Item.SeriesName` is non-empty and `replaceData`
-is false on an ordinary scan — which would drop the OPF value. The
-folder-fallback case measured above evidently does not populate the target
-before that check, or the OPF could not have won.
-
-**Shape of the work.** One more book in `Epub Two Dialect/` whose filename
-parses a series *and* whose OPF names a different one — the Goodreads
-spelling the shelf already uses, `Name (Series, #N) (Year).epub`, with
-`calibre:series` set to something else. Then scan and look. It is about
-twenty minutes including the rebuild, and it is worth doing rather than
-reasoning about: `DisplayOrder` on a BoxSet parses, saves, round-trips and can
-never take effect for exactly this kind of reason.
-
-**The EPUB 3 cover branch — FIXED.** `ReadCoverPath` tries
-`properties="cover-image"` first and `<meta name="cover">` last.
-`Long Form/The Long Novel (2016).epub` now carries the first and
-`Epub Two Dialect/The Older Format (2004).epub` the second, so both live
-branches have a fixture and `test_books.py` forbids either writer drifting
-onto the other's spelling. The two branches between them remain unreachable
-by anything — they are XPath string literals rather than globs — and that is
-noted in `books.epub_structure` rather than fixtured, because no valid EPUB
-can match them.
+**What that leaves open.** `ParentIndexNumber` *is* in that copy list and
+`IndexNumber` is not, so the two should behave oppositely — a filename-parsed
+parent index ought to block an OPF one. Nothing here combines the two: the
+`v02 c015` fixture that produces a `ParentIndexNumber` is an EPUB 3 with no
+calibre metadata. Closing it is one more EPUB 2 whose filename carries a
+volume/chapter suffix and whose OPF names a different `calibre:series_index`.
 
 ---
 

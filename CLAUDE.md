@@ -198,23 +198,46 @@ own PersonKind, `ctb` came back as **Author** — the contributor silently
 recorded as an author, as predicted — `J.R.R. Nakamura` came back respaced to
 `J. R. R. Nakamura`, and the one semicolon element came back as two people.
 
-`SeriesName` on a Book has two unrelated sources — the path, via
-`BookFileNameParser`, and `calibre:series`, via the OPF. **Measured: with no
-series in the filename, the OPF wins** (`The Archive Editions`, not the
-parent folder `Epub Two Dialect`, which is what the book beside it with no
-`calibre:series` falls back to). **The filename case is still not measured and
-may well go the other way**, because `BookMetadataService.MergeData` gates it:
+**`calibre:series` beats the filename, and the guard that looks like it should
+stop it never sees the filename.** `SeriesName` on a Book has two unrelated
+sources — the path, via `BookFileNameParser`, and `calibre:series`, via the
+OPF. Measured on 12.0, the OPF wins **both** `SeriesName` and `IndexNumber`,
+with no series in the filename and with a conflicting one, and the result is
+stable across a second `FullRefresh`:
+
+| Fixture | filename says | OPF says | comes back |
+| --- | --- | --- | --- |
+| `The Older Format (2004)` | (nothing; folder is `Epub Two Dialect`) | `The Archive Editions` / 2 | `The Archive Editions` / 2 |
+| `The Contributors (2006)` | (nothing) | (nothing) | `Epub Two Dialect` / — |
+| `The Contested Field (Filename Series, #4) (2011)` | `Filename Series` / 4 | `Opf Series` / 9 | **`Opf Series` / 9** |
+
+Reading `BookMetadataService.MergeData` alone predicts the opposite — it is
+guarded by `replaceData || string.IsNullOrEmpty(target.Item.SeriesName)`, and
+`BookResolver` really does set `SeriesName` from the parse (or the parent
+folder) at resolve time. **That prediction was wrong**, and the reason is one
+line up the stack: `MetadataService.RefreshMetadata` does not merge into the
+resolved item at all. It builds
 
 ```csharp
-if (replaceData || string.IsNullOrEmpty(target.Item.SeriesName))
+var temp = new MetadataResult<TItemType> { Item = CreateNew() };
+temp.Item.Path = item.Path;
+temp.Item.Id = item.Id;
+temp.Item.ParentIndexNumber = item.ParentIndexNumber;
 ```
 
-A filename-parsed series is set at resolve time, so on an ordinary scan
-`target.Item.SeriesName` is *not* empty, `replaceData` is false, and the OPF
-value would be dropped. That is inference from the source, not a measurement —
-it is written down because it predicts the opposite of what was measured for
-the folder-fallback case, which is exactly the kind of thing that gets assumed
-wrongly.
+— a **fresh** item carrying Path, Id, `ParentIndexNumber` and the two
+metadata-language fields, and nothing else. So `target.Item.SeriesName` is
+empty and `target.IndexNumber` is null whatever the resolver parsed, both
+guards pass, and the OPF lands. The filename values live on the real `item`
+and never enter that comparison.
+
+Note which field is in that copy list and which is not: **`ParentIndexNumber`
+is carried across and `IndexNumber` is not**, so the two behave oppositely — a
+filename-parsed parent index *would* block an OPF one. Not measured; no
+fixture yet combines a `v02 c015` filename with calibre metadata.
+
+The lesson is the one this file keeps relearning: a guard read in isolation
+says what it does, not what it sees.
 
 **A sort title has to sort somewhere the name would not.** `calibre:title_sort`
 was `"Older Format, The"` and it *worked* — `ForcedSortName` was set — and it

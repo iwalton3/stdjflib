@@ -2102,6 +2102,24 @@ EPUB2_SCHEME_IDS = (("ISBN", "9781234567897"),
 EPUB2_SUBJECTS = ("Fiction / Adventure", "Reference")
 EPUB2_DATE = "2004-06-15"
 
+# The conflict. Its filename is the Goodreads spelling the shelf uses, so
+# `BookFileNameParser` yields a series *and* an index at resolve time; its OPF
+# then names a different series and a different index. Every value says which
+# source it came from, so whichever appears on screen names itself.
+#
+# Both fields merge through the same shape of guard —
+# `replaceData || string.IsNullOrEmpty(target.Item.SeriesName)` in
+# `BookMetadataService.MergeData`, and `replaceData || !target.IndexNumber
+# .HasValue` in the base — so the prediction is that the *filename* wins both
+# and the OPF is dropped, which is the opposite of what `The Older Format`
+# measured with an empty filename series. See `docs/COVERAGE_GAPS.md`.
+EPUB2_CONFLICT_STEM = "The Contested Field (Filename Series, #4) (2011)"
+EPUB2_CONFLICT_NAME = "The Contested Field"
+EPUB2_CONFLICT_FILENAME_SERIES = "Filename Series"
+EPUB2_CONFLICT_FILENAME_INDEX = 4
+EPUB2_CONFLICT_OPF_SERIES = "Opf Series"
+EPUB2_CONFLICT_OPF_INDEX = 9
+
 EPUB2_CREDITS_STEM = "The Contributors (2006)"
 EPUB2_CREDITS_NAME = "The Contributors"
 
@@ -2427,6 +2445,24 @@ def _build_epub2(folder: str, cfg) -> list[dict]:
     made.append({"library": "Books", "key": "book-epub2-credits",
                  "path": credits_path,
                  "epub": {"version": "2.0", "title": EPUB2_CREDITS_NAME,
+                          "spine": 3, "contents": "ncx", "cover": False}})
+
+    conflict = os.path.join(folder, f"{EPUB2_CONFLICT_STEM}.epub")
+    if not cfg.artwork_only or not os.path.exists(conflict):
+        books.write_epub2(
+            conflict, EPUB2_CONFLICT_NAME, EPUB2_CREATORS[0][1],
+            chapters=[(f"Chapter {n}",
+                       books.paragraphs(f"{EPUB2_CONFLICT_NAME}:{n}", 5))
+                      for n in range(1, 4)],
+            series=EPUB2_CONFLICT_OPF_SERIES,
+            series_index=EPUB2_CONFLICT_OPF_INDEX,
+            description="The filename parses a series and an index; the OPF "
+                        "names different ones. Every value says where it came "
+                        "from, so whichever a client shows names its own "
+                        "source.")
+    made.append({"library": "Books", "key": "book-epub2-conflict",
+                 "path": conflict,
+                 "epub": {"version": "2.0", "title": EPUB2_CONFLICT_NAME,
                           "spine": 3, "contents": "ncx", "cover": False}})
     return made
 
