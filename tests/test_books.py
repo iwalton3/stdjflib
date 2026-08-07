@@ -436,12 +436,11 @@ def book_tree() -> dict:
         if comic["dialect"] in libraries.DIALECTS_BESIDE:
             add(libraries.COMICS_FOLDER,
                 os.path.splitext(comic["file"])[0] + ".xml")
-    single = {r.key: r for r in recipes.all_recipes()}["book-m4b"]
-    add(os.path.join(recipes.AUDIOBOOK_AUTHOR, single.title),
-        f"{single.title}.{single.container}")
-    for part in range(1, recipes.RIP_PARTS + 1):
-        add(os.path.join(recipes.RIP_AUTHOR, recipes.RIP_TITLE),
-            f"Chapter {part:02d}.mp3")
+    by_key = {r.key: r for r in recipes.all_recipes()}
+    for author, book, keys in libraries.audiobook_folders():
+        for key in keys:
+            rec = by_key[key]
+            add(os.path.join(author, book), f"{rec.title}.{rec.container}")
     return tree
 
 
@@ -694,10 +693,58 @@ class TestComicInfoDialects(unittest.TestCase):
 # Audiobooks
 # --------------------------------------------------------------------------
 
+# `Emby.Naming/Common/NamingOptions.cs:AudioBookPartsExpressions`, the two
+# entries every rip part here is named at. Restated rather than imported from
+# anywhere of ours, because they are what decides that a file is part N of
+# something rather than a book of its own.
+PART_EXPRESSIONS = (r"ch(?:apter)?[\s_-]?(?P<chapter>[0-9]+)",
+                    r"p(?:ar)?t[\s_-]?(?P<part>[0-9]+)")
+
+
+def parses_a_part_number(name: str) -> bool:
+    stem = os.path.splitext(name)[0]
+    return any(re.search(expr, stem, re.IGNORECASE)
+               for expr in PART_EXPRESSIONS)
+
+
+def audiobook_play_state(position: float, runtime: float,
+                         min_resume: int = recipes.AUDIOBOOK_MIN_RESUME_MINUTES,
+                         max_resume: int = recipes.AUDIOBOOK_MAX_RESUME_MINUTES
+                         ) -> tuple[float, bool]:
+    """`UserDataManager.UpdatePlayState`'s **AudioBook arm**, ported.
+
+    Seconds in, `(stored position, played)` out. The arm exists because an
+    audiobook is measured in *minutes off each end* rather than in the
+    percentages the video arm above it uses — under `MinAudiobookResume`
+    minutes in the position is thrown away as just-started, and under
+    `MaxAudiobookResume` minutes from the end it is thrown away *and* the item
+    is marked played. Nothing there consults the runtime otherwise, which is
+    the whole reason a short audiobook can hold no position at all.
+
+    A second statement of the server rather than of `recipes.py`'s comment
+    about it: a check that inherits its expectations from the thing it checks
+    is not a check. Only the known-runtime case, which is the one every
+    fixture here is in.
+    """
+    assert runtime > 0
+    if position <= 0:
+        return 0.0, False
+    if position / 60 < min_resume:
+        return 0.0, False
+    if (runtime - position) / 60 < max_resume or position >= runtime:
+        return 0.0, True
+    return position, False
+
+
 class TestAudiobooks(unittest.TestCase):
     def setUp(self):
         self.by_key = {r.key: r for r in recipes.all_recipes()}
         self.books = [r for r in recipes.all_recipes() if r.library == "Books"]
+        self.folders = libraries.audiobook_folders()
+        self.singles = [(author, book, keys[0])
+                        for author, book, keys in self.folders
+                        if len(keys) == 1]
+        self.rips = [row for row in self.folders if len(row[2]) > 1]
 
     def test_they_are_recipes_so_verify_re_probes_them(self):
         """A file with no recipe is a file nothing checks: `verify` looks a
@@ -714,79 +761,122 @@ class TestAudiobooks(unittest.TestCase):
         for rec in self.books:
             self.assertNotEqual(rec.library, "Test Media")
 
+    def test_both_shapes_exist_at_both_lengths(self):
+        """Four folders, not two. The short pair is the "too short to resume"
+        case and the long pair is the only one a resume position survives on;
+        neither substitutes for the other."""
+        self.assertEqual(len(self.singles), 2)
+        self.assertEqual(len(self.rips), 2)
+
     def test_the_single_file_shape_carries_chapter_markers(self):
         """The only way to reach the server's chapter extraction, which is
         enabled for AudioBook and nothing else — and which does no more than
         add `-show_chapters` to ffprobe, so markers the container lacks are
         markers that do not exist."""
-        rec = self.by_key["book-m4b"]
-        self.assertGreater(rec.chapters, 1)
-        self.assertEqual(rec.container, "m4b")
+        for _author, _book, key in self.singles:
+            with self.subTest(key):
+                rec = self.by_key[key]
+                self.assertGreater(rec.chapters, 1)
+                self.assertEqual(rec.container, "m4b")
 
     def test_the_multi_file_shape_carries_none(self):
         """Here a chapter is a file. A rip that also had markers would let a
         client pass by reading the wrong one."""
-        for part in range(1, recipes.RIP_PARTS + 1):
-            self.assertEqual(self.by_key[f"book-rip-{part:02d}"].chapters, 0)
+        for _author, _book, keys in self.rips:
+            for key in keys:
+                with self.subTest(key):
+                    self.assertEqual(self.by_key[key].chapters, 0)
 
-    def test_the_two_shapes_are_different_books(self):
+    def test_every_audiobook_is_a_different_book(self):
         """Two spellings of one title would read as a duplicate rather than as
-        two shapes."""
-        self.assertNotEqual(recipes.AUDIOBOOK_TITLE, recipes.RIP_TITLE)
-        self.assertNotEqual(recipes.AUDIOBOOK_AUTHOR, recipes.RIP_AUTHOR)
+        a shape or a length — and these are looked up by name."""
+        titles = [book for _author, book, _keys in self.folders]
+        authors = [author for author, _book, _keys in self.folders]
+        self.assertEqual(len(set(titles)), len(titles))
+        self.assertEqual(len(set(authors)), len(authors))
 
-    def test_the_rip_is_joined_by_album_because_nothing_else_joins_it(self):
+    def test_every_audiobook_item_name_is_unique_across_the_library(self):
+        """The single-file shape is named after its folder and a rip's parts
+        after their files, and nothing dedupes across folders: two rips both
+        spelling their parts `Chapter 01` would be four items sharing two
+        names, which is unlookupable."""
+        names = [book for _author, book, keys in self.folders if len(keys) == 1]
+        names += [self.by_key[key].title
+                  for _author, _book, keys in self.folders if len(keys) > 1
+                  for key in keys]
+        self.assertEqual(len(set(names)), len(names))
+
+    def test_the_rips_are_joined_by_album_because_nothing_else_joins_them(self):
         """`AudioBook` implements `IHasSeries` and **nothing in the server
         ever sets `SeriesName` on one** — the only writers are `BookResolver`
         and the comic and OPF readers, all of which produce `Book`. So the
         tags are the whole of the relationship."""
-        albums = set()
-        for part in range(1, recipes.RIP_PARTS + 1):
-            tags = dict(self.by_key[f"book-rip-{part:02d}"].container_tags)
-            albums.add(tags["album"])
-            self.assertEqual(tags["album_artist"], recipes.RIP_AUTHOR)
-        self.assertEqual(albums, {recipes.RIP_TITLE})
+        for author, book, keys in self.rips:
+            albums = set()
+            for key in keys:
+                tags = dict(self.by_key[key].container_tags)
+                albums.add(tags["album"])
+                self.assertEqual(tags["album_artist"], author)
+            self.assertEqual(albums, {book})
 
     def test_every_rip_part_has_its_own_track_number_and_title(self):
-        seen = set()
-        for part in range(1, recipes.RIP_PARTS + 1):
-            tags = dict(self.by_key[f"book-rip-{part:02d}"].container_tags)
-            seen.add((tags["title"], tags["track"]))
-        self.assertEqual(len(seen), recipes.RIP_PARTS)
+        for _author, _book, keys in self.rips:
+            seen = set()
+            for key in keys:
+                tags = dict(self.by_key[key].container_tags)
+                seen.add((tags["title"], tags["track"]))
+            self.assertEqual(len(seen), len(keys))
 
-    def test_the_rip_folder_holds_nothing_that_would_not_stack(self):
+    def test_a_rip_folder_holds_nothing_that_would_not_stack(self):
         """The subtle one, and it is load-bearing.
 
-        `StackResolver` groups by directory, so all six parts become one stack
-        of six, which `AudioResolver` then drops. Zero items is what saves
-        them: `ResolvePaths` only takes a multi-item resolver's answer
-        `if (result?.Items.Count > 0)`, so it falls through and resolves each
-        file on its own. Add a *seventh* audio file that ends up as its own
-        one-file stack and the folder yields one item — at which point the
-        early return fires and the six parts vanish from the library with
-        nothing logged.
+        `StackResolver.ResolveAudioBooks` groups by directory, so every part
+        becomes one stack, which `AudioResolver` then drops. Zero items is
+        what saves them: `ResolvePaths` only takes a multi-item resolver's
+        answer `if (result?.Items.Count > 0)`, so it falls through and
+        resolves each file on its own. Add an audio file that ends up as its
+        own one-file stack and the folder yields one item — at which point the
+        early return fires and the parts vanish from the library with nothing
+        logged.
         """
         tree = book_tree()
-        folder = os.path.join(recipes.RIP_AUTHOR, recipes.RIP_TITLE)
-        names = tree[folder]
-        self.assertEqual(len(names), recipes.RIP_PARTS)
-        for name in names:
-            self.assertTrue(name.startswith("Chapter "), name)
+        for author, book, keys in self.rips:
+            names = tree[os.path.join(author, book)]
+            with self.subTest(book):
+                self.assertEqual(sorted(names),
+                                 sorted(f"{self.by_key[k].title}."
+                                        f"{self.by_key[k].container}"
+                                        for k in keys))
+                for name in names:
+                    self.assertTrue(parses_a_part_number(name), name)
 
-    def test_the_single_audiobook_is_alone_in_its_folder(self):
-        """It takes its name from the folder, which only happens when the
+    def test_the_single_audiobooks_are_alone_in_their_folders(self):
+        """One takes its name from the folder, which only happens when the
         directory branch resolves — one audio file, and one only."""
         tree = book_tree()
-        single = self.by_key["book-m4b"]
-        folder = os.path.join(recipes.AUDIOBOOK_AUTHOR, single.title)
-        self.assertEqual(tree[folder], [f"{single.title}.{single.container}"])
+        for author, book, key in self.singles:
+            rec = self.by_key[key]
+            with self.subTest(key):
+                self.assertEqual(tree[os.path.join(author, book)],
+                                 [f"{rec.title}.{rec.container}"])
+                # The folder is what names it, so the file agreeing with the
+                # folder is what stops the two disagreeing invisibly.
+                self.assertEqual(rec.title, book)
 
     def test_the_author_and_narrator_go_in_the_tags_the_prober_reads(self):
         """`album_artist` is the Author and `composer` the Narrator —
         Audiobookshelf's convention, which the server adopted."""
-        tags = dict(self.by_key["book-m4b"].container_tags)
-        self.assertEqual(tags["album_artist"], recipes.AUDIOBOOK_AUTHOR)
-        self.assertEqual(tags["composer"], recipes.AUDIOBOOK_NARRATOR)
+        narrators = set()
+        for author, _book, keys in self.folders:
+            for key in keys:
+                tags = dict(self.by_key[key].container_tags)
+                with self.subTest(key):
+                    self.assertEqual(tags["album_artist"], author)
+                    self.assertTrue(tags["composer"])
+                narrators.add(tags["composer"])
+        # One narrator per book, so a People list says which fixture it came
+        # from rather than which shape.
+        self.assertEqual(len(narrators), len(self.folders))
 
     def test_the_m4b_muxer_is_not_the_extension(self):
         """`-f m4b` fails the same way `-f mkv` does, and says nothing about
@@ -795,6 +885,115 @@ class TestAudiobooks(unittest.TestCase):
 
         self.assertNotEqual(generate.muxer_for("m4b"), "m4b")
         self.assertIn(generate.muxer_for("m4b"), ("mp4", "ipod"))
+
+
+class TestAudiobookResume(unittest.TestCase):
+    """The lengths, and the server arm that makes them the fixture.
+
+    An audiobook's resume window is measured in minutes off each end, so it is
+    the *runtime* that decides whether any position at all can be stored — and
+    below ten minutes the answer is none. Both lengths are shipped on purpose:
+    the short pair is the case a client meets on a rip of a short story, and
+    the long pair is the only one where resume, "finished by playback" and
+    "ignored as just started" can be told apart.
+    """
+
+    def setUp(self):
+        self.by_key = {r.key: r for r in recipes.all_recipes()}
+
+    def _seconds(self, key):
+        return self.by_key[key].duration
+
+    def test_the_short_fixtures_can_hold_no_resume_position_at_all(self):
+        """Deliberate, not an oversight. Under twice the threshold every
+        position is either <5 minutes in or <5 minutes from the end, so the
+        arm zeroes all of them — measured against 12.0 at 30 s, 120 s, 200 s
+        and 235 s into the 240 s `.m4b`, all stored 0."""
+        short = ["book-m4b"] + [f"book-rip-{n:02d}"
+                                for n in range(1, recipes.RIP_PARTS + 1)]
+        for key in short:
+            runtime = self._seconds(key)
+            with self.subTest(key):
+                self.assertLess(runtime,
+                                (recipes.AUDIOBOOK_MIN_RESUME_MINUTES
+                                 + recipes.AUDIOBOOK_MAX_RESUME_MINUTES) * 60)
+                for position in range(1, int(runtime)):
+                    stored, _played = audiobook_play_state(position, runtime)
+                    self.assertEqual(stored, 0.0)
+
+    def test_the_short_single_can_not_even_be_marked_played_by_playback(self):
+        """Under `MinAudiobookResume` the *first* test wins and returns before
+        `Played` is ever set, so playing one to its end leaves it unplayed —
+        a second case worth having, and a second reason not to lengthen it."""
+        runtime = self._seconds("book-m4b")
+        self.assertLess(runtime, recipes.AUDIOBOOK_MIN_RESUME_MINUTES * 60)
+        for position in range(1, int(runtime) + 1):
+            _stored, played = audiobook_play_state(position, runtime)
+            self.assertFalse(played, position)
+
+    def test_the_long_single_reaches_all_three_answers(self):
+        runtime = self._seconds("book-m4b-long")
+        self.assertEqual(runtime, recipes.LONG_AUDIOBOOK_SECONDS)
+
+        stored, played = audiobook_play_state(
+            recipes.LONG_AUDIOBOOK_RESUME_SECONDS, runtime)
+        self.assertEqual(stored, recipes.LONG_AUDIOBOOK_RESUME_SECONDS)
+        self.assertFalse(played)
+
+        stored, played = audiobook_play_state(
+            recipes.LONG_AUDIOBOOK_PLAYED_SECONDS, runtime)
+        self.assertEqual(stored, 0.0)
+        self.assertTrue(played)
+
+        stored, played = audiobook_play_state(
+            recipes.LONG_AUDIOBOOK_IGNORED_SECONDS, runtime)
+        self.assertEqual(stored, 0.0)
+        self.assertFalse(played)
+
+    def test_the_long_single_has_a_resumable_chapter_boundary_on_each_side(self):
+        """A chapter jump is the other way a client produces a position, so
+        the markers are placed where they land on both sides of both
+        thresholds rather than all inside one band."""
+        runtime = self._seconds("book-m4b-long")
+        chapters = self.by_key["book-m4b-long"].chapters
+        starts = [i * runtime / chapters for i in range(chapters)][1:]
+        answers = [audiobook_play_state(s, runtime) for s in starts]
+        self.assertTrue([a for a in answers if a[0]], "no chapter resumes")
+        self.assertTrue([a for a in answers if a == (0.0, False)],
+                        "no chapter is discarded as just-started")
+        self.assertTrue([a for a in answers if a[1]],
+                        "no chapter marks it played")
+
+    def test_a_long_rip_part_can_be_finished_by_playback(self):
+        """Which is what makes folder-level resume — "the first part not yet
+        finished" — reachable at all. The short rip's 20 s parts have no such
+        position, so a client that resumes a rip by finding the first unplayed
+        part had nothing to be tested against."""
+        for n in range(1, recipes.LONG_RIP_PARTS + 1):
+            runtime = self._seconds(f"book-rip-long-{n:02d}")
+            with self.subTest(n):
+                self.assertEqual(runtime, recipes.LONG_RIP_SECONDS)
+                stored, played = audiobook_play_state(
+                    recipes.LONG_RIP_PLAYED_SECONDS, runtime)
+                self.assertEqual(stored, 0.0)
+                self.assertTrue(played)
+                stored, played = audiobook_play_state(
+                    recipes.LONG_RIP_RESUME_SECONDS, runtime)
+                self.assertEqual(stored, recipes.LONG_RIP_RESUME_SECONDS)
+                self.assertFalse(played)
+
+    def test_the_long_ones_stay_cheap(self):
+        """Mono at 32k, because the length is the fixture and the content is a
+        sine tone. Stereo at the short ones' 64k would be four times the bytes
+        for nothing that is being tested."""
+        for key in ["book-m4b-long"] + [f"book-rip-long-{n:02d}"
+                                        for n in range(1,
+                                                       recipes.LONG_RIP_PARTS
+                                                       + 1)]:
+            audio = self.by_key[key].audios[0]
+            with self.subTest(key):
+                self.assertEqual(audio.channels, 1)
+                self.assertEqual(audio.bitrate, "32k")
 
 
 class TestContainerTags(unittest.TestCase):

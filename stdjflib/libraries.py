@@ -2649,29 +2649,54 @@ def _comicinfo_for(comic: dict) -> str:
         colourist=comic.get("colourist", ""))
 
 
-def _build_audiobooks(root: str, cfg) -> list[dict]:
-    """The two shapes, each alone in a folder of its own.
+def audiobook_folders() -> list[tuple[str, str, tuple[str, ...]]]:
+    """`(author, book folder, recipe keys)` for every audiobook folder.
 
-    A folder rather than a loose file for both, because that is what the
-    server's own directory branch is for and because it is how audiobooks
-    arrive. The single `.m4b` takes its name from the folder; the rip's six
-    parts take theirs from their filenames.
+    Four of them: each shape twice, once too short to hold a resume position
+    and once long enough. The lengths are the fixture and the reason there are
+    four rather than two — `UpdatePlayState`'s AudioBook arm measures minutes
+    off each end, so under ten minutes there is no position the server will
+    keep, and lengthening the short pair would have deleted that case rather
+    than added this one. `recipes.py` carries the whole argument.
+
+    Derived from the names in `recipes.py` rather than restated, so a fixture
+    is declared in one place; `test_books.py` walks this to reconstruct the
+    tree without running a build.
+    """
+    return [
+        (recipes.AUDIOBOOK_AUTHOR, recipes.AUDIOBOOK_TITLE, ("book-m4b",)),
+        (recipes.LONG_AUDIOBOOK_AUTHOR, recipes.LONG_AUDIOBOOK_TITLE,
+         ("book-m4b-long",)),
+        (recipes.RIP_AUTHOR, recipes.RIP_TITLE,
+         tuple(f"book-rip-{n:02d}" for n in range(1, recipes.RIP_PARTS + 1))),
+        (recipes.LONG_RIP_AUTHOR, recipes.LONG_RIP_TITLE,
+         tuple(f"book-rip-long-{n:02d}"
+               for n in range(1, recipes.LONG_RIP_PARTS + 1))),
+    ]
+
+
+def _build_audiobooks(root: str, cfg) -> list[dict]:
+    """Both shapes at both lengths, each alone in a folder of its own.
+
+    A folder rather than a loose file for every one of them, because that is
+    what the server's own directory branch is for and because it is how
+    audiobooks arrive. A single-file audiobook takes its name from the
+    *folder*; a rip's parts take theirs from their filenames. Nothing but
+    parts goes in a rip's folder: every audio file in a directory becomes one
+    stack, the stack is dropped for holding more than one file, and each file
+    then falls through and resolves on its own — a file that ended up as a
+    one-file stack would produce a single item and hide the rest.
     """
     by_key = {r.key: r for r in recipes.all_recipes()}
     made = []
 
-    single = by_key["book-m4b"]
-    folder = os.path.join(root, recipes.AUDIOBOOK_AUTHOR, single.title)
-    path = os.path.join(folder, f"{single.title}.{single.container}")
-    if _emit(single, path, cfg):
-        made.append({"library": "Books", "key": single.key, "path": path})
-
-    rip = os.path.join(root, recipes.RIP_AUTHOR, recipes.RIP_TITLE)
-    for part in range(1, recipes.RIP_PARTS + 1):
-        rec = by_key[f"book-rip-{part:02d}"]
-        path = os.path.join(rip, f"{rec.title}.{rec.container}")
-        if _emit(rec, path, cfg):
-            made.append({"library": "Books", "key": rec.key, "path": path})
+    for author, book, keys in audiobook_folders():
+        folder = os.path.join(root, author, book)
+        for key in keys:
+            rec = by_key[key]
+            path = os.path.join(folder, f"{rec.title}.{rec.container}")
+            if _emit(rec, path, cfg):
+                made.append({"library": "Books", "key": rec.key, "path": path})
     return made
 
 

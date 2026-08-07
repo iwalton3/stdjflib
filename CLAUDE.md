@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (370 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (380 tests,
 well under a second, no ffmpeg). Three of them validate the EPUB writers with
 **epubcheck** and skip when it is absent — `apt install epubcheck`, which
 costs about four seconds of JVM startup when present. It is a development
@@ -345,6 +345,35 @@ which produce `Book`. Measured: null on all seven audiobook items. A
 multi-file audiobook is joined by its `album` tag and by nothing else, which
 is why the rip's parts carry one, and why `docs/COVERAGE_GAPS.md` is wrong
 where it says otherwise.
+
+**There are four audiobook folders because an audiobook's resume window is
+measured in minutes, not percentages, and the two lengths are separate
+fixtures.** `UpdatePlayState`'s `AudioBook` arm discards a position under
+`MinAudiobookResume` (5) minutes in and discards-and-marks-played one under
+`MaxAudiobookResume` (5) minutes from the end, consulting the runtime nowhere
+else. So under ten minutes **no** position can be stored, and under five
+minutes the item cannot even be marked played by playback — the first test
+wins and returns before `Played` is set. The 240 s `.m4b` and the 20 s rip
+parts are that case on purpose: do not lengthen them, and do not shorten
+`The Overnight Vigil` (24 min, 6 chapters) or `The Slow Crossing`'s parts
+(12 min), which are the only fixtures where resume, finished-by-playback and
+ignored-as-just-started can be told apart. `recipes.py` names the three
+positions that reach each answer, because reading them off the video arm's
+percentages gives the wrong number every time. Same shape as
+`origin-long.mp4` being 400 seconds, and a different cliff.
+
+Both comparisons are strict, so a position exactly five minutes in or exactly
+five minutes from the end is *kept* — measured on 12.0, along with everything
+else in `docs/COVERAGE_GAPS.md` §9. Two neighbours of that arm: a `Book` is
+excluded from *both* arms (`item is not AudioBook && item is not Book`, then
+`is AudioBook`), so an EPUB's or a PDF's position is stored verbatim with no
+threshold at all — measured; and plain `Audio` does not override
+`SupportsPositionTicksResume` while `AudioBook` does, so the same file in
+`Music/` can never resume however long it is — read from source, and no
+fixture here can reach it, because every track in `Music/` is under
+`MinResumeDurationSeconds` and would be zeroed by the video arm first. And
+"cannot be marked played" means *by playback*: `POST /UserPlayedItems` sets
+`Played` on the 240 s `.m4b` perfectly well.
 
 **A collection is not an NFO and not the Kodi dialect.** `collection.xml` is
 read by `BoxSetXmlParser`, which subclasses `BaseItemXmlParser` — the older

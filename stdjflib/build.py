@@ -575,9 +575,13 @@ In the library's settings that means:
   with folders that hold one kind, the other, or both. The untidy counterpart
   to `Home Videos/`.
 - `Books/` — EPUB, PDF and comic archives, plus **audiobooks in both shapes
-  the server produces**: one chaptered `.m4b` that resolves to a single item
-  with real chapter rows, and a six-part rip that resolves to six items joined
-  only by their `Album` tag. Also the three comic metadata dialects (two of
+  the server produces, at both lengths that matter**: a chaptered `.m4b` that
+  resolves to a single item with real chapter rows, and a multi-file rip that
+  resolves to one item per file, joined only by their `Album` tag — each of
+  them once too short to hold a resume position and once long enough. An
+  audiobook's resume window is measured in *minutes* off each end, not in
+  percentages, so nothing under ten minutes can hold one at all. Also the
+  three comic metadata dialects (two of
   which the server reads only from a `.cbz`), both comic cover rules, the
   formats that catalogue and that no client can open, and one book per
   filename convention the resolver parses. `Epub Two Dialect/` is EPUB 2.0.1 —

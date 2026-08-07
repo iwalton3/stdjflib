@@ -810,12 +810,38 @@ are not variations on one another.
 
 | Fixture | What comes back |
 | --- | --- |
-| `Elena Farrow/The Lantern Keeper/The Lantern Keeper.m4b` | **one** AudioBook, 8 real chapter rows, named after the *folder* |
-| `Gus Gupta/The Divided Account/Chapter 01–06.mp3` | **six** AudioBooks, one per file |
+| `Elena Farrow/The Lantern Keeper/The Lantern Keeper.m4b` | **one** AudioBook, 8 real chapter rows, named after the *folder*, 4 min |
+| `Gus Gupta/The Divided Account/Chapter 01–06.mp3` | **six** AudioBooks, one per file, 20 s each |
+| `Hana Halloran/The Overnight Vigil/The Overnight Vigil.m4b` | the same as the first, 24 min with 6 chapter rows |
+| `Kai Kowalski/The Slow Crossing/The Slow Crossing Part 01–03.mp3` | the same as the second, 12 min per part |
 
 So "chapter 7" is a marker in the first case and item 7 in the second — two
 code paths for one gesture, and only the first reuses a client's existing
 chapter UI.
+
+**Each shape is there twice because the length is a fixture of its own.** An
+audiobook's resume window is measured in **minutes off each end** —
+`MinAudiobookResume` and `MaxAudiobookResume`, both 5 — and not in the
+percentages every other media type uses. So an audiobook under ten minutes
+long can hold no resume position at all, and one under five minutes cannot
+even be marked played by playing it: the server discards the position as
+just-started and returns before `Played` is set. Measured, and it is silent —
+the client reports progress, the server answers 200, and the item comes back
+at 0.
+
+The short pair is that case and is meant to stay short. The long pair is where
+the behaviour lives: on `The Overnight Vigil`, 6:00 and 12:00 resume, 21:00
+zeroes the position and marks it played, and 2:00 is discarded — all three
+answers on one item, with chapter markers placed so a chapter *jump* lands on
+either side of both thresholds too. `The Slow Crossing`'s 12-minute parts are
+long enough for a part to be finished by playback (8:00 does it), which is
+what makes "resume the folder at the first part not yet finished" testable.
+
+Two neighbouring rules worth knowing: the same file in `Music/` can never
+resume, because plain `Audio` does not override `SupportsPositionTicksResume`
+and `AudioBook` does; and a **`Book`** — an EPUB or a PDF — is excluded from
+both arms of that method, so its reported position is stored verbatim with no
+threshold at all.
 
 Chapter extraction is enabled for this item type and no other
 (`ExtractChapters = item is AudioBook`), and it does nothing more than add

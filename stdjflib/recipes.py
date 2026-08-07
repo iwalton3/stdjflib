@@ -749,6 +749,71 @@ RIP_NARRATOR = "Mira Moreau"
 RIP_TITLE = "The Divided Account"
 RIP_PARTS = 6
 
+# --- the two long ones, and the branch they exist for --------------------
+#
+# `UserDataManager.UpdatePlayState` has an arm of its own for `AudioBook`, and
+# unlike the video arm above it its thresholds are **minutes off each end**,
+# not percentages: `MinAudiobookResume` and `MaxAudiobookResume`, both 5 by
+# default. Under 5 minutes in, the position is discarded as "just started";
+# under 5 minutes from the end, it is discarded *and* the item is marked
+# played. Nothing else in that arm looks at duration, so:
+#
+#   * an audiobook shorter than **10 minutes** can never hold a resume
+#     position at all — every position is either <5 min in or <5 min from the
+#     end;
+#   * one shorter than **5 minutes** can never even be marked played by
+#     playback, because the first test wins and returns before `Played` is
+#     set.
+#
+# `The Lantern Keeper` is 240 s and the rip's parts are 20 s, so both sit
+# under both thresholds and no amount of reporting moves either. Measured on
+# 12.0: positions of 30 s, 120 s, 200 s and 235 s into the `.m4b` all stored
+# 0 and left `Played` false. That is real coverage — it is the "too short to
+# resume" case, and it is what makes playing one to its end cheap — so the
+# long ones below are *additional* fixtures rather than those two lengthened.
+# One fixture, one property.
+#
+# Both are mono at 32k. The content is a sine tone and the *length* is the
+# fixture, so 24 minutes at the short ones' 64k stereo would be four times
+# the bytes for nothing that is being tested.
+
+LONG_AUDIOBOOK_AUTHOR = "Hana Halloran"
+LONG_AUDIOBOOK_NARRATOR = "Ivo Ibarra"
+LONG_AUDIOBOOK_TITLE = "The Overnight Vigil"
+LONG_AUDIOBOOK_CHAPTERS = 6
+LONG_AUDIOBOOK_SECONDS = 24 * 60
+
+# The multi-file rip long enough for a *part* to be finished by playback,
+# which is what makes folder-level resume ("the first part not yet finished")
+# reachable at all. A different book again, so four audiobook folders are four
+# titles rather than two titles at two lengths.
+LONG_RIP_AUTHOR = "Kai Kowalski"
+LONG_RIP_NARRATOR = "Lena Lindqvist"
+LONG_RIP_TITLE = "The Slow Crossing"
+LONG_RIP_PARTS = 3
+LONG_RIP_SECONDS = 12 * 60
+
+# The server's own two numbers, restated here because every position below is
+# only meaningful against them (`ServerConfiguration.MinAudiobookResume` /
+# `MaxAudiobookResume`, minutes).
+AUDIOBOOK_MIN_RESUME_MINUTES = 5
+AUDIOBOOK_MAX_RESUME_MINUTES = 5
+
+# The three answers that arm can give, as positions into the long `.m4b`.
+# Named because a test has to pick a number on the right side of both
+# thresholds, and neither threshold is a fraction of the runtime — reading
+# them off the percentages the video arm uses gives the wrong answer every
+# time.
+LONG_AUDIOBOOK_RESUME_SECONDS = 6 * 60     # >=5 min in, >=5 min left: kept
+LONG_AUDIOBOOK_PLAYED_SECONDS = 21 * 60    # <5 min left: zeroed and Played
+LONG_AUDIOBOOK_IGNORED_SECONDS = 2 * 60    # <5 min in: zeroed, not Played
+
+# And on one part of the long rip. The finish position is what a client's
+# "resume the folder" has to be able to produce; the short rip cannot reach
+# it, because 20 s is under both thresholds at once.
+LONG_RIP_RESUME_SECONDS = 6 * 60           # >=5 min in, >=5 min left: kept
+LONG_RIP_PLAYED_SECONDS = 8 * 60           # 4 min left: zeroed and Played
+
 
 def _audiobook_tags(title: str, author: str, narrator: str, year: int,
                     **extra: str) -> tuple[tuple[str, str], ...]:
@@ -805,6 +870,68 @@ def _audiobooks() -> list[Recipe]:
             container_tags=_audiobook_tags(
                 f"Chapter {part:02d}", RIP_AUTHOR, RIP_NARRATOR, 2016,
                 album=RIP_TITLE, track=f"{part}/{RIP_PARTS}"),
+        ))
+    out.append(Recipe(
+        key="book-m4b-long", title=LONG_AUDIOBOOK_TITLE, group="Audiobooks",
+        library="Books", container="m4b",
+        notes=f"The same shape as `{AUDIOBOOK_TITLE}` and "
+              f"{LONG_AUDIOBOOK_SECONDS // 60} minutes long, which is the "
+              f"whole of the difference: `UpdatePlayState`'s AudioBook arm "
+              f"measures {AUDIOBOOK_MIN_RESUME_MINUTES} minutes in and "
+              f"{AUDIOBOOK_MAX_RESUME_MINUTES} minutes from the end, in "
+              f"minutes rather than percentages, so nothing shorter than ten "
+              f"minutes can hold a resume position at all. All three answers "
+              f"that arm can give are reachable on this one item: "
+              f"{LONG_AUDIOBOOK_RESUME_SECONDS // 60}:00 resumes, "
+              f"{LONG_AUDIOBOOK_PLAYED_SECONDS // 60}:00 zeroes the position "
+              f"and marks it played, "
+              f"{LONG_AUDIOBOOK_IGNORED_SECONDS // 60}:00 is discarded as "
+              f"just-started. {LONG_AUDIOBOOK_CHAPTERS} embedded chapter "
+              f"markers of "
+              f"{LONG_AUDIOBOOK_SECONDS // LONG_AUDIOBOOK_CHAPTERS // 60} "
+              f"minutes each, so a chapter jump lands on either side of both "
+              f"thresholds too. Alone in its folder, so it is named after "
+              f"the folder like the short one. Mono at 32k: the length is "
+              f"the fixture, not the fidelity.",
+        video=None,
+        audios=(Audio(encoder="aac", channels=1, rate=44100,
+                      bitrate="32k", lang="eng"),),
+        duration=LONG_AUDIOBOOK_SECONDS, chapters=LONG_AUDIOBOOK_CHAPTERS,
+        year=2022,
+        container_tags=_audiobook_tags(
+            LONG_AUDIOBOOK_TITLE, LONG_AUDIOBOOK_AUTHOR,
+            LONG_AUDIOBOOK_NARRATOR, 2022),
+    ))
+    for part in range(1, LONG_RIP_PARTS + 1):
+        out.append(Recipe(
+            key=f"book-rip-long-{part:02d}",
+            title=f"{LONG_RIP_TITLE} Part {part:02d}", group="Audiobooks",
+            library="Books", container="mp3",
+            notes=f"Part {part} of {LONG_RIP_PARTS} of a rip whose parts are "
+                  f"{LONG_RIP_SECONDS // 60} minutes each — long enough for "
+                  f"one part to be *finished by playback*, which is what "
+                  f"makes folder-level resume (the first part not yet "
+                  f"finished) reachable at all. That needs a position at "
+                  f"least {AUDIOBOOK_MIN_RESUME_MINUTES} minutes in with "
+                  f"under {AUDIOBOOK_MAX_RESUME_MINUTES} minutes left, and "
+                  f"no such position exists on a 20 s part of "
+                  f"`{RIP_TITLE}`; here {LONG_RIP_PLAYED_SECONDS // 60}:00 "
+                  f"is one and {LONG_RIP_RESUME_SECONDS // 60}:00 resumes "
+                  f"instead. Its own folder, holding nothing but parts, for "
+                  f"the reason the short rip's folder does: every audio file "
+                  f"in a directory becomes one stack, the stack is dropped "
+                  f"for having more than one file, and each file then falls "
+                  f"through and resolves on its own. `album` joins them and "
+                  f"nothing else does. No chapter markers: here a chapter is "
+                  f"a file. Mono at 32k.",
+            video=None,
+            audios=(Audio(encoder="libmp3lame", channels=1, rate=44100,
+                          bitrate="32k", lang="eng"),),
+            duration=LONG_RIP_SECONDS, chapters=0, year=2023,
+            container_tags=_audiobook_tags(
+                f"{LONG_RIP_TITLE} Part {part:02d}", LONG_RIP_AUTHOR,
+                LONG_RIP_NARRATOR, 2023,
+                album=LONG_RIP_TITLE, track=f"{part}/{LONG_RIP_PARTS}"),
         ))
     return out
 

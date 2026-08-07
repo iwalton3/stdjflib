@@ -379,6 +379,125 @@ archive in the wild. Closing it means either a checked-in fixture or a
 hand-written RAR store-mode writer; the first breaks "everything is generated
 or licence-checked", the second is a real piece of work for one file.
 
+## 9. No audiobook was long enough to hold a resume position — FIXED
+
+Raised 2026-08-06 by the shim's audiobook work, and the reason it is worth a
+section rather than a line: **the fixtures made the failure unreachable while
+reporting a pass.** Every audiobook here resolved, played, reported progress
+and came back with `PlaybackPositionTicks` 0, and nothing anywhere said why.
+
+`UserDataManager.UpdatePlayState` has an arm of its own for `AudioBook`, and
+its thresholds are **minutes**, not percentages — unlike the video arm
+directly above it, which uses `MinResumePct` (5), `MaxResumePct` (90) and
+`MinResumeDurationSeconds` (300):
+
+```csharp
+else if (positionTicks > 0 && hasRuntime && item is AudioBook)
+{
+    var playbackPositionInMinutes = TimeSpan.FromTicks(positionTicks).TotalMinutes;
+    var remainingTimeInMinutes = TimeSpan.FromTicks(runtimeTicks - positionTicks).TotalMinutes;
+    if (playbackPositionInMinutes < _config.Configuration.MinAudiobookResume)   // default 5
+        positionTicks = 0;                       // ignore progress near the start
+    else if (remainingTimeInMinutes < _config.Configuration.MaxAudiobookResume // default 5
+             || positionTicks >= runtimeTicks)
+    { positionTicks = 0; data.Played = playedToCompletion = true; }             // finished near the end
+}
+```
+
+Nothing else in that arm consults the runtime, so what an item can express is
+decided by its length alone:
+
+| Runtime | What any reported position can do |
+| --- | --- |
+| under 5 min | nothing. Always zeroed, and `Played` is never set — the first test wins and returns before it is reached |
+| 5 to 10 min | can be marked **played**; can never hold a position |
+| 10 min and over | resumable anywhere in `[5 min, runtime − 5 min]`; played under 5 min from the end |
+
+The fixtures were a 240 s `.m4b` and 20 s rip parts — both under both
+thresholds, so **no resume or played-by-playback behaviour for an audiobook
+was reachable at all**. Measured against 12.0 before this landed: positions of
+30 s, 120 s, 200 s and 235 s into `The Lantern Keeper` each stored 0 and left
+`Played` false.
+
+**What shipped.** Two more fixtures, not two longer ones. The short pair is
+the "too short to resume" case, which is real coverage and is what makes
+playing one to its end cheap, so lengthening it would have deleted a case
+rather than added one — one fixture, one property.
+
+| Fixture | Shape | Runtime | Chapters |
+| --- | --- | --- | --- |
+| `Hana Halloran/The Overnight Vigil/The Overnight Vigil.m4b` | single file | 24 min | 6, of 4 min |
+| `Kai Kowalski/The Slow Crossing/The Slow Crossing Part 01-03.mp3` | rip, 3 parts | 12 min each | none |
+
+`The Overnight Vigil` reaches all three answers on one item — 6:00 and 12:00
+resume, 21:00 zeroes the position and marks it played, 2:00 is discarded as
+just-started — and its chapter markers are placed so that a chapter *jump*
+lands on either side of both thresholds as well. `The Slow Crossing`'s parts
+are long enough for a part to be finished by playback (8:00 does it, 6:00
+resumes instead), which is what makes folder-level resume — "the first part
+not yet finished" — testable at all.
+
+**Measured on 12.0 once they were scanned**, by reporting progress through
+`POST /Sessions/Playing/Progress` and reading `UserData` back. Both
+comparisons are strict, so a position exactly on a threshold is *kept*:
+
+| Item | reported | stored | `Played` |
+| --- | --- | --- | --- |
+| `The Overnight Vigil` (1440 s) | 2:00 | 0 | false |
+| | 4:59 | 0 | false |
+| | **5:00** | **5:00** | false |
+| | 6:00 / 12:00 | as reported | false |
+| | 18:59 (5.02 min left) | as reported | false |
+| | **19:00** (exactly 5 min left) | **19:00** | false |
+| | 21:00 | 0 | **true** |
+| | 24:00 (the end) | 0 | **true** |
+| `The Slow Crossing Part 01` (720 s) | 2:00 | 0 | false |
+| | 6:00 / 7:00 (exactly 5 min left) | as reported | false |
+| | 7:01 | 0 | **true** |
+| | 8:00 | 0 | **true** |
+| `The Lantern Keeper` (240 s) | 0:30, 2:00, 3:20, 3:55 | 0 | false |
+| `Chapter 01` of the rip (20 s) | 0:05, 0:10, 0:19 | 0 | false |
+
+Two more results from the same run, both of which a client will otherwise
+meet as surprises:
+
+* **"Cannot be marked played" means by *playback* only.** `POST
+  /UserPlayedItems` sets `Played` on the 240 s `.m4b` perfectly well — it is
+  `UpdatePlayState` that never gets there. A client offering a manual "mark as
+  played" is fine on a short audiobook; one that expects playing it to the end
+  to do the same thing is not.
+* **A `Book`'s position really is stored verbatim.** Reporting 1000, 10000 and
+  100000 ticks against `The Long Novel` stored exactly those, with `Played`
+  false — no threshold, no rounding, on an item whose whole `RunTimeTicks` is
+  10000000. So the two book-ish types behave in opposite ways: an audiobook
+  discards small positions and a book keeps them exactly.
+
+Both are mono at 32k: the content is a sine tone and the length is the
+fixture, so the short pair's 64k stereo would be four times the bytes for
+nothing under test. Together they are ~14.5 MB.
+
+Three things around the arm that a client has to know and no fixture can say
+on its own:
+
+* **`Audio` does not override `SupportsPositionTicksResume`, and `AudioBook`
+  does.** So the same file in `Music/` cannot hold a resume position under any
+  circumstances — `UpdatePlayState` computes one and the last lines of the
+  method throw it away. Resume is a property of resolving inside a `books`
+  library, not of the file. Read from source, **not** measured: every track in
+  `Music/` is under `MinResumeDurationSeconds`, so the video arm zeroes it
+  first and no fixture here can tell the two reasons apart.
+* **A `Book` is excluded from *both* arms** (`item is not AudioBook && item is
+  not Book` on the first, `is AudioBook` on the second), and it supports
+  played status and position resume. So an EPUB's or a PDF's reported position
+  is stored **verbatim, with no threshold of any kind** — the opposite of the
+  audiobook rule, on items whose `RunTimeTicks` is a page count times 10000.
+  Measured, not only read: see the table above.
+* The two numbers are server configuration, not constants:
+  `ServerConfiguration.MinAudiobookResume` and `MaxAudiobookResume`. A server
+  configured differently moves every boundary above, so a client must not hard
+  code five minutes — and the fixtures here are built against the defaults,
+  which is what `provision` leaves in place.
+
 ## The calibre:series conflict — SETTLED, and its successor closed
 
 A Book gets a `SeriesName` from its path via `BookFileNameParser` and another
