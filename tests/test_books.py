@@ -438,9 +438,13 @@ def book_tree() -> dict:
                 os.path.splitext(comic["file"])[0] + ".xml")
     by_key = {r.key: r for r in recipes.all_recipes()}
     for author, book, keys in libraries.audiobook_folders():
+        # An empty subfolder means the files are loose in the author's own
+        # folder, which is a shape and not a missing value — `os.path.join`
+        # would give it a trailing separator and a second, empty directory.
+        folder = os.path.join(author, book) if book else author
         for key in keys:
             rec = by_key[key]
-            add(os.path.join(author, book), f"{rec.title}.{rec.container}")
+            add(folder, f"{rec.title}.{rec.container}")
     return tree
 
 
@@ -737,14 +741,37 @@ def audiobook_play_state(position: float, runtime: float,
 
 
 class TestAudiobooks(unittest.TestCase):
+    """The folders, and the two questions a client asks about one.
+
+    A books folder is asked two things and only one of them has ever had two
+    answers here. "One book or several?" decides between a **chapter list**
+    and a **gallery**, and `album` is the only field that can answer it —
+    nothing sets `SeriesName` on an `AudioBook`, there is no album entity,
+    and the parts are N unrelated items. Every folder used to hold one book,
+    so the rule could not be wrong.
+    """
+
     def setUp(self):
         self.by_key = {r.key: r for r in recipes.all_recipes()}
         self.books = [r for r in recipes.all_recipes() if r.library == "Books"]
         self.folders = libraries.audiobook_folders()
-        self.singles = [(author, book, keys[0])
-                        for author, book, keys in self.folders
-                        if len(keys) == 1]
-        self.rips = [row for row in self.folders if len(row[2]) > 1]
+        # Classified the way the *client* classifies them, off the tags,
+        # rather than by which table row they came from: a fixture that
+        # stopped answering the question would otherwise still be counted
+        # under the shape it was written as.
+        self.one_book = [row for row in self.folders
+                         if len(self.albums(row[2])) == 1]
+        self.several = [row for row in self.folders
+                        if len(self.albums(row[2])) > 1]
+        self.singles = [row for row in self.one_book
+                        if len(row[2]) == 1 and row[1]]
+        self.rips = [row for row in self.one_book if len(row[2]) > 1]
+
+    def albums(self, keys):
+        return {dict(self.by_key[k].container_tags).get("album") for k in keys}
+
+    def tags(self, key):
+        return dict(self.by_key[key].container_tags)
 
     def test_they_are_recipes_so_verify_re_probes_them(self):
         """A file with no recipe is a file nothing checks: `verify` looks a
@@ -762,27 +789,112 @@ class TestAudiobooks(unittest.TestCase):
             self.assertNotEqual(rec.library, "Test Media")
 
     def test_both_shapes_exist_at_both_lengths(self):
-        """Four folders, not two. The short pair is the "too short to resume"
-        case and the long pair is the only one a resume position survives on;
-        neither substitutes for the other."""
+        """Four folders for the resume story, not two. The short pair is the
+        "too short to resume" case and the long pair is the only one a resume
+        position survives on; neither substitutes for the other."""
         self.assertEqual(len(self.singles), 2)
-        self.assertEqual(len(self.rips), 2)
+        for key in ("book-m4b", "book-m4b-long", "book-rip-01",
+                    "book-rip-long-01"):
+            self.assertIn(key, self.by_key)
+
+    def test_a_folder_holding_several_books_exists(self):
+        """The gap this closes. Every folder here used to hold exactly one
+        `Album`, so a client's "one book or several" rule only ever saw one
+        answer and could not be wrong — and drawing several books as a
+        chapter list hides every one of them behind a row that plays the
+        first."""
+        self.assertTrue(self.several)
+
+    def test_the_books_in_such_a_folder_do_not_share_an_album(self):
+        """The whole fixture. `album` is the only field that says these are
+        not chapters of one book, so sharing one would collapse them and
+        leave this folder as another copy of the rip."""
+        for author, folder, keys in self.several:
+            with self.subTest(author):
+                albums = [self.tags(k)["album"] for k in keys]
+                self.assertEqual(len(set(albums)), len(albums))
+                titles = [self.by_key[k].title for k in keys]
+                self.assertEqual(len(set(titles)), len(titles))
+                # And each book's album is its own title, not the folder's:
+                # an album named after the directory is how N books become
+                # one again.
+                for key in keys:
+                    self.assertEqual(self.tags(key)["album"],
+                                     self.by_key[key].title)
+                    self.assertNotEqual(self.tags(key)["album"], folder)
+
+    def test_a_shelf_of_books_is_loose_in_the_author_folder(self):
+        """No per-book subdirectory, which is what makes them siblings in one
+        folder rather than four one-book folders. It is also the shape a real
+        library has when audiobooks are filed by author."""
+        tree = book_tree()
+        for author, folder, keys in self.several:
+            with self.subTest(author):
+                self.assertEqual(folder, "")
+                names = tree[author]
+                for key in keys:
+                    self.assertIn(f"{self.by_key[key].title}."
+                                  f"{self.by_key[key].container}", names)
+
+    def test_a_folder_holding_both_shapes_at_once_exists(self):
+        """One author folder with a rip in a subfolder *and* loose books
+        beside it. Its children are not all audiobooks, so it cannot be a
+        chapter list at any level — and nothing else here is that."""
+        authors = [author for author, _folder, _keys in self.folders]
+        mixed = [a for a in set(authors) if authors.count(a) > 1]
+        self.assertTrue(mixed, "no author folder holds two kinds of thing")
+        for author in mixed:
+            rows = [row for row in self.folders if row[0] == author]
+            self.assertTrue([r for r in rows if r[1]], "no subfolder")
+            self.assertTrue([r for r in rows if not r[1]], "no loose files")
+
+    def test_a_mixed_folder_never_holds_exactly_one_loose_file(self):
+        """A resolver boundary nothing warns at, and the reason there are two
+        loose books rather than one.
+
+        `AudioResolver.FindAudioBook` runs on the *author* directory too. One
+        loose audio file there resolves to exactly one item, and the whole
+        author folder becomes that one audiobook — at which point its
+        subdirectories are never descended into and the rip inside them
+        leaves the library with nothing logged. Measured against 12.0. Two
+        files stack, the stack is dropped, and the folder survives as a
+        folder.
+        """
+        for author, folder, keys in self.folders:
+            if folder:
+                continue
+            rows = [row for row in self.folders if row[0] == author]
+            if len(rows) == 1:
+                continue                       # not a mixed folder
+            with self.subTest(author):
+                self.assertGreater(len(keys), 1)
 
     def test_the_single_file_shape_carries_chapter_markers(self):
         """The only way to reach the server's chapter extraction, which is
         enabled for AudioBook and nothing else — and which does no more than
         add `-show_chapters` to ffprobe, so markers the container lacks are
         markers that do not exist."""
-        for _author, _book, key in self.singles:
-            with self.subTest(key):
-                rec = self.by_key[key]
+        for _author, _folder, keys in self.singles:
+            with self.subTest(keys[0]):
+                rec = self.by_key[keys[0]]
                 self.assertGreater(rec.chapters, 1)
                 self.assertEqual(rec.container, "m4b")
+
+    def test_a_single_file_audiobook_with_no_markers_at_all_exists(self):
+        """The other half of that, which the shelf brought with it: a book
+        that is one item and has nothing to expand. A client that only ever
+        met chaptered `.m4b`s could draw an empty chapter list and never be
+        caught."""
+        flat = [k for _a, _f, keys in self.several for k in keys
+                if self.by_key[k].container == "m4b"]
+        self.assertTrue(flat)
+        for key in flat:
+            self.assertEqual(self.by_key[key].chapters, 0)
 
     def test_the_multi_file_shape_carries_none(self):
         """Here a chapter is a file. A rip that also had markers would let a
         client pass by reading the wrong one."""
-        for _author, _book, keys in self.rips:
+        for _author, _folder, keys in self.rips:
             for key in keys:
                 with self.subTest(key):
                     self.assertEqual(self.by_key[key].chapters, 0)
@@ -790,40 +902,63 @@ class TestAudiobooks(unittest.TestCase):
     def test_every_audiobook_is_a_different_book(self):
         """Two spellings of one title would read as a duplicate rather than as
         a shape or a length — and these are looked up by name."""
-        titles = [book for _author, book, _keys in self.folders]
-        authors = [author for author, _book, _keys in self.folders]
+        albums = [self.tags(r.key)["album"]
+                  for r in self.books if r.group == "Audiobooks"]
+        titles = [r.title for r in self.books if r.group == "Audiobooks"]
         self.assertEqual(len(set(titles)), len(titles))
-        self.assertEqual(len(set(authors)), len(authors))
+        # One album per book, so the count of distinct albums is the count of
+        # books a client's grouping rule will produce: one per single-file
+        # book, one per rip, and one per book on a shelf.
+        expected = sum(1 if len(self.albums(keys)) == 1 else len(keys)
+                       for _a, _f, keys in self.folders)
+        self.assertEqual(len(set(albums)), expected)
+
+    def test_every_audiobook_folder_is_its_own_directory(self):
+        """`(author, subfolder)` is a path, and two rows sharing one would be
+        two fixtures writing into the same directory — which changes what the
+        resolver does to both."""
+        paths = [(author, folder) for author, folder, _keys in self.folders]
+        self.assertEqual(len(set(paths)), len(paths))
 
     def test_every_audiobook_item_name_is_unique_across_the_library(self):
-        """The single-file shape is named after its folder and a rip's parts
-        after their files, and nothing dedupes across folders: two rips both
-        spelling their parts `Chapter 01` would be four items sharing two
-        names, which is unlookupable."""
-        names = [book for _author, book, keys in self.folders if len(keys) == 1]
-        names += [self.by_key[key].title
-                  for _author, _book, keys in self.folders if len(keys) > 1
-                  for key in keys]
+        """Nothing dedupes across folders: two rips both spelling their parts
+        `Chapter 01` would be four items sharing two names, which is
+        unlookupable — and these fixtures are looked up by name, never by id.
+
+        The name is the `title` **tag**, everywhere. `AudioFileProber` writes
+        `audio.Name = trackTitle` with no regard for `EnableEmbeddedTitles`,
+        so even the folder-named shape only comes back named after its folder
+        because its tag agrees.
+        """
+        names = [self.tags(k)["title"]
+                 for _a, _f, keys in self.folders for k in keys]
         self.assertEqual(len(set(names)), len(names))
+        # A folder that survives the scan as a folder is a name in the same
+        # list on screen. A single-file book's folder is not one of those —
+        # the directory *is* the item, and its name is the tag above.
+        folders = [folder for _a, folder, keys in self.folders
+                   if folder and len(keys) > 1]
+        self.assertEqual(len(set(folders)), len(folders))
+        self.assertFalse(set(folders) & set(names))
 
     def test_the_rips_are_joined_by_album_because_nothing_else_joins_them(self):
         """`AudioBook` implements `IHasSeries` and **nothing in the server
         ever sets `SeriesName` on one** — the only writers are `BookResolver`
         and the comic and OPF readers, all of which produce `Book`. So the
         tags are the whole of the relationship."""
-        for author, book, keys in self.rips:
+        for author, folder, keys in self.rips:
             albums = set()
             for key in keys:
-                tags = dict(self.by_key[key].container_tags)
+                tags = self.tags(key)
                 albums.add(tags["album"])
                 self.assertEqual(tags["album_artist"], author)
-            self.assertEqual(albums, {book})
+            self.assertEqual(albums, {folder})
 
     def test_every_rip_part_has_its_own_track_number_and_title(self):
-        for _author, _book, keys in self.rips:
+        for _author, _folder, keys in self.rips:
             seen = set()
             for key in keys:
-                tags = dict(self.by_key[key].container_tags)
+                tags = self.tags(key)
                 seen.add((tags["title"], tags["track"]))
             self.assertEqual(len(seen), len(keys))
 
@@ -840,9 +975,9 @@ class TestAudiobooks(unittest.TestCase):
         logged.
         """
         tree = book_tree()
-        for author, book, keys in self.rips:
-            names = tree[os.path.join(author, book)]
-            with self.subTest(book):
+        for author, folder, keys in self.rips:
+            names = tree[os.path.join(author, folder)]
+            with self.subTest(folder):
                 self.assertEqual(sorted(names),
                                  sorted(f"{self.by_key[k].title}."
                                         f"{self.by_key[k].container}"
@@ -854,29 +989,32 @@ class TestAudiobooks(unittest.TestCase):
         """One takes its name from the folder, which only happens when the
         directory branch resolves — one audio file, and one only."""
         tree = book_tree()
-        for author, book, key in self.singles:
-            rec = self.by_key[key]
-            with self.subTest(key):
-                self.assertEqual(tree[os.path.join(author, book)],
+        for author, folder, keys in self.singles:
+            rec = self.by_key[keys[0]]
+            with self.subTest(keys[0]):
+                self.assertEqual(tree[os.path.join(author, folder)],
                                  [f"{rec.title}.{rec.container}"])
                 # The folder is what names it, so the file agreeing with the
                 # folder is what stops the two disagreeing invisibly.
-                self.assertEqual(rec.title, book)
+                self.assertEqual(rec.title, folder)
 
     def test_the_author_and_narrator_go_in_the_tags_the_prober_reads(self):
         """`album_artist` is the Author and `composer` the Narrator —
         Audiobookshelf's convention, which the server adopted."""
-        narrators = set()
-        for author, _book, keys in self.folders:
+        narrators = {}
+        for author, _folder, keys in self.folders:
             for key in keys:
-                tags = dict(self.by_key[key].container_tags)
+                tags = self.tags(key)
                 with self.subTest(key):
                     self.assertEqual(tags["album_artist"], author)
                     self.assertTrue(tags["composer"])
-                narrators.add(tags["composer"])
-        # One narrator per book, so a People list says which fixture it came
-        # from rather than which shape.
-        self.assertEqual(len(narrators), len(self.folders))
+                narrators.setdefault(author, set()).add(tags["composer"])
+        # One narrator per author, and no two authors share one, so a People
+        # list says which fixture it came from.
+        for author, found in narrators.items():
+            self.assertEqual(len(found), 1, author)
+        flat = [next(iter(v)) for v in narrators.values()]
+        self.assertEqual(len(set(flat)), len(flat))
 
     def test_the_m4b_muxer_is_not_the_extension(self):
         """`-f m4b` fails the same way `-f mkv` does, and says nothing about
@@ -885,6 +1023,174 @@ class TestAudiobooks(unittest.TestCase):
 
         self.assertNotEqual(generate.muxer_for("m4b"), "m4b")
         self.assertIn(generate.muxer_for("m4b"), ("mp4", "ipod"))
+
+
+class TestAudiobookDescriptions(unittest.TestCase):
+    """Where a description has to be written, which is not one answer.
+
+    `AudioFileProber` gives `AudioBook` an arm of its own — ATL's
+    `Track.Description`, falling back to `Track.Comment` — but **which ffmpeg
+    tag reaches either field depends on the container**, and the obvious
+    spelling is silently inert in one of them. Measured against ATL 7.15.3
+    and end to end against 12.0; `recipes.py` carries the table.
+
+    The failure this guards against leaves no trace: a description in the
+    wrong tag produces a file that probes, resolves, plays and comes back
+    with no Overview at all.
+    """
+
+    def setUp(self):
+        self.by_key = {r.key: r for r in recipes.all_recipes()}
+        self.audiobooks = [r for r in recipes.all_recipes()
+                           if r.group == "Audiobooks"]
+
+    def described(self):
+        for rec in self.audiobooks:
+            tags = dict(rec.container_tags)
+            tag = recipes.DESCRIPTION_TAG[rec.container]
+            if tags.get(tag) or tags.get("comment"):
+                yield rec, tags
+
+    def test_a_description_is_written_in_the_tag_its_container_is_read_from(self):
+        """The whole point of the table: `description` on an MP3 lands in a
+        `TXXX` user frame that ATL files under additional fields and the
+        server never looks at, and `TIT3` on an MP4 is not a tag at all."""
+        for rec, tags in self.described():
+            with self.subTest(rec.key):
+                if rec.container == "mp3":
+                    self.assertIn("TIT3", tags)
+                    # The two spellings that do nothing here. A file carrying
+                    # one would look described and come back blank.
+                    self.assertNotIn("description", tags)
+                    self.assertNotIn("comment", tags)
+                else:
+                    self.assertIn(rec.container, recipes.COMMENT_IS_READ)
+                    self.assertTrue(tags.get("description")
+                                    or tags.get("comment"))
+                    self.assertNotIn("TIT3", tags)
+
+    def test_a_comment_is_refused_where_it_would_never_be_read(self):
+        """Rather than written and lost. A tag nothing reads is a fixture
+        that looks like coverage."""
+        with self.assertRaises(ValueError):
+            recipes._audiobook_tags("t", "a", "n", 2020, container="mp3",
+                                    comment="never read")
+        with self.assertRaises(ValueError):
+            recipes._audiobook_tags("t", "a", "n", 2020, container="ogg",
+                                    overview="no tag known")
+
+    def test_one_fixture_carries_both_tags_so_the_precedence_is_visible(self):
+        """`description` wins over `comment` — asserted by having one file
+        say two different things, so which the server took is on screen
+        rather than inferred."""
+        tags = dict(self.by_key["book-m4b-long"].container_tags)
+        self.assertTrue(tags["description"])
+        self.assertTrue(tags["comment"])
+        self.assertNotEqual(tags["description"], tags["comment"])
+
+    def test_one_fixture_reaches_the_fallback_by_having_no_description(self):
+        """The `comment` branch is only reachable when `description` is
+        absent, so it needs a file with no description tag at all."""
+        tags = dict(self.by_key["book-m4b"].container_tags)
+        self.assertNotIn("description", tags)
+        self.assertTrue(tags["comment"])
+
+    def test_one_book_is_deliberately_left_with_no_description_anywhere(self):
+        """"No blurb at all" is a case a client draws differently, and every
+        fixture having one would make it unreachable."""
+        keys = [f"book-rip-{n:02d}" for n in range(1, recipes.RIP_PARTS + 1)]
+        for key in keys:
+            tags = dict(self.by_key[key].container_tags)
+            with self.subTest(key):
+                self.assertNotIn("TIT3", tags)
+                self.assertNotIn("description", tags)
+                self.assertNotIn("comment", tags)
+        undescribed = [(a, f) for a, f, ks in libraries.audiobook_folders()
+                       if not any(self.described_key(k) for k in ks)]
+        self.assertTrue(undescribed)
+
+    def described_key(self, key):
+        rec = self.by_key[key]
+        tags = dict(rec.container_tags)
+        return bool(tags.get(recipes.DESCRIPTION_TAG[rec.container])
+                    or tags.get("comment"))
+
+    def test_every_description_says_which_fixture_it_came_from(self):
+        """They are told apart on screen, so no two may read the same — a
+        client showing the wrong one is only visible if the strings
+        differ."""
+        seen = [tags.get(recipes.DESCRIPTION_TAG[rec.container])
+                for rec, tags in self.described()]
+        seen = [x for x in seen if x]
+        seen.append(recipes.LONG_RIP_FOLDER_OVERVIEW)
+        seen.append(recipes.AUDIOBOOK_COMMENT)
+        seen.append(recipes.LONG_AUDIOBOOK_COMMENT)
+        self.assertEqual(len(set(seen)), len(seen))
+
+    def test_every_part_of_a_rip_is_described_separately(self):
+        """So which part a client reads a folder's description off is
+        visible. Taking "the first" is a rule, and a rule needs to be able to
+        be wrong."""
+        keys = [f"book-rip-long-{n:02d}"
+                for n in range(1, recipes.LONG_RIP_PARTS + 1)]
+        found = {dict(self.by_key[k].container_tags)["TIT3"] for k in keys}
+        self.assertEqual(len(found), len(keys))
+
+
+class TestFolderDescriptions(unittest.TestCase):
+    """A folder's own description, and why it cannot be a file.
+
+    `BaseNfoProvider<T>` is subclassed for Movie, Video, MusicVideo, Series,
+    Season, Episode, MusicAlbum and MusicArtist; `MediaBrowser.LocalMetadata`
+    reads `collection.xml` and `playlist.xml`. **A `Folder` has no local
+    metadata provider of any kind**, so nothing on disk can give one a
+    description — measured, with a `folder.nfo` and an `album.nfo` beside a
+    rip's parts both leaving Overview null.
+
+    It still has to exist, because a client's rule is that a folder-level
+    description **wins** over the per-file one, and without a folder that has
+    one, "the folder's, else the first part's" and "always the first part's"
+    are the same program.
+    """
+
+    def test_a_folder_description_is_declared_for_a_folder_the_server_keeps(self):
+        """It has to go on a *rip*. A folder holding one audiobook is not a
+        folder in the library at all — `FindAudioBook` turns the directory
+        itself into the item — so a description written there would be a
+        description of the book, which is the case it is meant to be
+        distinguished from."""
+        wanted = libraries.folder_overviews()
+        self.assertTrue(wanted)
+        rips = {os.path.join("Books", author, folder)
+                for author, folder, keys in libraries.audiobook_folders()
+                if folder and len(keys) > 1}
+        for path, text in wanted:
+            with self.subTest(path):
+                self.assertIn(path, rips)
+                self.assertTrue(text.strip())
+
+    def test_the_folder_whose_description_is_set_has_described_parts(self):
+        """Otherwise "the folder's wins" would be indistinguishable from "the
+        only one there is"."""
+        for path, _text in libraries.folder_overviews():
+            folder = os.path.basename(path)
+            keys = [ks for _a, f, ks in libraries.audiobook_folders()
+                    if f == folder][0]
+            by_key = {r.key: r for r in recipes.all_recipes()}
+            for key in keys:
+                tags = dict(by_key[key].container_tags)
+                with self.subTest(key):
+                    self.assertTrue(
+                        tags.get(recipes.DESCRIPTION_TAG[by_key[key].container]))
+
+    def test_no_nfo_is_shipped_for_one(self):
+        """Because nothing reads it. An `.nfo` beside a rip's parts is a file
+        that looks like coverage and is inert — the same rule that keeps NFOs
+        out of the Books library entirely."""
+        for folder, names in book_tree().items():
+            for name in names:
+                self.assertFalse(name.lower().endswith(".nfo"),
+                                 os.path.join(folder, name))
 
 
 class TestAudiobookResume(unittest.TestCase):
@@ -1058,6 +1364,43 @@ class TestEpubValidity(unittest.TestCase):
         path = os.path.join(tempfile.mkdtemp(), "t.epub")
         books.write_epub(path, kw.pop("title", "T"), kw.pop("author", "A"), **kw)
         return path, books.epub_structure(path)
+
+    def test_a_description_is_written_where_the_server_reads_one(self):
+        """`OpfReader` reads `//dc:description` into `Overview` and never
+        looks at the package version, so this is one of the few OPF fields an
+        EPUB 3 can express — and the only way a `Book` here gets a
+        description at all, since `MediaBrowser.XbmcMetadata` has no parser
+        for the type and an `.nfo` beside a book is read by nobody.
+        """
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        text = "A blurb, in the one field an EPUB 3 can put one in."
+        path, _got = self._written(description=text)
+        with zipfile.ZipFile(path) as zf:
+            opf = ET.fromstring(zf.read("OEBPS/content.opf"))
+        found = opf.findall(
+            ".//{http://purl.org/dc/elements/1.1/}description")
+        self.assertEqual([e.text for e in found], [text])
+
+    def test_a_book_with_no_description_declares_none(self):
+        """Most of a real shelf has none, and an empty element is not the
+        same as an absent one to a reader that trims and stores it."""
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        path, _got = self._written()
+        with zipfile.ZipFile(path) as zf:
+            opf = ET.fromstring(zf.read("OEBPS/content.opf"))
+        self.assertEqual(
+            opf.findall(".//{http://purl.org/dc/elements/1.1/}description"),
+            [])
+
+    def test_a_description_is_declared_for_a_book_to_carry(self):
+        """One book carries it and the other two on those shelves do not:
+        enough to make the path reachable, and "no blurb" is what most of a
+        real shelf looks like."""
+        self.assertTrue(libraries.BOOK_DESCRIPTION.strip())
 
     def test_the_default_single_chapter_epub_is_valid(self):
         _path, got = self._written()

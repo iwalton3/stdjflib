@@ -145,8 +145,12 @@ which the server reads **only** from a `.cbz` · both comic cover rules,
 including the one that picks the wrong page · `.azw3` and `.mobi`, which
 resolve with full metadata and which no client can open · **audiobooks in
 both shapes**: one chaptered `.m4b` that comes back as a single item with
-real chapter rows, and a six-part rip that comes back as six items · and one
-book of every filename convention `BookFileNameParser` recognises
+real chapter rows, and a six-part rip that comes back as six items · **both
+things a folder of audiobooks can mean**: one book's chapters, several
+different books loose in an author's folder, and one folder holding both at
+once · **descriptions** in every place the server reads one from, including a
+folder-level one that has to beat the files' · and one book of every filename
+convention `BookFileNameParser` recognises
 
 **Collections** both shapes a box set comes in — one whose members are paths
 in a `collection.xml` and one that is simply a folder of films — and both
@@ -806,7 +810,8 @@ every comic here has a cover extracted from its own pages.
 `AudioBook` is `Audio` with a different resolve, and it only happens inside a
 **books** library: the same file in `Music/` is an ordinary track and takes a
 different path through every client. The server produces two shapes and they
-are not variations on one another.
+are not variations on one another — and a *folder* of them means two
+different things, which is a second question with the same weight.
 
 | Fixture | What comes back |
 | --- | --- |
@@ -814,10 +819,38 @@ are not variations on one another.
 | `Gus Gupta/The Divided Account/Chapter 01–06.mp3` | **six** AudioBooks, one per file, 20 s each |
 | `Hana Halloran/The Overnight Vigil/The Overnight Vigil.m4b` | the same as the first, 24 min with 6 chapter rows |
 | `Kai Kowalski/The Slow Crossing/The Slow Crossing Part 01–03.mp3` | the same as the second, 12 min per part |
+| `Lior Levy/The Copper Bell.m4b`, `The Winter Ferry.m4b`, `The Paper Bridge.m4b` | **three** AudioBooks in one folder, three different **books** — no subfolder, no markers, 2 min each |
+| `Mo Mensah/` — two loose `.m4b`s **and** `The Falling Tide/Part 01–02.mp3` | **two** AudioBooks and a `Folder`, in one directory |
 
 So "chapter 7" is a marker in the first case and item 7 in the second — two
 code paths for one gesture, and only the first reuses a client's existing
 chapter UI.
+
+**A folder of audiobooks is not necessarily one book, and `Album` is the only
+field that says so.** Chapters of one book are a chapter list; several books
+are a gallery, and drawing the second as the first hides every book after the
+top one behind a row that plays it. `SeriesName` is null on an audiobook,
+there is no album *entity*, and the parts are N unrelated items — so one
+distinct album is one book and several albums are several books. The last two
+rows are the several-books case: `Lior Levy/` is what a library looks like
+when audiobooks are filed by author rather than by book, and `Mo Mensah/` is a
+folder whose children are not even all audiobooks. They are two minutes each
+because they exist to be *listed*; the resume behaviour lives on the long pair
+above.
+
+**A one-book folder is not a folder in the library at all.** `AudioResolver`
+runs on the *directory*, finds one audiobook in it, and the directory resolves
+**as** that audiobook — taking the file's path, the folder's name and the
+folder's parent. So `The Lantern Keeper` and `The Overnight Vigil` come back
+parented to `Elena Farrow` and `Hana Halloran`, and there is no per-book
+`Folder` to hang artwork, a description or user data on. Only a rip leaves a
+real folder behind. The same is true of a one-book folder holding an EPUB.
+
+**The dangerous shape is a folder with exactly *one* loose audio file beside a
+subfolder.** That folder resolves to a single audiobook and its subdirectories
+are never descended into — measured: a two-part rip inside one vanished from
+the library with nothing logged. `Mo Mensah/` holds two loose books for that
+reason, and the test suite keeps it that way.
 
 **Each shape is there twice because the length is a fixture of its own.** An
 audiobook's resume window is measured in **minutes off each end** —
@@ -862,9 +895,49 @@ The parts stack at scan time into one six-file audiobook, which the server
 then drops outright — "until we sort out naming for multi-part books". Zero
 items is what saves them: the library manager only takes a multi-item
 resolver's answer when it produced at least one, so it falls through and
-resolves each file on its own. Put a *seventh* audio file in that folder that
-does not stack with the rest and the folder yields one item, the early return
-fires, and the six parts vanish from the library with nothing logged.
+resolves each file on its own. The stack is grouped **by directory and by
+nothing else**, so this holds however the files are named: `Lior Levy/`'s
+three unrelated books go through the same path and come back as three items.
+It is a folder with exactly *one* audio file that produces one item, and that
+is the case where a sibling subfolder disappears.
+
+**An item's name is its `title` tag.** `AudioFileProber` ends with
+`audio.Name = trackTitle` and does not consult `EnableEmbeddedTitles` the way
+video does, so a file named one thing and tagged another comes back tagged.
+"Named after the folder" holds above only because every fixture's tag agrees
+with its folder.
+
+### Descriptions
+
+`Overview` comes from a different place for each of the three things in this
+library, and one of them has no on-disk place at all.
+
+| Item | Where its description comes from |
+| --- | --- |
+| an **audiobook** | the file's tags — `description` in an `.m4b`, falling back to `comment`; an ID3 **`TIT3`** frame in an `.mp3` |
+| a **book** | `dc:description` in the EPUB's OPF, and nothing else — there is no Book NFO parser and nothing reads a PDF |
+| a **folder** | **nothing on disk.** No local metadata provider exists for `Folder`, so a `folder.nfo` is read by nobody |
+
+**The MP3 row is the one that bites.** `-metadata comment=` on an `.mp3`
+writes a `TXXX` user frame, which the server's tag reader files under
+additional fields and never looks at — the file probes, resolves, plays, and
+comes back with no description, silently. ffmpeg cannot write the `COMM` frame
+the wild uses at all; `TIT3` is the one well-formed frame it can write that
+lands where the server reads. A real `COMM` written by any other tagger does
+work.
+
+The folder-level one is set through the **API** after the scan, which is what
+the web client's metadata editor does, and it is the only fixture here that
+lives in the database rather than in a file. It earns the exception because a
+client's rule is that a folder's description **wins** over the parts', and
+without a folder that has one there is nothing to tell that rule from "always
+use the first part's". `Kai Kowalski/The Slow Crossing/` is the folder; each
+of its three parts carries a *different* description of its own, so a client
+reading the wrong level says which one on screen.
+
+`Gus Gupta/The Divided Account/` has no description anywhere, deliberately:
+"this book has no blurb at all" is drawn differently and every other audiobook
+here has one.
 
 ## Collections
 

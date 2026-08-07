@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (380 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (400 tests,
 well under a second, no ffmpeg). Three of them validate the EPUB writers with
 **epubcheck** and skip when it is absent — `apt install epubcheck`, which
 costs about four seconds of JVM startup when present. It is a development
@@ -346,9 +346,69 @@ multi-file audiobook is joined by its `album` tag and by nothing else, which
 is why the rip's parts carry one, and why `docs/COVERAGE_GAPS.md` is wrong
 where it says otherwise.
 
-**There are four audiobook folders because an audiobook's resume window is
-measured in minutes, not percentages, and the two lengths are separate
-fixtures.** `UpdatePlayState`'s `AudioBook` arm discards a position under
+**Which makes `album` the only field that says whether a folder is one book
+or several, and both answers are now fixtures.** `Lior Levy/` holds three
+different books loose in one folder, each with **its own** album; `Mo Mensah/`
+holds a rip in a subfolder *and* loose books beside it. Giving any two books
+in one folder the same album collapses them into one and deletes the case —
+`test_books.py:TestAudiobooks` is what catches it, and it classifies the
+folders off the tags rather than off the table row they came from, so a
+fixture that stopped answering the question is not still counted under the
+shape it was written as.
+
+**A folder holding one audiobook is not a folder in the library at all — it
+*is* the item.** `AudioResolver.Resolve` runs on the directory, `FindAudioBook`
+finds a single audiobook in it, and the directory resolves as that audiobook:
+the file's `Path`, `Path.GetFileName(item.ContainingFolderPath)` as the `Name`,
+and the *folder's* parent as the parent. So `The Lantern Keeper` comes back
+under `Elena Farrow` and the per-book directory never exists — which reads as
+the server flattening something and is not. Only a rip leaves a real `Folder`.
+
+**Every audio file in a directory becomes one stack, whatever it is called.**
+`StackResolver.ResolveAudioBooks` groups by directory and by nothing else, so
+the "a non-stacking file would produce one item and hide the rest" worry in
+earlier notes was wrong about the mechanism: what hides things is a folder
+with **exactly one** audio file, which resolves the *whole directory* into one
+audiobook and never descends into its subdirectories. Measured — a two-part
+rip in a subfolder vanished with nothing logged. That is why `Mo Mensah/`
+holds two loose books and not one, and why three unrelated books in
+`Lior Levy/` are safe.
+
+**An audio item's `Name` is its `title` tag, not its filename.**
+`AudioFileProber` ends with `audio.Name = trackTitle` guarded by nothing but
+`LockedFields` — `EnableEmbeddedTitles` is not consulted, unlike video. Every
+"named after the folder" claim here holds only because the tag agrees, which
+`test_books.py` pins. Same shape as `dc:title` beating a filename for an EPUB.
+
+**A description goes in a different tag per container, and one obvious
+spelling is inert.** `AudioFileProber` reads ATL's `Track.Description` and
+falls back to `Track.Comment`. For an `.m4b` those are `description` and
+`comment`; for an `.mp3` the description is an ID3 **`TIT3`** frame, and
+`-metadata comment=` / `-metadata description=` both land in a `TXXX` user
+frame ATL files under additional fields — so the file probes, resolves, plays
+and comes back with no Overview, silently. ffmpeg has no route to a `COMM`
+frame at all (a hand-written one *is* read). `recipes.DESCRIPTION_TAG` and
+`COMMENT_IS_READ` are the table, `_audiobook_tags` refuses a comment for a
+container that never reads one, and `docs/COVERAGE_GAPS.md` §11 has the
+measurements.
+
+**A `Folder` has no local metadata provider of any kind, so no file can give
+one a description.** `BaseNfoProvider<T>` is subclassed for eight item types
+and `Folder` is not one; `MediaBrowser.LocalMetadata` covers `BoxSet` and
+`Playlist` only. Measured: `folder.nfo` and `album.nfo` beside a rip's parts
+both left Overview null, so none is shipped — the same rule that keeps NFOs
+out of Books entirely. `provision.apply_folder_overviews` sets the one
+folder-level description through the API after the scan and reads it back to
+check it stuck. It is the only fixture in the library that lives in the
+database rather than in a file, and it is there because "the folder's
+description beats the files'" is a client rule that otherwise has nothing to
+be tested against.
+
+**Four of the seven audiobook folders are a pair of pairs, because an
+audiobook's resume window is measured in minutes, not percentages, and the
+two lengths are separate fixtures.** (The other three are the folder-shape
+fixtures above, and are short on purpose.) `UpdatePlayState`'s `AudioBook`
+arm discards a position under
 `MinAudiobookResume` (5) minutes in and discards-and-marks-played one under
 `MaxAudiobookResume` (5) minutes from the end, consulting the runtime nowhere
 else. So under ten minutes **no** position can be stored, and under five

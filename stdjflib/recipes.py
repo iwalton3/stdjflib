@@ -814,21 +814,223 @@ LONG_AUDIOBOOK_IGNORED_SECONDS = 2 * 60    # <5 min in: zeroed, not Played
 LONG_RIP_RESUME_SECONDS = 6 * 60           # >=5 min in, >=5 min left: kept
 LONG_RIP_PLAYED_SECONDS = 8 * 60           # 4 min left: zeroed and Played
 
+# --- a folder holding SEVERAL books, which is the other thing a folder ---
+#   means -------------------------------------------------------------------
+#
+# Every folder above holds the parts of *one* book, so the question a client
+# has to answer about a books folder — one book, or several? — only ever had
+# one answer here, and a client that never asks it looks right. The two
+# renderings are not variations: chapters of one book are a **chapter list**
+# and several books are a **gallery**, and picking the first for the second
+# hides every book after the top one behind a row that plays it.
+#
+# `Album` is the only field that can tell them apart. Nothing sets
+# `SeriesName` on an `AudioBook`, there is no album entity to point at, and
+# the parts are N unrelated items — so **these must not share an album**, or
+# they collapse into one book and the fixture becomes another copy of the rip.
+#
+# This is what a real library looks like when someone files audiobooks by
+# author rather than by book: three single-file books loose in the author's
+# own folder. Measured (see `docs/COVERAGE_GAPS.md` §10): all three come back
+# as separate `AudioBook` items, because `AudioBookListResolver` makes one
+# stack of the whole directory, `ResolveMultipleAudio` drops a stack of more
+# than one file, and the per-file fall-through then resolves each on its own.
+#
+# They are two minutes each on purpose: they exist to be *listed*, not
+# resumed, and both resume lengths are already fixtures four folders up. Two
+# minutes is under `MinAudiobookResume`, so no position they report can ever
+# be stored — which is the right answer for a fixture whose whole subject is
+# the shape of the folder.
+#
+# No chapter markers either, which is a case of its own: every single-file
+# audiobook here until now carried them, so "a book with nothing to expand"
+# had no fixture.
+
+SHELF_AUTHOR = "Lior Levy"
+SHELF_NARRATOR = "Omar Okafor"
+SHELF_SECONDS = 120
+#: Three different books, and therefore three different `album` tags.
+SHELF_BOOKS = ("The Copper Bell", "The Winter Ferry", "The Paper Bridge")
+
+# --- and one folder holding both shapes at once ---------------------------
+#
+# An author folder with a multi-file rip in a subfolder *and* loose
+# single-file books beside it. Two things live here that nothing else covers:
+#
+#   * a folder whose children are not all audiobooks — a `Folder` among the
+#     `AudioBook`s — which cannot be drawn as a chapter list at all, because
+#     no row in a track list can open a folder;
+#   * the safe side of a resolver boundary nothing warns at. The author
+#     folder survives as a folder because it holds **two** loose files. With
+#     exactly one, `AudioResolver.FindAudioBook` gets a single item back and
+#     the whole author directory becomes that one audiobook — measured, and
+#     the rip in the subfolder disappears from the library with nothing
+#     logged (`docs/COVERAGE_GAPS.md` §10).
+
+MIXED_AUTHOR = "Mo Mensah"
+MIXED_NARRATOR = "Pia Petrov"
+MIXED_SECONDS = 120
+#: The loose single-file books. Two, and the count is load-bearing: see above.
+MIXED_LOOSE = ("The Glass Orchard", "The Quiet Ledger")
+MIXED_RIP_TITLE = "The Falling Tide"
+MIXED_RIP_PARTS = 2
+MIXED_RIP_SECONDS = 60
+
+
+# --------------------------------------------------------------------------
+# Descriptions, and the tag each container has to carry one in
+# --------------------------------------------------------------------------
+#
+# An audiobook's description lives in the **file**, not in the directory: a
+# books library has no metadata sidecar the server reads (`MediaBrowser.XbmcMetadata`
+# has no parser for `Book`, `AudioBook` or `Folder`), so the container tags
+# are the only place one can be written from disk.
+#
+# `AudioFileProber` reads it in an arm of its own, for `AudioBook` and no
+# other audio type:
+#
+#     var trackDescription = GetSanitizedStringTag(track.Description, ...);
+#     var trackComment     = GetSanitizedStringTag(track.Comment, ...);
+#     var overview = !string.IsNullOrWhiteSpace(trackDescription)
+#                      ? trackDescription : trackComment;
+#
+# `track` is an ATL `Track`, and **which ffmpeg tag reaches which of those two
+# fields is not the same in every container** — one of the obvious spellings
+# is silently inert. Measured against ATL 7.15.3, the version the server
+# builds with, and confirmed end to end against a running 12.0:
+#
+#   | container | ffmpeg `-metadata` | what is written        | ATL field   |
+#   | --------- | ------------------ | ---------------------- | ----------- |
+#   | m4b / mp4 | `description`      | the `desc` atom        | Description |
+#   | m4b / mp4 | `comment`          | the `(c)cmt` atom      | Comment     |
+#   | mp3       | `TIT3`             | an ID3v2 `TIT3` frame  | Description |
+#   | mp3       | `description`      | `TXXX:description`     | **none**    |
+#   | mp3       | `comment`          | `TXXX:comment`         | **none**    |
+#
+# So an MP3's description has to go in `TIT3`, and the spelling that works
+# everywhere else does nothing at all there — no error, no warning, an item
+# with no description. ffmpeg cannot write the `COMM` frame the wild puts one
+# in: every route to it (`-metadata comment=`, `-metadata COMM=`) ends in a
+# `TXXX` user frame. A real `COMM` *is* read — measured with one written by
+# hand — so a rip tagged by anything but ffmpeg reaches the same place by the
+# other branch.
+
+#: Containers whose ffmpeg `comment` tag reaches ATL's `Track.Comment`, and
+#: therefore the server's *fallback* source for an Overview. MP3 is not one:
+#: see above. Passing `comment=` for anything else is refused rather than
+#: written, because a tag nothing reads is a fixture that looks like coverage.
+COMMENT_IS_READ = ("m4b", "m4a", "mp4")
+
+#: Where a description goes, per container.
+DESCRIPTION_TAG = {"m4b": "description", "m4a": "description",
+                   "mp4": "description", "mp3": "TIT3"}
+
+# The strings themselves. Every one of them says which tag it was written in
+# and what it being on screen proves, because the whole point of having six
+# of them is that a client can be told apart by which one it shows.
+
+#: `The Lantern Keeper`, in `comment` and no `description` at all — the
+#: fallback half of the rule above, which nothing else here reaches.
+AUDIOBOOK_COMMENT = (
+    "Written into this file's `comment` tag, with no `description` tag "
+    "anywhere in it. That makes this book the fallback half of the server's "
+    "rule: `AudioFileProber` prefers ATL's Description and falls back to "
+    "Comment only when it is empty. This folder holds one audiobook, so the "
+    "folder *is* this item — what you are reading is both.")
+
+#: `The Overnight Vigil` carries both, saying different things, so which one
+#: won is visible on screen. The description is the one that should win.
+LONG_AUDIOBOOK_DESCRIPTION = (
+    "The `description` tag. This file also carries a `comment` saying "
+    "something else, and you should never see that one: ATL's Description is "
+    "read first and Comment is only the fallback.")
+LONG_AUDIOBOOK_COMMENT = (
+    "The `comment` tag, which is the fallback and has lost here. Reading "
+    "this on screen means a client (or a server) took Comment while a "
+    "Description was sitting in the same file.")
+
+#: `The Slow Crossing`'s parts, one string each, so which part a client reads
+#: a folder's description off is visible. Its *folder* also carries one, and
+#: that is the one that should win — see `LONG_RIP_FOLDER_OVERVIEW`.
+def long_rip_description(part: int) -> str:
+    return (f"Part {part} of {LONG_RIP_PARTS}, described in this file's own "
+            f"ID3 `TIT3` frame — the only frame ffmpeg can write that the "
+            f"server's tag reader reads a description out of. Every part "
+            f"says a different number, so which one a client picks up is "
+            f"visible. The folder above has a description of its own, and "
+            f"that one wins: seeing this string where a book's description "
+            f"goes means the folder's was not asked for.")
+
+#: And the folder's own, which **cannot be written from disk**: a `Folder`
+#: has no local metadata provider of any kind — no NFO parser, no XML
+#: provider — so an `.nfo` beside the parts is read by nobody. Measured, not
+#: assumed. It is set through the API after the scan (`provision.py`), the
+#: same route a person editing metadata in the web client takes, because a
+#: folder-level description that beats the per-file one is a rule a client
+#: has and nothing here could otherwise exercise.
+LONG_RIP_FOLDER_OVERVIEW = (
+    "The folder's own description, set on the folder item and not in any "
+    "file. It has to win over the parts' — each of those says which part it "
+    "came from, so a client showing one of those here is reading the wrong "
+    "level. No file on disk can carry this: a books library has no metadata "
+    "sidecar the server reads for a folder.")
+
+
+def shelf_description(title: str) -> str:
+    return (f"`{title}`, one of {len(SHELF_BOOKS)} different books loose in "
+            f"`{SHELF_AUTHOR}/`. Each has its own `album`, which is the only "
+            f"field that says they are not chapters of one book — and its "
+            f"own description, so a gallery of three shows three different "
+            f"blurbs rather than one repeated.")
+
+
+def mixed_description(title: str) -> str:
+    return (f"`{title}`, loose in `{MIXED_AUTHOR}/` beside a multi-file rip "
+            f"in a subfolder. A folder holding both shapes at once is not a "
+            f"chapter list at any level: one of its children is a folder.")
+
+
+def long_rip_folder_overviews() -> tuple[tuple[str, str, str], ...]:
+    """`(author, folder, overview)` for every folder-level description.
+
+    Read by `provision`, which is the only thing that can apply one. Kept
+    here beside the strings it applies rather than in the provisioning code,
+    so a fixture is declared in one place like every other.
+    """
+    return ((LONG_RIP_AUTHOR, LONG_RIP_TITLE, LONG_RIP_FOLDER_OVERVIEW),)
+
 
 def _audiobook_tags(title: str, author: str, narrator: str, year: int,
-                    **extra: str) -> tuple[tuple[str, str], ...]:
+                    *, container: str = "", overview: str = "",
+                    comment: str = "", **extra: str
+                    ) -> tuple[tuple[str, str], ...]:
     """The tags `AudioFileProber` reads off an audiobook.
 
     `album_artist` is the Author, `composer` the Narrator — Audiobookshelf's
     convention, which the server adopted — and `artist` is left as the author
     so a client that reads the ordinary music tags shows the same name rather
     than nothing.
+
+    `overview` is the book's description and goes in whichever tag *this
+    container* has one read out of (`DESCRIPTION_TAG`); `comment` writes the
+    fallback source as well, and is refused for a container the server never
+    reads it from, because a tag nothing reads is a fixture that looks like
+    coverage. The table above says which is which and how it was measured.
     """
     tags = {
         "title": title, "album": title, "album_artist": author,
         "artist": author, "composer": narrator, "genre": "Audiobook",
         "date": str(year),
     }
+    if overview:
+        if container not in DESCRIPTION_TAG:
+            raise ValueError(f"no description tag known for .{container}")
+        tags[DESCRIPTION_TAG[container]] = overview
+    if comment:
+        if container not in COMMENT_IS_READ:
+            raise ValueError(f"a .{container} `comment` never reaches "
+                             f"ATL's Track.Comment")
+        tags["comment"] = comment
     tags.update(extra)
     return tuple(tags.items())
 
@@ -843,13 +1045,20 @@ def _audiobooks() -> list[Recipe]:
                   f"single AudioBook whose Chapters are real rows — the only "
                   f"way to reach the chapter-extraction path, which is "
                   f"switched on for this item type and no other. Its name "
-                  f"comes from the *folder*, not the file.",
+                  f"comes from the *folder*, not the file — which holds only "
+                  f"because the `title` tag agrees with it: "
+                  f"`AudioFileProber` overwrites Name from that tag with no "
+                  f"regard for `EnableEmbeddedTitles`. Its description is in "
+                  f"`comment` and there is no `description` tag in it at "
+                  f"all, which makes it the only fixture reaching the "
+                  f"*fallback* half of the server's Overview rule.",
             video=None,
             audios=(Audio(encoder="aac", channels=2, rate=44100,
                           bitrate="64k", lang="eng"),),
             duration=240, chapters=AUDIOBOOK_CHAPTERS, year=2019,
             container_tags=_audiobook_tags(
-                AUDIOBOOK_TITLE, AUDIOBOOK_AUTHOR, AUDIOBOOK_NARRATOR, 2019),
+                AUDIOBOOK_TITLE, AUDIOBOOK_AUTHOR, AUDIOBOOK_NARRATOR, 2019,
+                container="m4b", comment=AUDIOBOOK_COMMENT),
         ),
     ]
     for part in range(1, RIP_PARTS + 1):
@@ -862,7 +1071,12 @@ def _audiobooks() -> list[Recipe]:
                   f"scan time and the stack is then dropped, so they survive "
                   f"only through the per-file fall-through. Nothing sets "
                   f"SeriesName on an AudioBook, so `album` is all that joins "
-                  f"them. No chapter markers: here a chapter is a file.",
+                  f"them. No chapter markers: here a chapter is a file. "
+                  f"**Deliberately undescribed** — no description tag on any "
+                  f"part and none on the folder — because "
+                  f"\"this book has no blurb at all\" is a case a client "
+                  f"draws differently, and every other audiobook here has "
+                  f"one.",
             video=None,
             audios=(Audio(encoder="libmp3lame", channels=2, rate=44100,
                           bitrate="64k", lang="eng"),),
@@ -892,7 +1106,10 @@ def _audiobooks() -> list[Recipe]:
               f"minutes each, so a chapter jump lands on either side of both "
               f"thresholds too. Alone in its folder, so it is named after "
               f"the folder like the short one. Mono at 32k: the length is "
-              f"the fixture, not the fidelity.",
+              f"the fixture, not the fidelity. Carries a `description` "
+              f"*and* a `comment` saying different things, which is the only "
+              f"fixture where the server's preference between the two is "
+              f"visible rather than assumed: the description must win.",
         video=None,
         audios=(Audio(encoder="aac", channels=1, rate=44100,
                       bitrate="32k", lang="eng"),),
@@ -900,7 +1117,9 @@ def _audiobooks() -> list[Recipe]:
         year=2022,
         container_tags=_audiobook_tags(
             LONG_AUDIOBOOK_TITLE, LONG_AUDIOBOOK_AUTHOR,
-            LONG_AUDIOBOOK_NARRATOR, 2022),
+            LONG_AUDIOBOOK_NARRATOR, 2022, container="m4b",
+            overview=LONG_AUDIOBOOK_DESCRIPTION,
+            comment=LONG_AUDIOBOOK_COMMENT),
     ))
     for part in range(1, LONG_RIP_PARTS + 1):
         out.append(Recipe(
@@ -923,15 +1142,112 @@ def _audiobooks() -> list[Recipe]:
                   f"for having more than one file, and each file then falls "
                   f"through and resolves on its own. `album` joins them and "
                   f"nothing else does. No chapter markers: here a chapter is "
-                  f"a file. Mono at 32k.",
+                  f"a file. Mono at 32k. Each part carries a description of "
+                  f"its own in an ID3 `TIT3` frame — the tag a description "
+                  f"has to go in for an MP3, where the obvious `comment` "
+                  f"spelling is silently inert — and the *folder* carries a "
+                  f"different one, applied through the API because no file "
+                  f"on disk can give a folder a description. The folder's "
+                  f"has to win.",
             video=None,
             audios=(Audio(encoder="libmp3lame", channels=1, rate=44100,
                           bitrate="32k", lang="eng"),),
             duration=LONG_RIP_SECONDS, chapters=0, year=2023,
             container_tags=_audiobook_tags(
                 f"{LONG_RIP_TITLE} Part {part:02d}", LONG_RIP_AUTHOR,
-                LONG_RIP_NARRATOR, 2023,
+                LONG_RIP_NARRATOR, 2023, container="mp3",
+                overview=long_rip_description(part),
                 album=LONG_RIP_TITLE, track=f"{part}/{LONG_RIP_PARTS}"),
+        ))
+    out += _audiobook_shelf()
+    out += _mixed_audiobook_folder()
+    return out
+
+
+def _audiobook_shelf() -> list[Recipe]:
+    """Several different books loose in one author's folder."""
+    out = []
+    for n, title in enumerate(SHELF_BOOKS, 1):
+        out.append(Recipe(
+            key=f"book-shelf-{n:02d}", title=title, group="Audiobooks",
+            library="Books", container="m4b",
+            notes=f"Book {n} of {len(SHELF_BOOKS)} filed loose in "
+                  f"`{SHELF_AUTHOR}/`, which is what a library looks like "
+                  f"when audiobooks are filed by author rather than by book. "
+                  f"Its `album` is **its own title and not the folder's**, "
+                  f"and that is the whole fixture: `album` is the only field "
+                  f"that can say these are three books rather than three "
+                  f"chapters of one, so sharing it would collapse them and "
+                  f"leave a client's \"one book or several\" rule with only "
+                  f"one answer to give again. Measured: all "
+                  f"{len(SHELF_BOOKS)} come back as separate AudioBook items "
+                  f"named from their `title` tags. "
+                  f"{SHELF_SECONDS // 60} minutes, and no chapter markers — "
+                  f"these exist to be *listed*, not resumed (both resume "
+                  f"lengths are already fixtures, and this is under "
+                  f"`MinAudiobookResume`, so no position it reports can be "
+                  f"stored), and a single-file audiobook with nothing to "
+                  f"expand had no fixture either. Its own description, so a "
+                  f"gallery of three shows three.",
+            video=None,
+            audios=(Audio(encoder="aac", channels=1, rate=44100,
+                          bitrate="32k", lang="eng"),),
+            duration=SHELF_SECONDS, chapters=0, year=2024,
+            container_tags=_audiobook_tags(
+                title, SHELF_AUTHOR, SHELF_NARRATOR, 2024, container="m4b",
+                overview=shelf_description(title), album=title),
+        ))
+    return out
+
+
+def _mixed_audiobook_folder() -> list[Recipe]:
+    """One author folder holding a rip in a subfolder and loose books."""
+    out = []
+    for n, title in enumerate(MIXED_LOOSE, 1):
+        out.append(Recipe(
+            key=f"book-mixed-{n:02d}", title=title, group="Audiobooks",
+            library="Books", container="m4b",
+            notes=f"Loose book {n} of {len(MIXED_LOOSE)} in "
+                  f"`{MIXED_AUTHOR}/`, which also holds `{MIXED_RIP_TITLE}/` "
+                  f"— a multi-file rip in a subfolder. A folder whose "
+                  f"children are not all audiobooks cannot be drawn as a "
+                  f"chapter list at any level, and nothing else here is one. "
+                  f"There are **two** loose files rather than one because "
+                  f"the count is a resolver boundary: with exactly one, "
+                  f"`FindAudioBook` gets a single item back and the whole "
+                  f"author directory becomes that one audiobook, taking the "
+                  f"subfolder's rip out of the library with nothing logged. "
+                  f"{MIXED_SECONDS // 60} minutes, no markers, its own "
+                  f"`album` and its own description.",
+            video=None,
+            audios=(Audio(encoder="aac", channels=1, rate=44100,
+                          bitrate="32k", lang="eng"),),
+            duration=MIXED_SECONDS, chapters=0, year=2025,
+            container_tags=_audiobook_tags(
+                title, MIXED_AUTHOR, MIXED_NARRATOR, 2025, container="m4b",
+                overview=mixed_description(title), album=title),
+        ))
+    for part in range(1, MIXED_RIP_PARTS + 1):
+        out.append(Recipe(
+            key=f"book-mixed-rip-{part:02d}",
+            title=f"{MIXED_RIP_TITLE} Part {part:02d}", group="Audiobooks",
+            library="Books", container="mp3",
+            notes=f"Part {part} of {MIXED_RIP_PARTS} of the rip inside "
+                  f"`{MIXED_AUTHOR}/{MIXED_RIP_TITLE}/`. The subfolder is an "
+                  f"ordinary rip and resolves like the other two; what it is "
+                  f"here for is its *parent*, which holds loose books beside "
+                  f"it. {MIXED_RIP_SECONDS} seconds a part — a rip that "
+                  f"exists to be found, not listened to.",
+            video=None,
+            audios=(Audio(encoder="libmp3lame", channels=1, rate=44100,
+                          bitrate="32k", lang="eng"),),
+            duration=MIXED_RIP_SECONDS, chapters=0, year=2025,
+            container_tags=_audiobook_tags(
+                f"{MIXED_RIP_TITLE} Part {part:02d}", MIXED_AUTHOR,
+                MIXED_NARRATOR, 2025, container="mp3",
+                overview=f"Part {part} of the rip that shares "
+                         f"`{MIXED_AUTHOR}/` with two loose books.",
+                album=MIXED_RIP_TITLE, track=f"{part}/{MIXED_RIP_PARTS}"),
         ))
     return out
 

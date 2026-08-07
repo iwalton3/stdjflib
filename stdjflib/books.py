@@ -65,7 +65,7 @@ def _default_chapters(title: str, author: str) -> list[tuple[str, list[str]]]:
 
 def write_epub(path: str, title: str, author: str,
                chapters: list[tuple[str, list[str]]] | None = None,
-               cover: bytes | None = None) -> None:
+               cover: bytes | None = None, description: str = "") -> None:
     """A valid EPUB 3: mimetype, container, an OPF, a nav document, chapters.
 
     `chapters` is `[(chapter title, [paragraph, ...])]`; the default is the
@@ -92,6 +92,13 @@ def write_epub(path: str, title: str, author: str,
     `OpfReader.ReadCoverPath`; `write_epub2` carries the OPF 2 spelling, which
     is the last. Nothing draws artwork beside a book, so what the OPF declares
     is the only image the item can ever have.
+
+    `description` is the book's blurb and becomes the item's **Overview**.
+    `OpfReader` reads it at `//dc:description` and never looks at the package
+    version, so this is one of the handful of OPF fields an EPUB 3 reaches —
+    unlike the `calibre:*` and `opf:scheme` metadata, which only `write_epub2`
+    can express. It is the only way a `Book` here gets a description at all:
+    the server has no Book NFO parser, so there is no sidecar to write one in.
     """
     chapters = chapters or _default_chapters(title, author)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -131,6 +138,8 @@ def write_epub(path: str, title: str, author: str,
                     f'    <dc:title>{_xml(title)}</dc:title>\n'
                     f'    <dc:creator>{_xml(author)}</dc:creator>\n'
                     f'    <dc:language>en</dc:language>\n'
+                    + (f'    <dc:description>{_xml(description)}'
+                       f'</dc:description>\n' if description else '') +
                     # Required by EPUB 3, and `config.EPOCH` rather than the
                     # clock for the same reason every other date here is: two
                     # builds of one library must produce identical bytes.

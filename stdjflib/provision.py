@@ -384,6 +384,60 @@ def refresh_disk_collections(jf: Jellyfin, say=print) -> int:
     return len(filled)
 
 
+def apply_folder_overviews(jf: Jellyfin, server_root: str,
+                           say=print) -> int:
+    """Give the folders that need one a description, after the scan.
+
+    **Nothing on disk can do this.** `BaseNfoProvider<T>` is subclassed for
+    eight item types and `Folder` is not one of them, and
+    `MediaBrowser.LocalMetadata` reads only `collection.xml` and
+    `playlist.xml` — so a `folder.nfo` or an `album.nfo` beside a rip's parts
+    is read by nobody. Measured against 12.0: both left the folder's Overview
+    null, which is why none is shipped. `libraries.folder_overviews` carries
+    the reasoning and `recipes.py` the strings.
+
+    What it buys is a rule a client has and could not otherwise be given
+    anything to implement: an audiobook's description lives in the *files*,
+    so a folder-level one has to **win** over the parts' — and until there is
+    a folder with one, "the folder's if it has one, otherwise the first
+    part's" and "always the first part's" behave identically.
+
+    Idempotent, and verified rather than assumed: `set_overview` reads the
+    value back, because a write that silently did nothing looks exactly like
+    a fixture that was never there. Runs on every provision, including
+    against a server that has already been set up, since this lives in the
+    database and not in the library.
+    """
+    from . import libraries
+
+    wanted = libraries.folder_overviews()
+    if not wanted:
+        return 0
+    user_id = (jf.get("/Users/Me") or {}).get("Id")
+    if not user_id:
+        say("  ! not signed in; no folder descriptions applied")
+        return 0
+    say("Folder descriptions (the API is the only route to one)")
+    done = 0
+    for relative, text in wanted:
+        path = os.path.join(server_root, relative)
+        item_id = jf.item_id_at(path, user_id)
+        if not item_id:
+            say(f"  ! nothing resolved at {relative}")
+            continue
+        try:
+            ok = jf.set_overview(item_id, text)
+        except ApiError as exc:
+            say(f"  ! {relative}: {exc}")
+            continue
+        if ok:
+            done += 1
+            say(f"  + {relative}")
+        else:
+            say(f"  ! {relative}: the description did not stick")
+    return done
+
+
 def create_api_collections(jf: Jellyfin, root: str, server_root: str,
                            say=print) -> dict:
     """Create the collections that cannot be built on disk.
@@ -639,6 +693,10 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
             say("Collections the API makes (the ones that survive a restart)")
             result["api_collections"] = create_api_collections(
                 jf, root, server_root, say=say)
+        # After the scan for the same reason: the folder has to exist before
+        # it has an id to write a description onto.
+        result["folder_overviews"] = apply_folder_overviews(
+            jf, server_root, say=say)
         counts = jf.counts()
         result["counts"] = counts
         interesting = [(k, v) for k, v in sorted(counts.items()) if v]

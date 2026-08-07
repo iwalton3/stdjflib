@@ -498,6 +498,204 @@ on its own:
   code five minutes — and the fixtures here are built against the defaults,
   which is what `provision` leaves in place.
 
+## 10. Every books folder held exactly one book — FIXED
+
+Raised 2026-08-06 by the shim's audiobook QA. A books folder is asked one
+question a client cannot avoid answering — **one book, or several?** — and
+every folder here answered it the same way, so the rule could not be wrong.
+
+The two answers are not variations on one another. Chapters of one book are a
+**chapter list**: rows that seek within a single work. Several books are a
+**gallery**: tiles that open different works. Draw the second as the first and
+every book after the top one is hidden behind a row that plays it.
+
+**`Album` is the only field that can tell them apart.** Nothing in the server
+sets `SeriesName` on an `AudioBook` (§1), there is no album *entity* to point
+at, and the parts are N unrelated items that survive the scanner one at a
+time. So one distinct album is one book and several albums are several books —
+and a fixture where every folder holds one album leaves that whole branch
+unreachable while the suite reports a pass.
+
+**What shipped.** Two more author folders, and neither is a longer version of
+anything already here.
+
+| Fixture | Shape | What comes back |
+| --- | --- | --- |
+| `Lior Levy/The Copper Bell.m4b`, `The Winter Ferry.m4b`, `The Paper Bridge.m4b` | three single-file books loose in the author's folder | **three** AudioBooks, three distinct albums, no subfolder |
+| `Mo Mensah/The Glass Orchard.m4b`, `The Quiet Ledger.m4b` + `Mo Mensah/The Falling Tide/Part 01-02.mp3` | a rip in a subfolder *and* loose books beside it | **two** AudioBooks and a `Folder`, in one directory |
+
+`Lior Levy/` is what a real library looks like when audiobooks are filed by
+author rather than by book, and it is the several-albums case. `Mo Mensah/` is
+the case where a folder's children are **not all audiobooks** — no row in a
+track list can open a folder, so it cannot be a chapter list at any level, and
+nothing else here is that shape.
+
+Two minutes each, and deliberately so: they exist to be *listed*, not resumed,
+and both resume lengths are already fixtures (§9). Two minutes is under
+`MinAudiobookResume`, so no position they report can be stored at all — which
+is the right answer for fixtures whose whole subject is the shape of a folder.
+The single-file ones also carry **no chapter markers**, which is a case of its
+own: every single-file audiobook here until now had them, so "a book with
+nothing to expand" had no fixture.
+
+### The resolver findings, which are worth more than the fixtures
+
+All measured against 12.0, by scanning a throwaway books library of probe
+files and reading the items back.
+
+**Several differently-named single files in one folder really do come back as
+separate items.** This was the open question — the note in `recipes.py` said a
+non-stacking file in a rip's folder "would produce one item and hide the
+other six", and three loose books is exactly that shape. It does not happen,
+and the reason is worth stating exactly:
+`StackResolver.ResolveAudioBooks` groups **by directory and by nothing else**,
+so *every* audio file in a folder lands in one stack regardless of its name.
+`ResolveMultipleAudio` then drops that stack for holding more than one file
+(`if (resolvedItem.Files.Count > 1) continue;`), the folder yields **zero**
+items, `ResolvePaths` only takes a multi-item resolver's answer
+`if (result?.Items.Count > 0)`, and every file falls through and resolves on
+its own. Three books in, three AudioBooks out, named from their tags.
+
+**The dangerous count is one, not seven.** The hiding case is real, and it is
+the *opposite* of what was predicted: a folder yields exactly one item when it
+holds exactly **one** audio file, and then `AudioResolver.FindAudioBook` turns
+the whole directory into that one audiobook. Measured: an author folder
+holding one loose `.m4b` and a subfolder with a two-part rip came back as
+**one** AudioBook, parented to the library root, with the rip's two parts
+**absent from the library entirely** and nothing logged. That is why
+`Mo Mensah/` holds two loose books rather than one, and
+`test_books.py:test_a_mixed_folder_never_holds_exactly_one_loose_file` is what
+keeps it that way.
+
+**A one-book folder is not flattened — the folder *is* the item.** This
+answers the observation that `The Overnight Vigil` and `The Lantern Keeper`
+come back parented to their *author* folder rather than to the per-book folder
+their paths suggest. Nothing is being flattened: `AudioResolver.Resolve` runs
+on the **directory**, `FindAudioBook` finds exactly one audiobook inside it,
+and the directory resolves *as* that audiobook —
+
+```csharp
+item.IsInMixedFolder = false;
+item.Name = Path.GetFileName(item.ContainingFolderPath);   // the folder's name
+```
+
+— taking the file's `Path`, the folder's `Name`, and the folder's parent as
+its own parent. So the per-book directory never exists as an item at all, and
+a client's folder-based grouping must not expect one. The same is true of a
+one-book folder holding an EPUB (`BookResolver`'s directory branch), which is
+why `Ada Alvarez/` and `Jo Jansen/` hold Books directly.
+
+A consequence a client feels: **there is no `Folder` to hang anything on for a
+single-file book.** Artwork, a description, user data — anything a folder
+could carry belongs to the item itself. Only a *rip* leaves a real `Folder`
+behind.
+
+**The item's name is the `title` tag, not the filename and not the folder.**
+`AudioFileProber` ends with `audio.Name = trackTitle` guarded by nothing but
+`LockedFields` — `EnableEmbeddedTitles` is **not** consulted, unlike video.
+Measured: a file called `Eta File One.mp3` tagged `title=Eta Tag Title One`
+came back named `Eta Tag Title One`. So "named after the folder" holds here
+only because every fixture's `title` tag agrees with its folder, which
+`test_books.py` now pins. It is the audio counterpart of `dc:title` beating
+the filename for an EPUB.
+
+## 11. Nothing in the Books library had a description — FIXED
+
+Raised 2026-08-06 alongside §10. `Overview` was empty on every audiobook, on
+every book in an author folder, and on every folder — so a client's
+description rendering had nothing to draw and could not be wrong. (Two comics
+and the two EPUB 2 fixtures did have one, from ComicInfo and from OPF 2
+metadata, which is how the gap survived a casual look.)
+
+**Where a description comes from is different for each of the three, and one
+of them has no answer at all.**
+
+### An audiobook: the file's tags, in a tag that depends on the container
+
+`AudioFileProber` gives `AudioBook` an arm of its own — it is the only audio
+type with one:
+
+```csharp
+var trackDescription = GetSanitizedStringTag(track.Description, audio.Path);
+var trackComment     = GetSanitizedStringTag(track.Comment, audio.Path);
+var overview = !string.IsNullOrWhiteSpace(trackDescription)
+                 ? trackDescription : trackComment;
+```
+
+`track` is an ATL `Track`, and **which ffmpeg tag reaches which of those two
+fields is not the same in every container.** Measured against ATL 7.15.3 (the
+version the server builds with) by reading the files directly, and confirmed
+end to end against 12.0:
+
+| container | ffmpeg `-metadata` | what is written | ATL field | reaches Overview |
+| --- | --- | --- | --- | --- |
+| m4b / mp4 | `description` | the `desc` atom | Description | yes |
+| m4b / mp4 | `comment` | the `©cmt` atom | Comment | yes, as the fallback |
+| mp3 | `TIT3` | an ID3v2 `TIT3` frame | Description | yes |
+| mp3 | `description` | `TXXX:description` | *none* | **no** |
+| mp3 | `comment` | `TXXX:comment` | *none* | **no** |
+| mp3 | a real `COMM` frame | `COMM` | Comment | yes — but ffmpeg cannot write one |
+
+**The MP3 rows are the finding.** The obvious spelling is silently inert: a
+`.mp3` tagged `-metadata comment=...` probes fine, resolves fine, plays fine
+and comes back with no description, with nothing logged anywhere. ffmpeg has
+no route to a `COMM` frame at all — `-metadata comment=` and even
+`-metadata COMM=` both end in a `TXXX` user frame, which ATL files under
+`AdditionalFields` and the server never looks at. A *properly structured*
+`COMM` written by hand **is** read (measured), so a rip tagged by anything but
+ffmpeg reaches Overview by the other branch; from ffmpeg, `TIT3` is the one
+well-formed frame that lands on either field.
+
+`recipes.py` carries that table beside the tags it writes, and
+`_audiobook_tags` refuses a `comment=` for a container the server never reads
+one from — a tag nothing reads is a fixture that looks like coverage.
+
+### A book: `dc:description` in the OPF, and nothing else
+
+`OpfReader` reads `//dc:description` into `Overview` and never checks the
+package version, so it is one of the handful of OPF fields an **EPUB 3** can
+express — most of that reader is `calibre:*` and `opf:scheme` spellings only
+an EPUB 2 has (see §7's neighbours). It is also the only route there is: with
+no Book NFO parser (§6), an `.nfo` beside a book is read by nobody, and a PDF
+has no metadata the server reads at all.
+
+### A folder: **nothing on disk can give one a description**
+
+`BaseNfoProvider<T>` is subclassed for Movie, Video, MusicVideo, Series,
+Season, Episode, MusicAlbum and MusicArtist. `MediaBrowser.LocalMetadata`
+provides for `BoxSet` and `Playlist`. **There is no local metadata provider
+for `Folder` of any kind** — no NFO parser, no XML provider, nothing. Measured
+rather than assumed: a `folder.nfo` and an `album.nfo` written beside a rip's
+parts, both carrying a `<plot>`, left the folder's Overview null after a
+scan. None is shipped, for the same reason no other NFO is shipped in Books:
+a file that looks like coverage and is inert is worse than an absence.
+
+The API is the only route, and it works: `POST /Items/{id}` with the folder's
+DTO and an `Overview` set sticks and is served back — which is what the
+metadata editor in the web client does. `provision.apply_folder_overviews`
+does exactly that after the scan, and verifies it by reading the value back.
+
+This is the one fixture in the library that lives in the **database** rather
+than in the files, and it earns the exception: a client's rule is that a
+folder-level description **wins** over the per-file one, and without a folder
+that has one, "the folder's, else the first part's" and "always the first
+part's" are the same program.
+
+**What shipped**, and the strings are all different from each other on
+purpose, so which one a client surfaced is visible on screen rather than
+inferred:
+
+| Fixture | Where the description lives | What it proves |
+| --- | --- | --- |
+| `The Overnight Vigil` | `description` **and** a different `comment` | Description wins; the comment says so if you ever see it |
+| `The Lantern Keeper` | `comment` only, no `description` at all | the fallback branch, which nothing else reaches |
+| `The Slow Crossing` Parts 01-03 | one `TIT3` frame each, all different | which part a folder's description is read off |
+| `Kai Kowalski/The Slow Crossing/` (the folder) | the API, after the scan | a folder-level description **beating** the parts' |
+| `The Divided Account` (6 parts) | nowhere, deliberately | "this book has no blurb at all" |
+| `Lior Levy`'s three books | `description` each, all different | a gallery of three showing three blurbs, not one |
+| `Mo Mensah`'s two books and rip | `description` / `TIT3` | the mixed folder, described at both levels |
+| `The Standard Reference` (EPUB 3) | `dc:description` in the OPF | the only route to a `Book`'s description |
+
 ## The calibre:series conflict — SETTLED, and its successor closed
 
 A Book gets a `SeriesName` from its path via `BookFileNameParser` and another

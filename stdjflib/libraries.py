@@ -1897,6 +1897,22 @@ def build_mixed_content(root: str, cfg) -> list[dict]:
 #    AudioBook. Metadata comes from the formats themselves, which is why the
 #    dialect tables below exist and why there are no `.nfo` files here.
 
+#: The one book on the shelf with a description. `dc:description` is the only
+#: OPF field an EPUB 3 can spell that reaches `Overview`, and there is no
+#: sidecar route to one: `MediaBrowser.XbmcMetadata` has no Book parser, so an
+#: `.nfo` beside a book is read by nobody. A `Book`'s description is therefore
+#: a property of the file's own metadata and of nothing else, which is the
+#: opposite of the comics beside it — those get theirs from a ComicInfo the
+#: archive carries or a sidecar next to it.
+BOOK_DESCRIPTION = (
+    "The description of a `Book`, written as `dc:description` in the OPF and "
+    "read out of it by `OpfReader`. It is the only OPF field an EPUB 3 can "
+    "express that reaches Overview — the rest of that reader is `calibre:*` "
+    "and `opf:scheme` spellings only an EPUB 2 has — and the only way a book "
+    "here can have one at all, because no NFO parser exists for this type."
+)
+
+
 # The shelf: one folder holding several books, which is what switches the
 # resolver from the directory rule to per-file parsing. Everything about these
 # filenames is load-bearing — they are the test.
@@ -2288,13 +2304,23 @@ def build_books(root: str, cfg) -> list[dict]:
     # because `EpubProvider` reads `content.opf` and `dc:title` overrides the
     # resolver — which is worth knowing, and is the reason a Books library can
     # look correct while the path convention behind it is doing something else.
-    for i, (title, author) in enumerate(
-            [("The Standard Reference", "Ada Alvarez"),
-             ("A Second Volume", "Bo Brandt"),
-             ("日本語の本", "Cai Chen")], 1):
+    #
+    # The first of them carries a `dc:description`, which is the *only* field
+    # an EPUB 3 can put in an OPF that reaches `Overview` — `OpfReader` reads
+    # it at `//dc:description` and never checks the package version, while
+    # everything else it would take from a book here is a `calibre:*` or
+    # `opf:scheme` spelling that only OPF 2 has. It is also the only way a
+    # `Book` gets a description at all: there is no Book NFO parser, so there
+    # is no sidecar to write one in. The other two are left blank, because
+    # "no description" is what most of a real shelf looks like and a client
+    # has to draw that too.
+    for i, (title, author, description) in enumerate(
+            [("The Standard Reference", "Ada Alvarez", BOOK_DESCRIPTION),
+             ("A Second Volume", "Bo Brandt", ""),
+             ("日本語の本", "Cai Chen", "")], 1):
         epub = os.path.join(root, author, f"{title}.epub")
         if not cfg.artwork_only or not os.path.exists(epub):
-            books.write_epub(epub, title, author)
+            books.write_epub(epub, title, author, description=description)
         made.append({"library": "Books", "key": f"book-{i}", "path": epub})
 
     # --- the shelf: several books in one folder, so filenames are parsed ---
@@ -2650,18 +2676,30 @@ def _comicinfo_for(comic: dict) -> str:
 
 
 def audiobook_folders() -> list[tuple[str, str, tuple[str, ...]]]:
-    """`(author, book folder, recipe keys)` for every audiobook folder.
+    """`(author, subfolder, recipe keys)` for every audiobook directory.
 
-    Four of them: each shape twice, once too short to hold a resume position
-    and once long enough. The lengths are the fixture and the reason there are
-    four rather than two — `UpdatePlayState`'s AudioBook arm measures minutes
-    off each end, so under ten minutes there is no position the server will
-    keep, and lengthening the short pair would have deleted that case rather
-    than added this one. `recipes.py` carries the whole argument.
+    `subfolder` is `""` when the files sit loose in the author's own folder,
+    which is a shape of its own and not a tidying-up: a folder holding one
+    book's parts is a **chapter list** and a folder holding several books is
+    a **gallery**, and `album` is the only field that tells them apart.
 
-    Derived from the names in `recipes.py` rather than restated, so a fixture
-    is declared in one place; `test_books.py` walks this to reconstruct the
-    tree without running a build.
+    Six rows, and each is there for one property:
+
+    * `Elena Farrow` / `Hana Halloran` — one `.m4b` alone in a book folder,
+      short and long. The folder *is* the item (`FindAudioBook`), so neither
+      folder appears in the library at all.
+    * `Gus Gupta` / `Kai Kowalski` — a multi-file rip, short and long. The
+      folder survives as a `Folder` with one item per file.
+    * `Lior Levy` — several different books loose in the author's folder, no
+      subfolder, one distinct `album` each.
+    * `Mo Mensah` — twice: the loose books, and the rip in its subfolder.
+      The same author folder holds both.
+
+    The two lengths are the resume fixtures and `recipes.py` carries that
+    argument; the two *shapes above them* are the folder fixtures and it
+    carries that one too. Derived from the names in `recipes.py` rather than
+    restated, so a fixture is declared in one place; `test_books.py` walks
+    this to reconstruct the tree without running a build.
     """
     return [
         (recipes.AUDIOBOOK_AUTHOR, recipes.AUDIOBOOK_TITLE, ("book-m4b",)),
@@ -2672,26 +2710,63 @@ def audiobook_folders() -> list[tuple[str, str, tuple[str, ...]]]:
         (recipes.LONG_RIP_AUTHOR, recipes.LONG_RIP_TITLE,
          tuple(f"book-rip-long-{n:02d}"
                for n in range(1, recipes.LONG_RIP_PARTS + 1))),
+        (recipes.SHELF_AUTHOR, "",
+         tuple(f"book-shelf-{n:02d}"
+               for n in range(1, len(recipes.SHELF_BOOKS) + 1))),
+        (recipes.MIXED_AUTHOR, "",
+         tuple(f"book-mixed-{n:02d}"
+               for n in range(1, len(recipes.MIXED_LOOSE) + 1))),
+        (recipes.MIXED_AUTHOR, recipes.MIXED_RIP_TITLE,
+         tuple(f"book-mixed-rip-{n:02d}"
+               for n in range(1, recipes.MIXED_RIP_PARTS + 1))),
     ]
 
 
-def _build_audiobooks(root: str, cfg) -> list[dict]:
-    """Both shapes at both lengths, each alone in a folder of its own.
+def folder_overviews() -> list[tuple[str, str]]:
+    """`(path under the library root, description)` for every folder that
+    needs one applied after the scan.
 
-    A folder rather than a loose file for every one of them, because that is
-    what the server's own directory branch is for and because it is how
-    audiobooks arrive. A single-file audiobook takes its name from the
-    *folder*; a rip's parts take theirs from their filenames. Nothing but
-    parts goes in a rip's folder: every audio file in a directory becomes one
-    stack, the stack is dropped for holding more than one file, and each file
-    then falls through and resolves on its own — a file that ended up as a
-    one-file stack would produce a single item and hide the rest.
+    A `Folder` has no local metadata provider of any kind — `BaseNfoProvider`
+    is subclassed for eight item types and `Folder` is not one of them, and
+    `MediaBrowser.LocalMetadata` only reads `collection.xml` and
+    `playlist.xml` — so **nothing written on disk can give a folder a
+    description**. Measured: a `folder.nfo` and an `album.nfo` beside a rip's
+    parts both left the folder's Overview null.
+
+    That leaves the API, which is the route a person editing metadata in the
+    web client takes, and `provision` applies these after the scan. It is
+    worth the exception because "the folder's description beats the files'"
+    is a rule a client has to implement and this is the only way to give it
+    anything to implement it against.
+    """
+    return [(os.path.join("Books", author, folder), text)
+            for author, folder, text in recipes.long_rip_folder_overviews()]
+
+
+def _build_audiobooks(root: str, cfg) -> list[dict]:
+    """Every audiobook folder, in both shapes, at both lengths, and both ways
+    a folder can hold more than one file.
+
+    A folder rather than a loose file wherever one book's files are involved,
+    because that is what the server's own directory branch is for and because
+    it is how audiobooks arrive. A single-file audiobook takes its name from
+    the *folder*; a rip's parts and a shelf's books take theirs from their
+    files — or rather from their `title` tags, which is what the prober
+    overwrites Name with.
+
+    Nothing but parts goes in a rip's folder: every audio file in a directory
+    becomes one stack, the stack is dropped for holding more than one file,
+    and each file then falls through and resolves on its own — a file that
+    ended up as a one-file stack would produce a single item and hide the
+    rest. The same rule is why `Mo Mensah/` holds two loose books and not
+    one.
     """
     by_key = {r.key: r for r in recipes.all_recipes()}
     made = []
 
     for author, book, keys in audiobook_folders():
-        folder = os.path.join(root, author, book)
+        folder = os.path.join(root, author, book) if book \
+            else os.path.join(root, author)
         for key in keys:
             rec = by_key[key]
             path = os.path.join(folder, f"{rec.title}.{rec.container}")

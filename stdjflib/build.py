@@ -591,7 +591,16 @@ In the library's settings that means:
   testing a *reader* rather than a resolver: a 24-chapter EPUB with a real
   table of contents, and a 240-page PDF. Folders here are load-bearing: a
   folder holding exactly one book resolves as *the book*, named after the
-  folder, and stops doing so at the second one.
+  folder — so the folder itself is never an item — and stops doing so at the
+  second one. Both things a folder of audiobooks can mean are covered:
+  `Lior Levy/` holds three *different* books loose in one folder, each with
+  its own `Album`, which is the only field that distinguishes them from the
+  chapters of one; `Mo Mensah/` holds a rip in a subfolder and loose books
+  beside it. **Descriptions** are here too, in each of the places the server
+  reads one from — a `.m4b`'s `description` (falling back to `comment`), an
+  `.mp3`'s ID3 `TIT3` frame, an EPUB's `dc:description` — plus one on a
+  *folder*, which no file on disk can carry and which `provision` sets
+  through the API after the scan.
 - `Home Videos/`, `Music Videos/` — smaller sets of the same idea.
 
 `{config.ATTRIBUTION}` credits every downloaded source.

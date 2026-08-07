@@ -192,6 +192,29 @@ class Jellyfin:
                           "recursive": "true" if recursive else "false"},
                   expect_json=False)
 
+    def set_overview(self, item_id: str, overview: str) -> bool:
+        """Give an item a description through the metadata editor's endpoint.
+
+        `POST /Items/{id}` is `UpdateItem`, which takes a **whole** DTO and
+        writes it back, so the current one is read first and one field
+        changed — sending a partial body would blank everything left out.
+
+        This exists for one item type: a `Folder`. Every other description in
+        this library is in a file, because that is where the server reads one
+        from; a folder has no local metadata provider of any kind, so the API
+        is the only route and this is the one a person editing metadata in
+        the web client takes. Returns whether the value stuck, because an
+        unverified write here would look exactly like a fixture that is
+        simply absent.
+        """
+        dto = self.get(f"/Items/{item_id}")
+        if not dto:
+            return False
+        dto["Overview"] = overview
+        self.post(f"/Items/{item_id}", body=dto, expect_json=False)
+        back = self.get(f"/Items/{item_id}") or {}
+        return back.get("Overview") == overview
+
     # -- collections ------------------------------------------------------
 
     def item_id_at(self, path: str, user_id: str) -> str | None:
