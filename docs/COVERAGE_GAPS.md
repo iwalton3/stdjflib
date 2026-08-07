@@ -379,19 +379,36 @@ archive in the wild. Closing it means either a checked-in fixture or a
 hand-written RAR store-mode writer; the first breaks "everything is generated
 or licence-checked", the second is a real piece of work for one file.
 
-## The calibre:series conflict is unmeasured
+## The calibre:series conflict, half measured
 
 A Book gets a `SeriesName` from its path via `BookFileNameParser` and another
-from `calibre:series` via the OPF, and nothing here has put the two in
-conflict in front of a running server. The current fixtures dodge it on
-purpose — `Epub Two Dialect/`'s filenames carry no series, so the OPF is
-unambiguously the source of the one that appears.
+from `calibre:series` via the OPF.
 
-**Shape of the work.** One more book whose filename *and* OPF both claim a
-series, with different values, measured rather than reasoned about. The answer
-depends on `MergeData`, which has form for surprises here: `DisplayOrder` on a
-BoxSet parses, saves, round-trips and can never take effect, for exactly this
-kind of reason.
+**Measured on 12.0:** with no series in the filename, the OPF wins.
+`The Older Format (2004).epub` comes back as `The Archive Editions`, while
+`The Contributors (2006).epub` beside it — same folder, no `calibre:series` —
+falls back to the parent folder, `Epub Two Dialect`.
+
+**Not measured, and the source predicts the opposite:**
+`BookMetadataService.MergeData` gates the field on
+
+```csharp
+if (replaceData || string.IsNullOrEmpty(target.Item.SeriesName))
+```
+
+A series parsed out of the *filename* is set at resolve time, so by the time
+the provider merges, `target.Item.SeriesName` is non-empty and `replaceData`
+is false on an ordinary scan — which would drop the OPF value. The
+folder-fallback case measured above evidently does not populate the target
+before that check, or the OPF could not have won.
+
+**Shape of the work.** One more book in `Epub Two Dialect/` whose filename
+parses a series *and* whose OPF names a different one — the Goodreads
+spelling the shelf already uses, `Name (Series, #N) (Year).epub`, with
+`calibre:series` set to something else. Then scan and look. It is about
+twenty minutes including the rebuild, and it is worth doing rather than
+reasoning about: `DisplayOrder` on a BoxSet parses, saves, round-trips and can
+never take effect for exactly this kind of reason.
 
 **The EPUB 3 cover branch — FIXED.** `ReadCoverPath` tries
 `properties="cover-image"` first and `<meta name="cover">` last.

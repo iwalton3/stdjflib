@@ -15,7 +15,7 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (369 tests,
+Run the tests with `python3 -m unittest discover -s tests -t .` (370 tests,
 well under a second, no ffmpeg). Three of them validate the EPUB writers with
 **epubcheck** and skip when it is absent — `apt install epubcheck`, which
 costs about four seconds of JVM startup when present. It is a development
@@ -189,11 +189,44 @@ half of the client story: jellyfin-web pins `epubjs 0.3.93`, whose
 `book.navigation` resolves a **nav document** for EPUB 3 and an **NCX** for
 EPUB 2, two separate parsers.
 
-`SeriesName` on a Book therefore has two unrelated sources — the path, via
-`BookFileNameParser`, and `calibre:series`, via the OPF. **Which wins is not
-measured.** The fixture's filenames deliberately carry no series so that the
-OPF is unambiguously the source; putting the two in conflict is still an open
-question and `test_books.py` says so.
+Measured on 12.0, and all of it works: `calibre:series` → SeriesName,
+`series_index` → IndexNumber 2, `calibre:rating` → CommunityRating 8, all
+three `opf:scheme` ids → `{Amazon, GoogleBooks, ISBN}`, `dc:publisher` →
+Studios, `dc:date` → PremiereDate, and `dc:subject` "Fiction / Adventure"
+splitting into **two** genres. Every `case` in `GetRole` came back with its
+own PersonKind, `ctb` came back as **Author** — the contributor silently
+recorded as an author, as predicted — `J.R.R. Nakamura` came back respaced to
+`J. R. R. Nakamura`, and the one semicolon element came back as two people.
+
+`SeriesName` on a Book has two unrelated sources — the path, via
+`BookFileNameParser`, and `calibre:series`, via the OPF. **Measured: with no
+series in the filename, the OPF wins** (`The Archive Editions`, not the
+parent folder `Epub Two Dialect`, which is what the book beside it with no
+`calibre:series` falls back to). **The filename case is still not measured and
+may well go the other way**, because `BookMetadataService.MergeData` gates it:
+
+```csharp
+if (replaceData || string.IsNullOrEmpty(target.Item.SeriesName))
+```
+
+A filename-parsed series is set at resolve time, so on an ordinary scan
+`target.Item.SeriesName` is *not* empty, `replaceData` is false, and the OPF
+value would be dropped. That is inference from the source, not a measurement —
+it is written down because it predicts the opposite of what was measured for
+the folder-fallback case, which is exactly the kind of thing that gets assumed
+wrongly.
+
+**A sort title has to sort somewhere the name would not.** `calibre:title_sort`
+was `"Older Format, The"` and it *worked* — `ForcedSortName` was set — and it
+was indistinguishable from doing nothing, because `BaseItem.GetSortName`
+strips `SortRemoveWords` ("the", "a", "an") from the start, the middle **and
+the end**, then deletes `SortRemoveCharacters` (`, & - { } '`). So
+`"Older Format, The"` and the name-derived `"The Older Format"` both normalise
+to `older format`. It now asks for `"Zzz Sorted Last By Title Sort"`, measured
+as `SortName` `zzz sorted last by title sort`. Same trap as `Ordered By Name`
+in the collections, and it was only caught by putting it in front of a running
+server — a fixture has to be able to tell "honoured" from "ignored and the two
+agreed".
 
 **A `dc:creator`'s `opf:role` must be a real MARC relator.** epubcheck rejects
 anything else with OPF-052, which is how the first draft of `EPUB2_CREATORS`
@@ -218,8 +251,9 @@ names `Book` alone precisely so `EpubImageProvider` and `ComicImageProvider`
 can supply them from the files themselves. Every EPUB here declared no cover
 at all until this pair, so every book in the library was artwork-less.
 
-`ReadCoverPath` has two live branches and they are covered one each, which is
-the arrangement to keep: `Long Form/The Long Novel (2016).epub` carries the
+Measured: both come back with `ImageTags: ['Primary']`, so both live branches
+of `ReadCoverPath` work. `ReadCoverPath` has two live branches and they are
+covered one each, which is the arrangement to keep: `Long Form/The Long Novel (2016).epub` carries the
 OPF 3 spelling (`properties="cover-image"`, the first branch) and
 `Epub Two Dialect/The Older Format (2004).epub` the OPF 2 one
 (`<meta name="cover">`, the last). A writer drifting onto the other's spelling

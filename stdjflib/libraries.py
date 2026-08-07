@@ -2080,7 +2080,16 @@ EPUB2_METADATA_NAME = "The Older Format"        # what the filename parses to
 # does: the folder is `Epub Two Dialect` and the series is not.
 EPUB2_SERIES = "The Archive Editions"
 EPUB2_SERIES_INDEX = 2
-EPUB2_SORT_TITLE = "Older Format, The"
+# **Not "Older Format, The".** `BaseItem.GetSortName` lowercases, strips any
+# of `SortRemoveWords` ("the", "a", "an") from the start, middle *or end*, and
+# then deletes `SortRemoveCharacters` (`, & - { } \'`). So "Older Format, The"
+# and the name-derived "The Older Format" both normalise to `older format` —
+# the field was honoured and the result was identical to it being ignored.
+# Measured against 12.0 before this was changed, which is the only reason it
+# was caught. Same trap as `Ordered By Name` in the collections: a fixture has
+# to be able to tell "the client honoured the field" from "the client ignored
+# it and the two happened to agree".
+EPUB2_SORT_TITLE = "Zzz Sorted Last By Title Sort"
 EPUB2_RATING = 8
 # Deliberately made-up, in made-up-looking shapes. Remote fetchers are off for
 # Book in both provider layers so nothing resolves them, and a real ISBN in a

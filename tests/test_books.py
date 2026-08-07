@@ -1109,6 +1109,35 @@ class TestEpub2Dialect(unittest.TestCase):
         rows = [(w, s) for _r, w, s, _k in libraries.EPUB2_CREATORS if w != s]
         self.assertTrue(any("." in w for w, _s in rows))
 
+    def test_the_sort_title_cannot_collapse_onto_the_name_derived_one(self):
+        """`BaseItem.GetSortName`, ported far enough to answer one question:
+        does `calibre:title_sort` produce a different sort key from the one
+        the Name would have produced anyway?
+
+        "Older Format, The" did not — the trailing article is stripped from
+        the *end* too, and then the comma goes — so the field was honoured and
+        looked exactly like it being ignored. Measured on 12.0 before this
+        test existed.
+        """
+        def sort_key(name):
+            s = name.strip().lower()
+            for word in ("the", "a", "an"):
+                if s.startswith(word + " "):
+                    s = s[len(word) + 1:]
+                s = s.replace(" " + word + " ", " ")
+                if s.endswith(" " + word):
+                    s = s[:-(len(word) + 1)]
+            for ch in (",", "&", "-", "{", "}", "'"):
+                s = s.replace(ch, "")
+            for ch in (".", "+", "%"):
+                s = s.replace(ch, " ")
+            return " ".join(s.split())
+
+        self.assertNotEqual(sort_key(libraries.EPUB2_SORT_TITLE),
+                            sort_key(libraries.EPUB2_METADATA_NAME),
+                            "a sort title that normalises onto the name's own "
+                            "sort key proves nothing either way")
+
     def test_a_subject_that_splits_into_two_genres_is_present(self):
         """The server splits `dc:subject` on `/ & , ; -`, so one element can
         become two genres. A table of single-word subjects would not show
