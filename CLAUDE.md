@@ -15,8 +15,12 @@ things that look like they need a package do not: image work goes through
 ffmpeg (`artwork.py`), and the VobSub encoder is written by hand
 (`vobsub.py`).
 
-Run the tests with `python3 -m unittest discover -s tests -t .` (331 tests,
-well under a second, no ffmpeg). To try it for real, build the minimal tier —
+Run the tests with `python3 -m unittest discover -s tests -t .` (369 tests,
+well under a second, no ffmpeg). Three of them validate the EPUB writers with
+**epubcheck** and skip when it is absent — `apt install epubcheck`, which
+costs about four seconds of JVM startup when present. It is a development
+tool, never a dependency: the suite must keep passing on a machine that has
+never heard of Java. To try it for real, build the minimal tier —
 it downloads nothing and takes about 80 seconds on a 16-core machine:
 
 ```sh
@@ -35,7 +39,7 @@ filter or muxer problem.
 | `stdjflib/generate.py` | Recipe → ffmpeg invocation → file |
 | `stdjflib/vobsub.py` | the hand-written VobSub (.idx/.sub) encoder |
 | `stdjflib/subs.py` | subtitle sample text and the SRT/ASS/VTT writers |
-| `stdjflib/books.py` | the hand-written EPUB, PDF, CBZ/CBT and comic-metadata writers |
+| `stdjflib/books.py` | the hand-written EPUB, PDF, CBZ/CBT and comic-metadata writers, and the derived filler text the long ones are filled with |
 | `stdjflib/boxsets.py` | `collection.xml`, and the Emby-dialect parser it is written against |
 | `stdjflib/strm.py` | `.strm` stream files, and the parsing rule they are written against |
 | `stdjflib/origin.py` | the local HTTP origin those stream files can point at |
@@ -158,6 +162,108 @@ shelf therefore embeds *the name the parser should produce*, and the one row
 the parser gives no name to is a PDF, because no provider reads one.
 `test_books.py:test_every_epub_embeds_the_name_its_filename_parses_to` holds
 the two to each other.
+
+**An EPUB needs a nav document and a `dcterms:modified`, and Jellyfin will
+never tell you they are missing.** EPUB 3 requires both — a manifest item
+carrying `properties="nav"`, and the one mandatory `<meta>` in the package
+metadata. Every EPUB this tool wrote had neither, and nothing caught it:
+`EpubProvider` reads `dc:title` out of the OPF and stops, so the files
+resolved, displayed, and passed `verify`. What was lost was the *client* side
+— one spine item and no table of contents means nothing to page through, no
+chapter to jump to and no TOC to draw, so three of the four things an ebook
+reader does had no fixture. `books.epub_structure` re-reads spine length and
+the nav declaration and `verify` checks them, because that is the only place
+their loss would ever be reported. The nav document is deliberately **not** in
+the spine (EPUB 3 allows either), so spine length is the chapter count exactly
+and the check has one number to compare.
+
+**`OpfReader` never checks the package version, and most of it is only
+reachable from an EPUB 2.** It is a bag of XPaths, and roughly two thirds are
+OPF 2 spellings an EPUB 3 file has no way to express: `calibre:series`,
+`calibre:series_index`, `calibre:rating` and `calibre:title_sort`, the
+`dc:identifier[@opf:scheme=...]` provider ids, `opf:role` on `dc:creator`, and
+the `<meta name="cover">` form of the cover. An all-EPUB-3 shelf reaches
+`dc:title`, `dc:creator` and `dc:language` and leaves the rest of that file
+unexecuted — which is what `Epub Two Dialect/` is for. It is also the other
+half of the client story: jellyfin-web pins `epubjs 0.3.93`, whose
+`book.navigation` resolves a **nav document** for EPUB 3 and an **NCX** for
+EPUB 2, two separate parsers.
+
+`SeriesName` on a Book therefore has two unrelated sources — the path, via
+`BookFileNameParser`, and `calibre:series`, via the OPF. **Which wins is not
+measured.** The fixture's filenames deliberately carry no series so that the
+OPF is unambiguously the source; putting the two in conflict is still an open
+question and `test_books.py` says so.
+
+**A `dc:creator`'s `opf:role` must be a real MARC relator.** epubcheck rejects
+anything else with OPF-052, which is how the first draft of `EPUB2_CREATORS`
+was caught — it used `zzz` to reach `GetRole`'s `default` arm and produced an
+invalid EPUB instead of a fixture. The `default` arm is reached with **`ctb`**
+instead: a real relator the server has no `case` for, so a *contributor is
+silently recorded as an author*. The table covers every `case` in `GetRole`
+plus the default, and `test_the_table_covers_every_case_in_get_role` forbids
+it quietly collapsing to eleven rows of Author.
+
+**Two branches of `ReadCoverPath` can never match.**
+`//opf:item[@id='cover' and @media-type='image/*']` and
+`//opf:item[@id='*cover-image']` are XPath *string literals*, not globs — and
+an `id` of `*cover-image` is not a well-formed NCName, so the second is
+unmatchable in any valid EPUB. Read from source, **not** measured against a
+running server. `books.epub_structure` restates the two branches that do work
+and leaves these out, because no fixture can reach them.
+
+**No artwork is drawn beside a book, so an OPF cover is the only image one can
+ever have.** `build_books` writes no posters — `provision.LOCAL_IMAGE_EXTRACTORS`
+names `Book` alone precisely so `EpubImageProvider` and `ComicImageProvider`
+can supply them from the files themselves. Every EPUB here declared no cover
+at all until this pair, so every book in the library was artwork-less.
+
+`ReadCoverPath` has two live branches and they are covered one each, which is
+the arrangement to keep: `Long Form/The Long Novel (2016).epub` carries the
+OPF 3 spelling (`properties="cover-image"`, the first branch) and
+`Epub Two Dialect/The Older Format (2004).epub` the OPF 2 one
+(`<meta name="cover">`, the last). A writer drifting onto the other's spelling
+would leave a branch with no fixture and nothing would fail, so
+`test_books.py` asserts each writer emits its own and *not* the other's.
+
+Both are also the reason those two builders are **not** skipped under
+`artwork_only`: unlike every other EPUB here they contain artwork, so a redraw
+has something to change in them. `_book_cover` draws at 1200x1800 — 2:3, the
+poster shape, because a book's Primary image is shaped like a movie's and not
+like an album's.
+
+**The long book is mostly Latin on purpose, and its tail deliberately is
+not.** `Long Form/The Long Novel (2016).epub` is 24 chapters; the last five
+are Cyrillic, Greek, Japanese, Hebrew and Arabic, taken from `subs.SCRIPTS`
+rather than a second table that could drift from it. Font fallback in a reader
+fails exactly as it does in a subtitle renderer, so the coverage is worth
+having — but chapters 1-19 stay Latin because pagination is what the bulk of
+the book measures, and a reader that cannot draw CJK would contaminate that.
+Each script chapter's title carries the English name *and* the script, so the
+TOC is one more place the fallback shows and stays diagnosable when it fails.
+
+**The long fixtures live in a folder of two, and the count is the reason.**
+One supported file makes the folder the book, named after the folder — and
+nothing in the server reads a PDF's title, so a lone long PDF would come back
+named after its directory with no way to say what it is. Two files means each
+is named from its own filename. The EPUB still embeds the name its filename
+parses to, for the same reason every EPUB on the shelf does.
+
+**Filler text is derived, never random.** `books.paragraphs` expands SHA-256
+of the item key into a byte stream and picks words from it, so two builds of
+one library produce identical bytes. `random` seeded from the clock and
+`hash()` both fail that, and `hash()` fails it invisibly — Python salts string
+hashing per process, so it looks deterministic within a single run.
+
+**Comic page counts are a tier decision, not a constant.** A page is one
+ffmpeg invocation at about 130 ms and 53 KB. `COMIC_PAGES` is 15 — four was
+enough to check the page *count*, which is all `verify` reads, but not enough
+for a reader to page through or a jump to land on wrongly. `LONG_COMIC_PAGES`
+is 300 and gated to `standard`, because 17 MB is real and minimal is the tier
+that promises to be quick. The draws go through `_run_all`, which is what
+keeps 405 pages at a few seconds instead of a minute — and which preserves
+submission order, so `comic_entries` still predicts the archive's entry order
+and the cover rule still applies to it.
 
 **Nothing in the server sets `SeriesName` on an `AudioBook`.** It implements
 `IHasSeries`, so the field is there and a client will find it, and the only

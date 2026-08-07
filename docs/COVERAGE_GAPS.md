@@ -21,7 +21,9 @@ look correct right up until someone points it at a real library.
 Raised 2026-08-06 while researching Jellyfin's book support for the shim,
 which is about to implement audiobooks and download-and-open. `build_books`
 (`stdjflib/libraries.py:1534`) currently emits **three EPUBs** under
-`<author>/` folders and **one four-page CBZ** under `Comics/`. That is the
+`<author>/` folders and **one four-page CBZ** under `Comics/` (both since
+superseded; comics now hold fifteen pages, and `Long Form/` holds a
+twenty-four chapter EPUB and a 240-page PDF). That is the
 whole Books library.
 
 Two things already in place that these items build on, so none of this is
@@ -247,7 +249,8 @@ page one). The two are otherwise identical archives, so the difference between
 their covers is the rule and not the artwork.
 
 **A page count is an entry count.** `ProbeProvider` counts every non-directory
-entry, so an internal `ComicInfo.xml` makes a four-page comic report five.
+entry, so an internal `ComicInfo.xml` makes a fifteen-page comic report
+sixteen.
 Measured (40000 vs 50000 ticks). Stated rather than corrected: a client
 showing five is reading the server correctly.
 
@@ -375,6 +378,30 @@ metadata restriction — which is about the extension — but it leaves RAR and
 archive in the wild. Closing it means either a checked-in fixture or a
 hand-written RAR store-mode writer; the first breaks "everything is generated
 or licence-checked", the second is a real piece of work for one file.
+
+## The calibre:series conflict is unmeasured
+
+A Book gets a `SeriesName` from its path via `BookFileNameParser` and another
+from `calibre:series` via the OPF, and nothing here has put the two in
+conflict in front of a running server. The current fixtures dodge it on
+purpose — `Epub Two Dialect/`'s filenames carry no series, so the OPF is
+unambiguously the source of the one that appears.
+
+**Shape of the work.** One more book whose filename *and* OPF both claim a
+series, with different values, measured rather than reasoned about. The answer
+depends on `MergeData`, which has form for surprises here: `DisplayOrder` on a
+BoxSet parses, saves, round-trips and can never take effect, for exactly this
+kind of reason.
+
+**The EPUB 3 cover branch — FIXED.** `ReadCoverPath` tries
+`properties="cover-image"` first and `<meta name="cover">` last.
+`Long Form/The Long Novel (2016).epub` now carries the first and
+`Epub Two Dialect/The Older Format (2004).epub` the second, so both live
+branches have a fixture and `test_books.py` forbids either writer drifting
+onto the other's spelling. The two branches between them remain unreachable
+by anything — they are XPath string literals rather than globs — and that is
+noted in `books.epub_structure` rather than fixtured, because no valid EPUB
+can match them.
 
 ---
 

@@ -580,7 +580,12 @@ In the library's settings that means:
   only by their `Album` tag. Also the three comic metadata dialects (two of
   which the server reads only from a `.cbz`), both comic cover rules, the
   formats that catalogue and that no client can open, and one book per
-  filename convention the resolver parses. Folders here are load-bearing: a
+  filename convention the resolver parses. `Epub Two Dialect/` is EPUB 2.0.1 —
+  an NCX rather than a nav document, calibre series metadata, MARC relator
+  roles and an embedded cover, none of which an EPUB 3 file can express.
+  `Long Form/` is the pair meant for
+  testing a *reader* rather than a resolver: a 24-chapter EPUB with a real
+  table of contents, and a 240-page PDF. Folders here are load-bearing: a
   folder holding exactly one book resolves as *the book*, named after the
   folder, and stops doing so at the second one.
 - `Home Videos/`, `Music Videos/` — smaller sets of the same idea.

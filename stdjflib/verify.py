@@ -341,7 +341,7 @@ def check_box_sets(manifest, report) -> int:
 def check_books(manifest, report) -> int:
     """Re-read the books whose whole point is a number the server will report.
 
-    Two of them, and neither is checkable by probing with ffmpeg — a PDF and a
+    None of them is checkable by probing with ffmpeg — a PDF, an EPUB and a
     comic archive are not media. So the files are re-read here:
 
     * a PDF's **page count**, because Jellyfin stores `pageCount * 10000` as
@@ -356,6 +356,13 @@ def check_books(manifest, report) -> int:
       renamed or reordered entry silently changes. An archive whose pages
       sorted differently after a rebuild would still open, still show a cover,
       and no longer be testing what it says it tests.
+    * a long EPUB's **spine length and navigation document**, because that is
+      the whole of what makes it a reader fixture rather than another
+      resolver one. An EPUB 3 must declare a manifest item with
+      `properties="nav"`; Jellyfin does not care — `EpubProvider` reads
+      `dc:title` and stops — so an invalid file resolves, displays and passes
+      every other check here while giving a client nothing to page through.
+      Nothing but this notices.
     """
     from . import books
 
@@ -393,6 +400,50 @@ def check_books(manifest, report) -> int:
                 report.problems.append(
                     f"{item['key']}: the server would take {cover!r} as the "
                     f"cover, expected {archive['cover']!r}")
+
+        epub = item.get("epub")
+        if epub:
+            checked += 1
+            got = books.epub_structure(path)
+            if got is None:
+                report.problems.append(
+                    f"{item['key']}: unreadable EPUB ({path})")
+                continue
+            if got["title"] != epub["title"]:
+                report.problems.append(
+                    f"{item['key']}: EPUB dc:title is {got['title']!r}, "
+                    f"expected {epub['title']!r} — this is the name the "
+                    f"server will show, whatever the filename parses to")
+            if got["spine"] != epub["spine"]:
+                report.problems.append(
+                    f"{item['key']}: EPUB spine has {got['spine']} items, "
+                    f"expected {epub['spine']} — a reader can only page "
+                    f"through what is in the spine")
+            if got["version"] != epub["version"]:
+                report.problems.append(
+                    f"{item['key']}: EPUB package version is "
+                    f"{got['version']!r}, expected {epub['version']!r} — "
+                    f"which dialect this file is in decides which half of "
+                    f"OpfReader it can reach")
+            # Which table of contents a file must carry is the dialect's, not
+            # a preference: EPUB 3 wants a nav document, EPUB 2 an NCX, and
+            # epub.js has a separate parser for each.
+            wanted = epub["contents"]
+            if not got[wanted]:
+                report.problems.append(
+                    f"{item['key']}: EPUB declares no {wanted}, so it has no "
+                    f"table of contents a client can draw"
+                    + (" and is not a valid EPUB 3" if wanted == "nav" else ""))
+            if epub["version"] == "3.0" and not got["modified"]:
+                report.problems.append(
+                    f"{item['key']}: EPUB has no dcterms:modified, which "
+                    f"EPUB 3 requires")
+            if bool(got["cover"]) != bool(epub["cover"]):
+                report.problems.append(
+                    f"{item['key']}: EPUB cover is {got['cover']!r}, expected "
+                    f"{'one' if epub['cover'] else 'none'} — no artwork is "
+                    f"drawn beside a book, so what the OPF declares is the "
+                    f"only image the item can ever have")
     return checked
 
 

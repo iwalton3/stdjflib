@@ -17,7 +17,8 @@ import concurrent.futures as futures
 import dataclasses
 import os
 
-from . import artwork, boxsets, catalog, ff, generate, nfo, origin, recipes, strm
+from . import (artwork, boxsets, catalog, config, ff, generate, nfo, origin,
+               recipes, strm, subs)
 from .recipes import Audio, Recipe, Video
 
 YEAR = 2020
@@ -1973,6 +1974,164 @@ BOOK_ALONE = "The Solitary Volume (2001)"
 # EPUB inside must call itself.
 BOOK_ALONE_PARSED_NAME = "The Solitary Volume"
 
+# --- long form ------------------------------------------------------------
+#
+# Everything else on these shelves is a few sentences long, which is enough to
+# test a *resolver* and nothing at all to test a *reader*. An EPUB with one
+# spine item and no navigation document cannot be paged through, has no
+# chapter to jump to and no table of contents to draw — three of the four
+# things an ebook reader does had no fixture here until this folder existed.
+#
+# Two supported files, so the folder is not a directory-book and each file is
+# named from its own filename. That is deliberate: the name a client shows has
+# to say what the fixture is, and for the PDF the filename is the only thing
+# that can say it — nothing in the server reads a PDF's title, so a lone PDF
+# in a folder would come back named after the folder.
+#
+# Both are in the minimal tier. They are pure byte writes — no ffmpeg, no
+# download — and together they cost well under a second and under a megabyte.
+LONG_BOOKS_FOLDER = "Long Form"
+
+LONG_BOOK_STEM = "The Long Novel (2016)"
+LONG_BOOK_NAME = "The Long Novel"        # what the filename parses to
+LONG_BOOK_CHAPTERS = 24
+LONG_BOOK_PARAGRAPHS = 24                # per chapter, ~78 words each
+
+# The last five chapters are not Latin. Font fallback in a reader is the same
+# failure the subtitle fixtures exist for — tofu boxes where glyphs should be,
+# and RTL text laid out left to right — and `subs.SCRIPTS` already holds real
+# sentences per script for exactly that reason, so this borrows them rather
+# than inventing a second table that could drift from the first.
+#
+# Chapters 1-19 are Latin on purpose: pagination is what the bulk of this book
+# tests, and a reader that cannot draw CJK would otherwise contaminate that
+# measurement. Each script chapter's title carries both the English name and
+# the script itself, so the table of contents is one more place the fallback
+# is visible — and stays readable when it fails, which is the point.
+LONG_BOOK_SCRIPTS = [
+    ("cyrillic", "Cyrillic", "Кириллица"),
+    ("greek", "Greek", "Ελληνικά"),
+    ("cjk", "Japanese", "日本語"),
+    ("rtl", "Hebrew", "עברית"),
+    ("arabic", "Arabic", "العربية"),
+]
+
+LONG_PDF_STEM = "The Long Manual (1998)"
+LONG_PDF_NAME = "The Long Manual"
+# Two hundred and forty pages against the shelf's six. The pair is the
+# fixture: same folder shape, same parse, a page count forty times larger.
+# Jellyfin stores it as `RunTimeTicks` at pageCount * 10000 — which is 2.4
+# *seconds* for 240 pages, so a client rendering that field as a duration
+# shows nonsense at any length. Stated rather than corrected; the number is
+# read back correctly, it is the unit that is wrong.
+LONG_PDF_PAGES = 240
+
+
+def long_book_chapters() -> list[tuple[str, list[str]]]:
+    """The long EPUB's chapters, composed here rather than in `books.py`.
+
+    `books.py` writes formats; what a fixture *says* is decided here, which is
+    why the multi-script text is pulled in at this level.
+    """
+    from . import books
+
+    chapters = []
+    latin = LONG_BOOK_CHAPTERS - len(LONG_BOOK_SCRIPTS)
+    for n in range(1, latin + 1):
+        chapters.append((f"Chapter {n}",
+                         books.paragraphs(f"{LONG_BOOK_NAME}:{n}",
+                                          LONG_BOOK_PARAGRAPHS)))
+    for i, (script, english, native) in enumerate(LONG_BOOK_SCRIPTS):
+        n = latin + i + 1
+        # Newlines in the samples are subtitle line breaks; in a paragraph
+        # they are just whitespace, so they are flattened rather than kept.
+        lines = [line.replace("\n", " ")
+                 for line in subs.sample_lines(script, script)]
+        body = [" ".join(lines[j % len(lines):] + lines[:j % len(lines)])
+                for j in range(6)]
+        chapters.append((f"Chapter {n} \u2014 {english} ({native})", body))
+    return chapters
+
+
+# --- the EPUB 2 dialect ---------------------------------------------------
+#
+# `OpfReader` never checks the package `version`. It is a bag of XPaths, and
+# roughly two thirds of them are OPF 2 spellings that an EPUB 3 file has no
+# way to express — so an all-EPUB-3 shelf reaches `dc:title`, `dc:creator` and
+# `dc:language` and leaves the rest of that file unexecuted. The table in
+# `books.write_epub2`'s comment is the full list.
+#
+# Two files, so the folder is not a directory-book and each is named from its
+# own filename. Both are EPUB 2.0.1 and both carry an NCX, which is the other
+# half of the point: jellyfin-web pins `epubjs 0.3.93`, and its table of
+# contents resolves a nav document for EPUB 3 and an **NCX** for EPUB 2 —
+# two separate parsers, only one of which had a fixture.
+EPUB2_FOLDER = "Epub Two Dialect"
+
+EPUB2_METADATA_STEM = "The Older Format (2004)"
+EPUB2_METADATA_NAME = "The Older Format"        # what the filename parses to
+
+# `calibre:series` has no OPF 3 spelling at all, so this is the only way a
+# Book on this library ever gets a SeriesName from its *file* rather than from
+# its path. Which of the two wins when both exist is **not measured** — the
+# resolver sets SeriesName from the parent folder and `OpfReader` sets it from
+# here, and nothing in this repo has yet put the pair in front of a running
+# server. The fixture is built so that the answer is visible when someone
+# does: the folder is `Epub Two Dialect` and the series is not.
+EPUB2_SERIES = "The Archive Editions"
+EPUB2_SERIES_INDEX = 2
+EPUB2_SORT_TITLE = "Older Format, The"
+EPUB2_RATING = 8
+# Deliberately made-up, in made-up-looking shapes. Remote fetchers are off for
+# Book in both provider layers so nothing resolves them, and a real ISBN in a
+# test fixture is somebody's actual book.
+EPUB2_SCHEME_IDS = (("ISBN", "9781234567897"),
+                    ("AMAZON", "B000STDJFLIB"),
+                    ("GOOGLE", "stdjflibQA0001"))
+# The server splits a `dc:subject` on `/ & , ; -`, so one element becomes two
+# genres. A single-genre subject would not show that happening.
+EPUB2_SUBJECTS = ("Fiction / Adventure", "Reference")
+EPUB2_DATE = "2004-06-15"
+
+EPUB2_CREDITS_STEM = "The Contributors (2006)"
+EPUB2_CREDITS_NAME = "The Contributors"
+
+# `FindAuthors` does three things nothing here covered: it maps a MARC relator
+# code onto a `PersonKind`, it flips "Lastname, Firstname", and it respaces
+# initials with `(?<=\p{L})\.(?!\s|$)`. Each row is (role code, what the
+# file says, what the server should display, which PersonKind).
+#
+# The rows below cover **every `case` in `GetRole`** plus its `default`. Two
+# are the awkward ones:
+#
+#   * `ctb` is a real MARC relator that `GetRole` has no case for, so it falls
+#     through to `default` and a *contributor is recorded as an author*. It is
+#     `ctb` rather than a nonsense code because epubcheck rejects an invalid
+#     relator outright — OPF-052 — which is how the first draft of this table
+#     was caught. An invalid file would not have been testing the fallthrough,
+#     it would have been an invalid file.
+#   * `oth` maps to `PersonKind.Unknown`, which is the one row where the
+#     server has a case and still ends up with no useful role.
+EPUB2_CREATORS = [
+    ("aut", "Adeyemi, Ada", "Ada Adeyemi", "Author"),
+    ("edt", "Bergstrom, Bo", "Bo Bergstrom", "Editor"),
+    ("ill", "Castellanos, Cai", "Cai Castellanos", "Illustrator"),
+    ("nrt", "Dubois, Dara", "Dara Dubois", "Narrator"),
+    ("art", "Eriksson, Eli", "Eli Eriksson", "Artist"),
+    ("lyr", "Fontaine, Fay", "Fay Fontaine", "Lyricist"),
+    ("mus", "Guerrero, Gus", "Gus Guerrero", "AlbumArtist"),
+    ("arr", "Haddad, Hal", "Hal Haddad", "Arranger"),
+    ("trl", "Ivanova, Ines", "Ines Ivanova", "Translator"),
+    ("oth", "Lindqvist, Lars", "Lars Lindqvist", "Unknown"),
+    ("ctb", "Moreau, Max", "Max Moreau", "Author"),
+    ("aut", "J.R.R. Nakamura", "J. R. R. Nakamura", "Author"),
+]
+# One element, two people. Kept out of the table above because it is the one
+# row whose "what the server should display" is a pair rather than a name.
+EPUB2_JOINT_CREATOR = ("aut", "Jaworski, Jo; Kowalski, Kai",
+                       ("Jo Jaworski", "Kai Kowalski"))
+
+
 # The formats Jellyfin catalogues and nothing can open. `BookResolver` takes
 # them, so they browse with metadata and artwork like any other book, and
 # then every client dead-ends: jellyfin-web's three players claim epub, pdf
@@ -2010,9 +2169,28 @@ UNOPENABLE_FILES = [
 # was not read, and you can see that without opening anything.
 COMICS_FOLDER = "Comics"
 
-# Pages are 1200x1800 JPEGs. Four is enough: the page count is what is
-# checked, and it is checked against this number.
-COMIC_PAGES = 4
+# Pages are 1200x1800 JPEGs, drawn one ffmpeg invocation each — measured at
+# about 130 ms and 53 KB apiece on the machine this was written on, which is
+# what sets both numbers below.
+#
+# Fifteen rather than four. Four was enough to check the page *count*, which
+# is all `verify` reads, but it is not enough to exercise the thing a reader
+# actually does: at four pages there is no paging, no scrubber worth dragging
+# and no page a jump could land on wrongly. Fifteen costs about two seconds
+# across the seven archives now that the draws go through `_run_all`, and it
+# is still small enough to stay in the minimal tier.
+COMIC_PAGES = 15
+
+# The long one, and the reason it is `standard` and not `minimal`: three
+# hundred pages is about forty seconds of drawing serially and sixteen
+# megabytes on disk. Parallel it is a few seconds, but the disk cost is real
+# and minimal is the tier that promises to be quick and to download nothing.
+#
+# Length is the whole fixture. A three-hundred-page archive is where a
+# reader's paging, its thumbnail strip and its memory behaviour stop being
+# free, and where `RunTimeTicks` — which for a comic is the entry count times
+# 10000 — is finally a number big enough to be formatted wrongly.
+LONG_COMIC_PAGES = 300
 
 # The two cover rules, which are the whole of `ComicImageProvider`:
 #   1. an entry named exactly `cover.<ext>` at the archive root, tried in the
@@ -2039,18 +2217,29 @@ def _comic_pages(folder: str, key: str, cfg, count: int = COMIC_PAGES,
     so two of them being built at once cannot collide, and removed once the
     archive is written — a loose page in a library folder would be an item.
     """
-    pages = []
+    specs = []
     if credits_page:
-        path = os.path.join(folder, f".{key}-credits.jpg")
-        if artwork.draw("photo", f"{key}-credits", "Scan Credits", path, cfg,
-                        size=(1200, 1800), stamp=False):
-            pages.append((SCAN_CREDITS_PAGE, path))
-    for n in range(1, count + 1):
-        path = os.path.join(folder, f".{key}-page{n}.jpg")
-        if artwork.draw("photo", f"{key}-{n}", f"Page {n}", path, cfg,
-                        size=(1200, 1800), stamp=False):
-            pages.append((f"{n:03d}.jpg", path))
-    return pages
+        specs.append((SCAN_CREDITS_PAGE, f".{key}-credits.jpg",
+                      f"{key}-credits", "Scan Credits"))
+    specs += [(f"{n:03d}.jpg", f".{key}-page{n}.jpg", f"{key}-{n}", f"Page {n}")
+              for n in range(1, count + 1)]
+
+    def task(name, filename, art_key, label):
+        def run():
+            path = os.path.join(folder, filename)
+            if artwork.draw("photo", art_key, label, path, cfg,
+                            size=(1200, 1800), stamp=False):
+                return (name, path)
+            return None
+        return run
+
+    # Through the pool rather than in a loop: a page is one ffmpeg invocation
+    # at about 130 ms, so the long archive is forty seconds serial and a few
+    # parallel. `_run_all` preserves submission order, which matters here —
+    # the archive's entry order is what `comic_entries` predicts and what the
+    # cover rule is applied to.
+    return [page for page in _run_all([task(*spec) for spec in specs], cfg)
+            if page]
 
 
 def build_books(root: str, cfg) -> list[dict]:
@@ -2108,6 +2297,35 @@ def build_books(root: str, cfg) -> list[dict]:
         books.write_epub(alone, BOOK_ALONE_PARSED_NAME, BOOK_ALONE_AUTHOR)
     made.append({"library": "Books", "key": "book-alone", "path": alone})
 
+    # --- long form: the two fixtures a reader can actually be tested on ----
+    long_dir = os.path.join(root, LONG_BOOKS_FOLDER)
+    os.makedirs(long_dir, exist_ok=True)
+    long_epub = os.path.join(long_dir, f"{LONG_BOOK_STEM}.epub")
+    # The OPF 3 cover spelling — `properties="cover-image"`, the first branch
+    # of `ReadCoverPath`, where `Epub Two Dialect/` carries the last. Not
+    # skipped under `artwork_only` for the same reason the EPUB 2 one is not:
+    # this file *contains* artwork, so a redraw has something to change in it.
+    long_cover = _book_cover(long_dir, "book-long-cover", LONG_BOOK_NAME, cfg)
+    # The name the *filename* parses to, for the same reason as the shelf:
+    # a `dc:title` that disagreed would be the thing on screen.
+    books.write_epub(long_epub, LONG_BOOK_NAME, LONG_BOOKS_FOLDER,
+                     chapters=long_book_chapters(), cover=long_cover)
+    made.append({"library": "Books", "key": "book-long-epub", "path": long_epub,
+                 # Recorded so `verify` re-reads the file rather than trusting
+                 # that the writer was asked for the right shape.
+                 "epub": {"version": "3.0", "title": LONG_BOOK_NAME,
+                          "spine": LONG_BOOK_CHAPTERS, "contents": "nav",
+                          "cover": long_cover is not None}})
+
+    long_pdf = os.path.join(long_dir, f"{LONG_PDF_STEM}.pdf")
+    if not cfg.artwork_only or not os.path.exists(long_pdf):
+        books.write_pdf(long_pdf, LONG_PDF_NAME, LONG_BOOKS_FOLDER,
+                        LONG_PDF_PAGES, body_key="long-pdf")
+    made.append({"library": "Books", "key": "book-long-pdf", "path": long_pdf,
+                 "pages": LONG_PDF_PAGES})
+
+    made += _build_epub2(os.path.join(root, EPUB2_FOLDER), cfg)
+
     # --- the formats that resolve and cannot be opened --------------------
     for stem, ext, key in UNOPENABLE_FILES:
         path = os.path.join(root, UNOPENABLE_FOLDER, f"{stem}.{ext}")
@@ -2117,6 +2335,90 @@ def build_books(root: str, cfg) -> list[dict]:
 
     made += _build_comics(os.path.join(root, COMICS_FOLDER), cfg)
     made += _build_audiobooks(root, cfg)
+    return made
+
+
+def _book_cover(folder: str, key: str, title: str, cfg) -> bytes | None:
+    """Draw a cover and return its bytes, or None if nothing could be drawn.
+
+    A hidden temporary beside the book, removed once it is embedded — a loose
+    image in a library folder would be an item in a photos library and clutter
+    in this one. The bytes go *inside* the EPUB, which is the whole point:
+    nothing draws artwork beside a book, so what the OPF declares is the only
+    image the item can ever have, and `EpubImageProvider` is the only thing
+    that can supply it (`provision.LOCAL_IMAGE_EXTRACTORS` names `Book` and
+    nothing else).
+
+    2:3 at 1200x1800, which is what `artwork.SPECS` calls a poster — a book's
+    Primary image is shaped like a movie's, not like an album's.
+    """
+    path = os.path.join(folder, f".{key}-cover.jpg")
+    if not artwork.draw("photo", key, title, path, cfg,
+                        size=(1200, 1800), stamp=False):
+        return None
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def _build_epub2(folder: str, cfg) -> list[dict]:
+    """The two EPUB 2.0.1 books, and everything OPF 2 can say that OPF 3 cannot."""
+    from . import books
+
+    os.makedirs(folder, exist_ok=True)
+    made = []
+
+    metadata = os.path.join(folder, f"{EPUB2_METADATA_STEM}.epub")
+    # Not skipped under `artwork_only`: unlike every other EPUB here this one
+    # *contains* artwork, so a redraw has something to change in it.
+    cover = _book_cover(folder, "epub2-cover", EPUB2_METADATA_NAME, cfg)
+    books.write_epub2(
+        metadata, EPUB2_METADATA_NAME, EPUB2_CREATORS[0][1],
+        chapters=[(f"Chapter {n}",
+                   books.paragraphs(f"{EPUB2_METADATA_NAME}:{n}", 8))
+                  for n in range(1, 7)],
+        scheme_ids=EPUB2_SCHEME_IDS,
+        series=EPUB2_SERIES, series_index=EPUB2_SERIES_INDEX,
+        sort_title=EPUB2_SORT_TITLE, rating=EPUB2_RATING,
+        description="An EPUB 2.0.1 package. Everything a client shows for "
+                    "this book beyond its filename — the series, the index, "
+                    "the rating, the sort title, the ISBN and the cover — is "
+                    "written in a spelling that only exists in OPF 2, so an "
+                    "EPUB 3 file cannot express any of it.",
+        publisher="Standard QA Press", subjects=EPUB2_SUBJECTS,
+        date=EPUB2_DATE, creators=((EPUB2_CREATORS[0][0],
+                                    EPUB2_CREATORS[0][1]),),
+        cover=cover)
+    made.append({"library": "Books", "key": "book-epub2-metadata",
+                 "path": metadata,
+                 "epub": {"version": "2.0", "title": EPUB2_METADATA_NAME,
+                          "spine": 6, "contents": "ncx",
+                          "cover": cover is not None}})
+
+    credits_path = os.path.join(folder, f"{EPUB2_CREDITS_STEM}.epub")
+    creators = [(role, written) for role, written, _shown, _kind
+                in EPUB2_CREATORS]
+    creators.append(EPUB2_JOINT_CREATOR[:2])
+    if not cfg.artwork_only or not os.path.exists(credits_path):
+        books.write_epub2(
+            credits_path, EPUB2_CREDITS_NAME, EPUB2_CREATORS[0][1],
+            chapters=[(f"Chapter {n}",
+                       books.paragraphs(f"{EPUB2_CREDITS_NAME}:{n}", 6))
+                      for n in range(1, 4)],
+            description="Ten `dc:creator` elements in one OPF 2 file, each "
+                        "with a MARC relator code the server maps onto a "
+                        "different PersonKind. Two of them are awkward on "
+                        "purpose: an unknown code falls through to Author "
+                        "rather than failing, and the last element holds a "
+                        "semicolon and becomes two people.",
+            creators=tuple(creators))
+    made.append({"library": "Books", "key": "book-epub2-credits",
+                 "path": credits_path,
+                 "epub": {"version": "2.0", "title": EPUB2_CREDITS_NAME,
+                          "spine": 3, "contents": "ncx", "cover": False}})
     return made
 
 
@@ -2182,6 +2484,18 @@ COMICS = [
      "dialect": "none", "credits_page": True, "named_cover": True,
      "why": "the same archive with cover.jpg added and nothing else changed, "
             "so the difference between the two covers is the rule"},
+    # Deliberately dialect "none": this one is about length and nothing else,
+    # so its name comes from its filename and its page count is exactly its
+    # page count. A `ComicInfo.xml` would add the entry-count off-by-one on
+    # top, and `The Signal Archive 003.cbz` already answers that question at a
+    # size where the arithmetic is easy to follow.
+    {"key": "cbz-long", "file": "A Three Hundred Page Comic 008.cbz",
+     "dialect": "none", "credits_page": False, "named_cover": True,
+     "pages": LONG_COMIC_PAGES, "tier": "standard",
+     "why": "three hundred pages: the only archive here big enough to make a "
+            "reader's paging, thumbnail strip and memory behaviour cost "
+            "something. Named cover, so the cover rule is not also being "
+            "asked to guess across three hundred entries"},
 ]
 
 # Which dialects put a member inside the archive, and which put one beside it.
@@ -2190,6 +2504,16 @@ COMICS = [
 DIALECTS_INSIDE = ("internal", "ignored")
 DIALECTS_BESIDE = ("external",)
 DIALECTS_IN_COMMENT = ("bookinfo",)
+
+
+def comic_pages(comic: dict) -> int:
+    """How many pages one archive holds. Most take the shared default."""
+    return comic.get("pages", COMIC_PAGES)
+
+
+def comic_tier(comic: dict) -> str:
+    """Which tier an archive appears in. Only the long one is not minimal."""
+    return comic.get("tier", "minimal")
 
 
 def comic_entries(comic: dict) -> list[str]:
@@ -2202,7 +2526,7 @@ def comic_entries(comic: dict) -> list[str]:
     names = []
     if comic["credits_page"]:
         names.append(SCAN_CREDITS_PAGE)
-    names += [f"{n:03d}.jpg" for n in range(1, COMIC_PAGES + 1)]
+    names += [f"{n:03d}.jpg" for n in range(1, comic_pages(comic) + 1)]
     if comic["named_cover"]:
         names.append("cover.jpg")
     if comic["dialect"] in DIALECTS_INSIDE:
@@ -2217,6 +2541,11 @@ def _build_comics(folder: str, cfg) -> list[dict]:
     os.makedirs(folder, exist_ok=True)
     made = []
     for comic in COMICS:
+        # Skipped entirely rather than built and left out of the manifest:
+        # `verify` reads the manifest, so an archive recorded but never drawn
+        # is a failure the next verify reports and nobody caused.
+        if not config.tier_includes(cfg.tier, comic_tier(comic)):
+            continue
         path = os.path.join(folder, comic["file"])
         entries = comic_entries(comic)
         made.append({"library": "Books", "key": comic["key"], "path": path,
@@ -2226,6 +2555,7 @@ def _build_comics(folder: str, cfg) -> list[dict]:
             continue
 
         pages = _comic_pages(folder, comic["key"], cfg,
+                             count=comic_pages(comic),
                              credits_page=comic["credits_page"])
         if not pages:
             continue

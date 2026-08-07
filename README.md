@@ -135,8 +135,12 @@ broadcast case) and an arbitrary 3:2 sample aspect MPEG-2 cannot express ·
 video with no audio · audio with no video · one-frame and three-hour runtimes ·
 a truncated file and a zero-byte file
 
-**Books** EPUB · PDF, whose page count is the only number a client can read
-back off a book · CBZ and CBT · the three comic metadata dialects, two of
+**Books** EPUB in **both dialects** — EPUB 3 with a nav document, and
+EPUB 2.0.1 with an NCX, calibre metadata, MARC relator roles and an embedded
+cover, none of which an EPUB 3 file can express · PDF, whose page count is the
+only number a client can read back off a book · **long form**: a twenty-four chapter EPUB with a real table
+of contents and a 240-page PDF, so a *reader* can be tested and not just a
+resolver · CBZ and CBT · the three comic metadata dialects, two of
 which the server reads **only** from a `.cbz` · both comic cover rules,
 including the one that picks the wrong page · `.azw3` and `.mobi`, which
 resolve with full metadata and which no client can open · **audiobooks in
@@ -698,11 +702,99 @@ with `cover.jpg` added and nothing else changed, so the difference between the
 two covers is the rule rather than the artwork.
 
 **Page counts are entry counts.** For a comic archive the server counts every
-non-directory entry, so an internal `ComicInfo.xml` makes a four-page comic
-report five. That is stated rather than corrected: a client showing five is
+non-directory entry, so an internal `ComicInfo.xml` makes a fifteen-page comic
+report sixteen. That is stated rather than corrected: a client showing five is
 reading the server correctly. A PDF is counted properly with PDFium, and an
 EPUB gets a flat `TimeSpan.TicksPerSecond` — page position in an EPUB is a
 percentage, not a page.
+
+### Long form
+
+Everything else on these shelves is a few sentences long. That is enough to
+test a **resolver** — which extension is accepted, which name is parsed from
+where — and nothing at all to test a **reader**, which is the other half of
+what a client does with a book.
+
+`Long Form/` holds two files, and it holds two rather than one deliberately:
+that is what makes each of them resolve from its own filename, and for the
+PDF the filename is the only thing that can name it, since nothing in the
+server reads a PDF's title.
+
+| Fixture | What it is for |
+| --- | --- |
+| `The Long Novel (2016).epub` | 24 chapters, 24 spine items, a real table of contents, an OPF 3 cover, ~35,000 words |
+| `The Long Manual (1998).pdf` | 240 pages against the shelf's six — the same parse, a page count forty times larger |
+
+The novel's **last five chapters are not Latin** — Cyrillic, Greek, Japanese,
+Hebrew and Arabic, taken from the same `subs.SCRIPTS` table the subtitle
+fixtures use. Font fallback in a reader fails exactly the way it fails in a
+subtitle renderer: tofu boxes where glyphs should be, and right-to-left text
+laid out left to right. Chapters 1–19 are Latin on purpose, because
+pagination is what the bulk of the book is for and a reader that cannot draw
+CJK would otherwise contaminate that measurement. Each script chapter's title
+carries both the English name and the script itself, so the table of contents
+is one more place the fallback shows — and stays readable when it fails.
+
+### The two EPUB dialects
+
+`OpfReader` never looks at the package `version`. It is a bag of XPaths, and
+roughly two thirds of them are OPF 2 spellings an EPUB 3 file has no way to
+express — so a shelf of EPUB 3 reaches `dc:title`, `dc:creator` and
+`dc:language` and leaves the rest of that file unexecuted.
+
+| What the server sets | Where it reads it |
+| --- | --- |
+| `SeriesName` | `<meta name="calibre:series">` — **OPF 2 only** |
+| `IndexNumber` | `<meta name="calibre:series_index">` — **OPF 2 only** |
+| `CommunityRating` | `<meta name="calibre:rating">` — **OPF 2 only** |
+| ISBN / Amazon / GoogleBooks | `dc:identifier[@opf:scheme=…]` — **OPF 2 only** |
+| people and their roles | `opf:role` on `dc:creator` — the OPF 2 attribute |
+| `ForcedSortName` | OPF 3 `file-as`/`refines`, **or** `calibre:title_sort` |
+| Primary image | OPF 3 `properties="cover-image"`, **or** `<meta name="cover">` |
+
+Both cover branches have a fixture, one each: the long novel carries the OPF 3
+spelling and `The Older Format (2004).epub` the OPF 2 one. Nothing draws
+artwork beside a book, so what the OPF declares is the only image the item can
+ever have — before these two, no book in the library had any.
+
+`Epub Two Dialect/` covers the OPF 2 column. `The Older Format (2004).epub`
+carries the metadata and the cover; `The Contributors (2006).epub` carries ten
+`dc:creator` elements covering **every `case` in `GetRole`** plus its default
+— including `ctb`, a real MARC relator the server has no case for, so a
+contributor is silently recorded as an author. It also covers the two name
+rewrites `FindAuthors` performs: `Adeyemi, Ada` becomes `Ada Adeyemi`, and
+`J.R.R. Nakamura` becomes `J. R. R. Nakamura`.
+
+It is the other half of the client story too. jellyfin-web pins
+`epubjs 0.3.93`, and its table of contents calls `book.navigation` — which
+resolves a **nav document** for EPUB 3 and an **NCX** for EPUB 2. Two separate
+parsers; only one had a fixture.
+
+**`SeriesName` on a Book has two unrelated sources** — the path, via
+`BookFileNameParser`, and `calibre:series`, via the OPF. Which one wins when
+both exist is **not measured**. These filenames deliberately carry no series
+so the OPF is unambiguously the source; the conflict case is still open.
+
+**Two branches of `ReadCoverPath` can never match.**
+`//opf:item[@id='cover' and @media-type='image/*']` and
+`//opf:item[@id='*cover-image']` are XPath string literals, not globs, and an
+`id` of `*cover-image` is not a well-formed NCName. Read from source, not
+measured against a server — noted here because they look like coverage and
+no fixture can reach them.
+
+**Every EPUB here was invalid until this shipped.** EPUB 3 requires a manifest
+item carrying `properties="nav"` — the navigation document — and a
+`<meta property="dcterms:modified">` in the package metadata. This tool wrote
+neither. Jellyfin never noticed and never will: `EpubProvider` reads
+`dc:title` out of the OPF and stops, so the files resolved, displayed and
+verified perfectly. What could not be tested was the client. With one spine
+item and no table of contents there is nothing to page through, no chapter to
+jump to and no TOC to draw — three of the four things an ebook reader does had
+no fixture at all. `verify` now re-reads every EPUB's version, spine length and
+table of contents, because nothing else in the pipeline would report their
+loss. Validity itself is checked with **epubcheck**, which the test suite runs
+when it is installed and skips when it is not — `apt install epubcheck`. It is
+a development tool, never a dependency.
 
 **A PDF is the one book type with no artwork at all.** There is no PDF image
 provider, so `The Standard Manual (1994).pdf` renders with whatever a client

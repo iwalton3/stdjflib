@@ -409,7 +409,8 @@ def cmd_verify(args) -> int:
           f"and {report.images} images against the shape their type calls for")
     if report.books:
         print(f"re-read {report.books} book(s) for the page count and cover "
-              f"the server would take from them")
+              f"the server would take from them, and the spine and table of "
+              f"contents a reader would take from them")
     if report.streams:
         print(f"re-read {report.streams} stream files for the URL Jellyfin "
               f"would take from each")

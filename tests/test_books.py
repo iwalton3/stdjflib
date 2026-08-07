@@ -18,6 +18,7 @@ be checked by probing with ffmpeg. Three kinds of check take its place:
 
 import os
 import re
+import shutil
 import unittest
 
 from stdjflib import books, libraries, recipes
@@ -425,6 +426,10 @@ def book_tree() -> dict:
         f"{libraries.BOOK_ALONE}.epub")
     for stem, ext, _key in libraries.UNOPENABLE_FILES:
         add(libraries.UNOPENABLE_FOLDER, f"{stem}.{ext}")
+    add(libraries.EPUB2_FOLDER, f"{libraries.EPUB2_METADATA_STEM}.epub")
+    add(libraries.EPUB2_FOLDER, f"{libraries.EPUB2_CREDITS_STEM}.epub")
+    add(libraries.LONG_BOOKS_FOLDER, f"{libraries.LONG_BOOK_STEM}.epub")
+    add(libraries.LONG_BOOKS_FOLDER, f"{libraries.LONG_PDF_STEM}.pdf")
     for comic in libraries.COMICS:
         add(libraries.COMICS_FOLDER, comic["file"])
         if comic["dialect"] in libraries.DIALECTS_BESIDE:
@@ -473,7 +478,9 @@ class TestFolderShapes(unittest.TestCase):
         """The filename parser is unreachable in a one-book folder, so a shelf
         that shrank to one file would take every naming case with it."""
         for folder in (libraries.BOOK_SHELF, libraries.COMICS_FOLDER,
-                       libraries.UNOPENABLE_FOLDER):
+                       libraries.UNOPENABLE_FOLDER,
+                       libraries.LONG_BOOKS_FOLDER,
+                       libraries.EPUB2_FOLDER):
             with self.subTest(folder):
                 self.assertGreater(len(supported(self.tree[folder])), 1)
 
@@ -615,7 +622,7 @@ class TestComicCovers(unittest.TestCase):
         reading the server correctly."""
         for comic in libraries.COMICS:
             entries = libraries.comic_entries(comic)
-            expect = libraries.COMIC_PAGES
+            expect = libraries.comic_pages(comic)
             expect += comic["credits_page"] + comic["named_cover"]
             expect += "ComicInfo.xml" in entries
             with self.subTest(comic["file"]):
@@ -811,6 +818,387 @@ class TestContainerTags(unittest.TestCase):
         text = generate._chapter_metadata(rec)
         self.assertIn(r"title=A\=B\; \#C", text)
         self.assertIn(r"album=X\\Y", text)
+
+
+# --------------------------------------------------------------------------
+# EPUB structure — the reader fixtures
+# --------------------------------------------------------------------------
+
+
+class TestEpubValidity(unittest.TestCase):
+    """EPUB 3 requires a navigation document and a `dcterms:modified`.
+
+    Jellyfin requires neither — `EpubProvider` reads `dc:title` out of the OPF
+    and stops — so every EPUB this tool wrote before these existed resolved,
+    displayed and verified perfectly while being an invalid EPUB with nothing
+    for a reader to page through. Nothing but a check like this notices.
+
+    Read back with `books.epub_structure`, which parses the OPF rather than
+    string-matching it, so a well-formedness regression fails here.
+    """
+
+    def _written(self, **kw):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "t.epub")
+        books.write_epub(path, kw.pop("title", "T"), kw.pop("author", "A"), **kw)
+        return path, books.epub_structure(path)
+
+    def test_the_default_single_chapter_epub_is_valid(self):
+        _path, got = self._written()
+        self.assertTrue(got["nav"], "EPUB 3 requires a nav document")
+        self.assertTrue(got["modified"], "EPUB 3 requires dcterms:modified")
+        self.assertEqual(got["spine"], 1)
+
+    def test_the_spine_is_the_chapter_count_exactly(self):
+        """The nav document is deliberately not in the spine, so the spine
+        length is the chapter count and nothing else."""
+        chapters = [(f"Chapter {n}", ["one", "two"]) for n in range(1, 8)]
+        _path, got = self._written(chapters=chapters)
+        self.assertEqual(got["spine"], 7)
+
+    def test_every_chapter_is_reachable_from_the_table_of_contents(self):
+        """A TOC entry pointing at a file that is not in the archive is a
+        chapter a reader cannot navigate to."""
+        import zipfile
+        chapters = [(f"Chapter {n}", ["body"]) for n in range(1, 5)]
+        path, _got = self._written(chapters=chapters)
+        with zipfile.ZipFile(path) as zf:
+            nav = zf.read("OEBPS/nav.xhtml").decode("utf-8")
+            names = set(zf.namelist())
+        for href in re.findall(r'<a href="([^"]+)"', nav):
+            with self.subTest(href):
+                self.assertIn(f"OEBPS/{href}", names)
+        self.assertEqual(len(re.findall(r'<a href="', nav)), 4)
+
+    def test_every_xml_member_is_well_formed(self):
+        import xml.etree.ElementTree as ET
+        import zipfile
+        path, _got = self._written(
+            title="Cloak & Dagger <b>", author="A & B",
+            chapters=[("Chapter & One", ["a < b", 'quote " here'])])
+        with zipfile.ZipFile(path) as zf:
+            for name in zf.namelist():
+                if name.endswith((".xhtml", ".opf", ".xml")):
+                    with self.subTest(name):
+                        ET.fromstring(zf.read(name))
+
+    def test_the_opf_three_cover_uses_the_properties_spelling(self):
+        """`ReadCoverPath` tries `properties="cover-image"` first and
+        `<meta name="cover">` last. The two writers must carry one each — if
+        this one drifted to the OPF 2 spelling, the first branch would lose
+        its only fixture and nothing would fail."""
+        import zipfile
+        path, got = self._written(cover=b"pretend-jpeg")
+        self.assertEqual(got["cover"], "OEBPS/cover.jpg")
+        with zipfile.ZipFile(path) as zf:
+            opf = zf.read("OEBPS/content.opf").decode("utf-8")
+        self.assertIn('properties="cover-image"', opf)
+        self.assertNotIn('<meta name="cover"', opf)
+
+    def test_an_epub_without_a_cover_declares_none(self):
+        """Most of the shelf has no cover, and a writer that invented one
+        would give every book artwork it was never asked for."""
+        _path, got = self._written()
+        self.assertIsNone(got["cover"])
+
+    def test_the_modified_date_is_the_epoch_and_not_the_clock(self):
+        """Two builds of one library must produce identical bytes, and a
+        `dcterms:modified` taken from `datetime.now()` is the easiest way to
+        break that without noticing."""
+        from stdjflib import config
+        _path, got = self._written()
+        self.assertEqual(got["modified"], config.EPOCH)
+
+    def test_two_builds_produce_identical_bytes(self):
+        import hashlib
+        chapters = libraries.long_book_chapters()
+        digests = set()
+        for _ in range(2):
+            path, _got = self._written(chapters=chapters)
+            with open(path, "rb") as fh:
+                digests.add(hashlib.sha256(fh.read()).hexdigest())
+        self.assertEqual(len(digests), 1)
+
+
+class TestLongForm(unittest.TestCase):
+    """The two fixtures that exist so a *reader* can be tested rather than a
+    resolver. Everything else on these shelves is a few sentences long."""
+
+    def test_the_long_book_embeds_the_name_its_filename_parses_to(self):
+        """Same rule as the shelf: `dc:title` beats the filename, so an EPUB
+        whose internal title disagreed would hide the parse."""
+        self.assertEqual(
+            libraries.LONG_BOOK_NAME,
+            parse_book_name(libraries.LONG_BOOK_STEM)["name"])
+
+    def test_the_long_pdf_parses_to_a_name_because_nothing_reads_a_pdf(self):
+        """No provider reads a PDF's title, so the filename is the only thing
+        that can name it — which is why both live in a folder holding two
+        books rather than one each."""
+        parsed = parse_book_name(libraries.LONG_PDF_STEM)
+        self.assertEqual(parsed["name"], libraries.LONG_PDF_NAME)
+        self.assertEqual(parsed["year"], 1998)
+
+    def test_the_chapter_count_matches_the_declared_one(self):
+        self.assertEqual(len(libraries.long_book_chapters()),
+                         libraries.LONG_BOOK_CHAPTERS)
+
+    def test_the_last_chapters_are_the_scripts_they_say_they_are(self):
+        """Font fallback in a reader is the same failure the subtitle fixtures
+        exist for. A chapter titled "Japanese" holding Latin text would look
+        like a passing test."""
+        from stdjflib import subs
+        chapters = libraries.long_book_chapters()
+        tail = chapters[-len(libraries.LONG_BOOK_SCRIPTS):]
+        for (script, english, native), (title, body) in zip(
+                libraries.LONG_BOOK_SCRIPTS, tail):
+            with self.subTest(script):
+                self.assertIn(english, title)
+                self.assertIn(native, title)
+                # Every sample line for that script must appear in the body.
+                for line in subs.sample_lines(script, script):
+                    self.assertIn(line.replace("\n", " "), " ".join(body))
+
+    def test_the_bulk_of_the_book_is_latin_so_pagination_is_measurable(self):
+        """A reader that cannot draw CJK would otherwise contaminate the one
+        thing the long book is mostly for."""
+        chapters = libraries.long_book_chapters()
+        latin = chapters[:-len(libraries.LONG_BOOK_SCRIPTS)]
+        self.assertGreater(len(latin), len(libraries.LONG_BOOK_SCRIPTS) * 3)
+        for title, body in latin:
+            with self.subTest(title):
+                self.assertTrue(" ".join(body).isascii())
+
+    def test_the_prose_is_derived_from_the_key_and_nothing_else(self):
+        """`random` seeded from the clock and `hash()` both look deterministic
+        within one run. Python salts string hashing per process, so `hash()`
+        differs between runs of the same program."""
+        self.assertEqual(books.paragraphs("k", 3), books.paragraphs("k", 3))
+        self.assertNotEqual(books.paragraphs("k", 3), books.paragraphs("j", 3))
+
+    def test_the_long_pdf_is_far_longer_than_the_short_one(self):
+        """The pair is the fixture: same folder shape, same parse, a page
+        count large enough that a client's paging costs something."""
+        short = [pages for _s, ext, _k, _t, pages, _w
+                 in libraries.BOOK_SHELF_FILES if ext == "pdf"]
+        self.assertTrue(short)
+        self.assertGreater(libraries.LONG_PDF_PAGES, max(short) * 10)
+
+
+class TestComicTiers(unittest.TestCase):
+    def test_only_the_long_comic_is_held_back_from_the_minimal_tier(self):
+        """Minimal promises to be quick and to download nothing. Three hundred
+        1200x1800 pages is sixteen megabytes and the one archive here big
+        enough to be worth gating."""
+        from stdjflib import config
+        for comic in libraries.COMICS:
+            with self.subTest(comic["file"]):
+                tier = libraries.comic_tier(comic)
+                self.assertEqual(
+                    tier != "minimal",
+                    libraries.comic_pages(comic) > libraries.COMIC_PAGES)
+                self.assertIn(tier, config.TIERS)
+
+    def test_the_long_comic_declares_the_entries_it_will_hold(self):
+        long = [c for c in libraries.COMICS if c["key"] == "cbz-long"][0]
+        entries = libraries.comic_entries(long)
+        self.assertEqual(len(entries), libraries.LONG_COMIC_PAGES + 1)
+        self.assertIn("cover.jpg", entries)
+        self.assertEqual(books.archive_cover(entries), "cover.jpg")
+
+
+# --------------------------------------------------------------------------
+# EPUB 2 — the dialect that reaches the other two thirds of OpfReader
+# --------------------------------------------------------------------------
+
+# `OpfReader.GetRole`, ported. Restated here rather than imported from
+# anywhere, on the same terms `BookFileNameParser` is ported above: the claim
+# each fixture row makes is checked against the switch it is aimed at rather
+# than against a comment. `default` is Author, which is why `ctb` — a real
+# MARC relator with no case — lands there.
+GET_ROLE = {
+    "arr": "Arranger", "art": "Artist",
+    "aut": "Author", "aqt": "Author", "aft": "Author", "aui": "Author",
+    "edt": "Editor", "ill": "Illustrator", "lyr": "Lyricist",
+    "mus": "AlbumArtist", "nrt": "Narrator", "oth": "Unknown",
+    "trl": "Translator",
+}
+
+
+def find_authors(text: str) -> list[str]:
+    r"""`OpfReader.FindAuthors`' name normalisation, ported.
+
+    Split on `;`, flip "Lastname, Firstname", then respace initials with
+    `(?<=\p{L})\.(?!\s|$)` — so `J.R.R. Nakamura` becomes
+    `J. R. R. Nakamura` and the final period, which is followed by a space,
+    is left alone.
+    """
+    out = []
+    for full in (part.strip() for part in text.split(";") if part.strip()):
+        parts = [p.strip() for p in full.split(",", 1) if p.strip()]
+        if len(parts) == 2:
+            full = f"{parts[1]} {parts[0]}"
+        out.append(re.sub(r"(?<=[^\W\d_])\.(?!\s|$)", ". ", full))
+    return out
+
+
+class TestEpub2Dialect(unittest.TestCase):
+    """`OpfReader` never checks the package version — it is a bag of XPaths,
+    and most of them are OPF 2 spellings an EPUB 3 file cannot express."""
+
+    def test_both_books_embed_the_name_their_filename_parses_to(self):
+        for stem, name in ((libraries.EPUB2_METADATA_STEM,
+                            libraries.EPUB2_METADATA_NAME),
+                           (libraries.EPUB2_CREDITS_STEM,
+                            libraries.EPUB2_CREDITS_NAME)):
+            with self.subTest(stem):
+                self.assertEqual(parse_book_name(stem)["name"], name)
+
+    def test_the_filenames_carry_no_series_so_the_opf_is_the_only_source(self):
+        """`calibre:series` has no OPF 3 spelling at all. If the filename also
+        carried a series there would be no way to tell which one a client
+        read."""
+        for stem in (libraries.EPUB2_METADATA_STEM,
+                     libraries.EPUB2_CREDITS_STEM):
+            with self.subTest(stem):
+                self.assertFalse(parse_book_name(stem)["series"])
+
+    def test_every_relator_code_is_one_the_server_maps(self):
+        roles = [role for role, _w, _s, _k in libraries.EPUB2_CREATORS]
+        roles.append(libraries.EPUB2_JOINT_CREATOR[0])
+        for role in roles:
+            with self.subTest(role):
+                self.assertEqual(GET_ROLE.get(role, "Author"),
+                                 self._expected_kind(role))
+
+    def _expected_kind(self, role):
+        for r, _w, _s, kind in libraries.EPUB2_CREATORS:
+            if r == role:
+                return kind
+        return "Author"
+
+    def test_the_table_covers_every_case_in_get_role(self):
+        """A table that exercised Author eleven times would look full."""
+        covered = {GET_ROLE.get(role, "Author")
+                   for role, _w, _s, _k in libraries.EPUB2_CREATORS}
+        self.assertEqual(covered, set(GET_ROLE.values()))
+
+    def test_one_row_is_a_valid_relator_the_server_has_no_case_for(self):
+        """The `default` arm. It has to be a *real* MARC relator: epubcheck
+        rejects an invalid one with OPF-052, so a nonsense code would make an
+        invalid EPUB rather than a fixture for the fallthrough."""
+        fallthrough = [role for role, _w, _s, _k in libraries.EPUB2_CREATORS
+                       if role not in GET_ROLE]
+        self.assertTrue(fallthrough)
+        for role in fallthrough:
+            with self.subTest(role):
+                self.assertEqual(self._expected_kind(role), "Author")
+
+    def test_the_declared_display_names_are_what_the_server_would_produce(self):
+        for role, written, shown, _kind in libraries.EPUB2_CREATORS:
+            with self.subTest(written):
+                self.assertEqual(find_authors(written), [shown])
+
+    def test_one_creator_element_becomes_two_people(self):
+        _role, written, expected = libraries.EPUB2_JOINT_CREATOR
+        self.assertEqual(find_authors(written), list(expected))
+
+    def test_the_initials_row_is_actually_respaced(self):
+        """A row whose written and shown forms were identical would pass
+        `test_the_declared_display_names...` while testing nothing."""
+        rows = [(w, s) for _r, w, s, _k in libraries.EPUB2_CREATORS if w != s]
+        self.assertTrue(any("." in w for w, _s in rows))
+
+    def test_a_subject_that_splits_into_two_genres_is_present(self):
+        """The server splits `dc:subject` on `/ & , ; -`, so one element can
+        become two genres. A table of single-word subjects would not show
+        that happening."""
+        self.assertTrue(any(any(sep in subject for sep in "/&,;")
+                            for subject in libraries.EPUB2_SUBJECTS))
+
+    def test_the_written_file_is_an_epub_two_with_an_ncx_and_no_nav(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "t.epub")
+        books.write_epub2(path, "T", "A",
+                          chapters=[("C1", ["x"]), ("C2", ["y"])])
+        got = books.epub_structure(path)
+        self.assertEqual(got["version"], "2.0")
+        self.assertEqual(got["spine"], 2)
+        self.assertTrue(got["ncx"], "EPUB 2's contents are an NCX")
+        self.assertFalse(got["nav"], "a nav document is the EPUB 3 spelling")
+
+    def test_the_opf_two_cover_is_found_the_way_the_server_finds_it(self):
+        """`<meta name="cover">` naming a manifest id — the OPF 2 spelling,
+        and the only reason any book in this library has artwork."""
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "t.epub")
+        books.write_epub2(path, "T", "A", cover=b"not-really-a-jpeg")
+        self.assertEqual(books.epub_structure(path)["cover"], "OEBPS/cover.jpg")
+        import zipfile
+        with zipfile.ZipFile(path) as zf:
+            opf = zf.read("OEBPS/content.opf").decode("utf-8")
+        self.assertIn('<meta name="cover" content="cover-image"/>', opf)
+        self.assertNotIn('properties="cover-image"', opf,
+                         "that is the OPF 3 spelling and the other writer's")
+
+
+@unittest.skipUnless(shutil.which("epubcheck"),
+                     "epubcheck is not installed (apt install epubcheck)")
+class TestEpubCheck(unittest.TestCase):
+    """Validate what the writers produce against the official W3C validator.
+
+    Gated on the binary being present, because the suite is standard-library
+    only and must keep passing on a machine that has never heard of Java.
+    epubcheck is a *development* tool here, never a dependency.
+
+    This is what caught both of the writers' real bugs: an EPUB 3 with no nav
+    document and no `dcterms:modified` (RSC-005, twice), and an `opf:role` of
+    `zzz` (OPF-052) in the first draft of the creators table.
+    """
+
+    def _check(self, path):
+        import subprocess
+        result = subprocess.run(["epubcheck", "-e", path],
+                                capture_output=True, text=True)
+        errors = [line for line in
+                  (result.stdout + result.stderr).splitlines()
+                  if line.startswith(("ERROR", "FATAL"))]
+        self.assertEqual(errors, [], f"{os.path.basename(path)} is not valid")
+
+    def test_the_epub_three_writer_produces_a_valid_epub(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "three.epub")
+        books.write_epub(path, "The Long Novel", "Long Form",
+                         chapters=libraries.long_book_chapters())
+        self._check(path)
+
+    def test_the_epub_two_writer_produces_a_valid_epub(self):
+        """Every OPF 2 field the fixtures use, so an invalid spelling is
+        caught here rather than in a library nobody validated. No cover: a
+        real JPEG needs ffmpeg, and this suite runs without it."""
+        import tempfile
+        creators = [(role, written)
+                    for role, written, _s, _k in libraries.EPUB2_CREATORS]
+        creators.append(libraries.EPUB2_JOINT_CREATOR[:2])
+        path = os.path.join(tempfile.mkdtemp(), "two.epub")
+        books.write_epub2(
+            path, libraries.EPUB2_METADATA_NAME, "Adeyemi, Ada",
+            chapters=[("Chapter 1", ["body"]), ("Chapter 2", ["body"])],
+            scheme_ids=libraries.EPUB2_SCHEME_IDS,
+            series=libraries.EPUB2_SERIES,
+            series_index=libraries.EPUB2_SERIES_INDEX,
+            sort_title=libraries.EPUB2_SORT_TITLE,
+            rating=libraries.EPUB2_RATING,
+            description="d", publisher="p",
+            subjects=libraries.EPUB2_SUBJECTS, date=libraries.EPUB2_DATE,
+            creators=tuple(creators))
+        self._check(path)
+
+    def test_the_default_one_chapter_epub_is_valid(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "d.epub")
+        books.write_epub(path, "The Standard Reference", "Ada Alvarez")
+        self._check(path)
 
 
 if __name__ == "__main__":
