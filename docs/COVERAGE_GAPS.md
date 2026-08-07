@@ -379,7 +379,7 @@ archive in the wild. Closing it means either a checked-in fixture or a
 hand-written RAR store-mode writer; the first breaks "everything is generated
 or licence-checked", the second is a real piece of work for one file.
 
-## The calibre:series conflict — SETTLED
+## The calibre:series conflict — SETTLED, and its successor closed
 
 A Book gets a `SeriesName` from its path via `BookFileNameParser` and another
 from `calibre:series` via the OPF. **The OPF wins, and so does its
@@ -399,12 +399,29 @@ only `Path`, `Id`, `ParentIndexNumber` and the two metadata-language fields.
 The target is therefore empty of both fields no matter what the filename said,
 and the OPF always lands.
 
-**What that leaves open.** `ParentIndexNumber` *is* in that copy list and
-`IndexNumber` is not, so the two should behave oppositely — a filename-parsed
-parent index ought to block an OPF one. Nothing here combines the two: the
-`v02 c015` fixture that produces a `ParentIndexNumber` is an EPUB 3 with no
-calibre metadata. Closing it is one more EPUB 2 whose filename carries a
-volume/chapter suffix and whose OPF names a different `calibre:series_index`.
+**The `ParentIndexNumber` successor question — CLOSED, and unreachable.**
+This section previously proposed one more fixture, reasoning that because
+`ParentIndexNumber` is in that copy list and `IndexNumber` is not, a
+filename-parsed parent index would block an OPF one. Both halves were wrong
+and no fixture was built:
+
+* **Nothing can conflict with it.** No provider in the tree sets
+  `ParentIndexNumber` on a Book. `OpfReader` maps `calibre:series_index` to
+  `IndexNumber`; `ComicInfoReader` maps `ComicInfo/Number` to `IndexNumber`
+  and never reads `ComicInfo/Volume` — a real ComicRack field Jellyfin
+  ignores entirely; `ComicBookInfoProvider` maps `Issue` to `IndexNumber` and
+  deserializes `Volume` without using it. `BookResolver` is the only writer.
+* **The asymmetry is not real either.** `RefreshMetadata` backfills the
+  item's own values into `temp` after the providers run
+  (`MergeData(metadata, temp, [], false, false)`), so every field the
+  providers left alone survives whether or not it was in the copy list.
+  Measured: `Adrift v02 c015.epub` comes back `ParentIndexNumber` 2 and
+  `IndexNumber` 15, and `IndexNumber` is not copied.
+
+The general rule that came out of it is worth more than the fixture would
+have been: **first writer into `temp` wins**, providers run before the
+backfill, so a provider value always beats a resolver value and a resolver
+value survives only where no provider spoke.
 
 ---
 

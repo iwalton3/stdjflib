@@ -214,27 +214,43 @@ stable across a second `FullRefresh`:
 Reading `BookMetadataService.MergeData` alone predicts the opposite — it is
 guarded by `replaceData || string.IsNullOrEmpty(target.Item.SeriesName)`, and
 `BookResolver` really does set `SeriesName` from the parse (or the parent
-folder) at resolve time. **That prediction was wrong**, and the reason is one
-line up the stack: `MetadataService.RefreshMetadata` does not merge into the
-resolved item at all. It builds
+folder) at resolve time. That prediction was wrong, and the reason is that
+`MetadataService.RefreshMetadata` merges **three** times, not once:
 
-```csharp
-var temp = new MetadataResult<TItemType> { Item = CreateNew() };
-temp.Item.Path = item.Path;
-temp.Item.Id = item.Id;
-temp.Item.ParentIndexNumber = item.ParentIndexNumber;
-```
+1. `var temp = new MetadataResult<T> { Item = CreateNew() }` — a fresh item
+   carrying only `Path`, `Id`, `ParentIndexNumber` and the two
+   metadata-language fields.
+2. every local provider's result is merged **into `temp`**, whose fields are
+   still empty, so each guard passes and the OPF value lands.
+3. `MergeData(metadata, temp, [], false, false)` — the **backfill**: the
+   existing item's own values are merged into `temp` with `replaceData: false`,
+   filling only what the providers did not set.
+4. `MergeData(temp, metadata, …, shouldReplace, true)` — `temp` is written
+   back over the item, and on an ordinary scan `shouldReplace` is *true*
+   (`MetadataRefreshMode.Default && !ReplaceAllMetadata`).
 
-— a **fresh** item carrying Path, Id, `ParentIndexNumber` and the two
-metadata-language fields, and nothing else. So `target.Item.SeriesName` is
-empty and `target.IndexNumber` is null whatever the resolver parsed, both
-guards pass, and the OPF lands. The filename values live on the real `item`
-and never enter that comparison.
+So the rule is **first writer into `temp` wins**, and providers always write
+before the backfill. A resolver value survives only where no provider spoke —
+which is exactly what the shelf shows: `Adrift v02 c015.epub` comes back
+`ParentIndexNumber` 2 and `IndexNumber` 15, both straight off the filename,
+because no provider touches either.
 
-Note which field is in that copy list and which is not: **`ParentIndexNumber`
-is carried across and `IndexNumber` is not**, so the two behave oppositely — a
-filename-parsed parent index *would* block an OPF one. Not measured; no
-fixture yet combines a `v02 c015` filename with calibre metadata.
+**`ParentIndexNumber` cannot be put in conflict at all, and the asymmetry that
+looked like it mattered does not exist.** An earlier note here reasoned that
+because `ParentIndexNumber` is in the step-1 copy list and `IndexNumber` is
+not, the two would behave oppositely. They do not: step 3 backfills every
+field the providers left alone, so the copy list is belt-and-braces rather
+than the thing that preserves the value — measured, `IndexNumber` is *not*
+copied and survives anyway.
+
+And there is nothing to conflict with regardless. **No provider in the tree
+sets `ParentIndexNumber` on a Book.** `OpfReader` maps `calibre:series_index`
+to `IndexNumber`; `ComicInfoReader` maps `ComicInfo/Number` to `IndexNumber`
+and never reads `ComicInfo/Volume` at all; `ComicBookInfoProvider` maps
+`Issue` to `IndexNumber` and deserializes `Volume` into its model without ever
+using it. `BookResolver` is the only writer, so a book's parent index is
+always its filename's. `books.comicinfo_xml` writes no `Volume` for the usual
+reason — write what has a `case`.
 
 The lesson is the one this file keeps relearning: a guard read in isolation
 says what it does, not what it sees.

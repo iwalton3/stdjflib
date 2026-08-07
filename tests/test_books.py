@@ -631,6 +631,22 @@ class TestComicCovers(unittest.TestCase):
 
 
 class TestComicInfoDialects(unittest.TestCase):
+    def test_no_volume_is_written_because_nothing_reads_one(self):
+        """`ComicInfo/Volume` is a real ComicRack field and Jellyfin never
+        reads it — `ComicInfoReader` maps only `Number`, onto `IndexNumber`,
+        and `ComicBookInfoProvider` deserializes `Volume` into its model and
+        never uses it. Writing one would be `outline` all over again: a field
+        that round-trips and looks like coverage.
+
+        It also means no provider anywhere sets `ParentIndexNumber` on a Book,
+        so a book's parent index is always its filename's.
+        """
+        xml = books.comicinfo_xml(
+            title="T", series="S", number=1, year=2000, summary="x",
+            publisher="P", genres=["A"], writer="W")
+        self.assertNotIn("Volume", xml)
+
+
     def test_comicinfo_uses_the_spellings_the_server_reads(self):
         xml = books.comicinfo_xml(
             title="T", series="S", number=1, year=2000, summary="x",
