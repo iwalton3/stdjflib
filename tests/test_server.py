@@ -415,3 +415,109 @@ class TestLiveTvConfigure(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             livetv.configure(None, "http://h", tuner_type="satellite")
+
+
+class _TaskApi:
+    """A server with one scheduled task, which runs for a few polls."""
+
+    def __init__(self, tasks=None, runs_for: int = 0):
+        self.tasks = [dict(t) for t in (tasks or [])]
+        self.runs_for = runs_for
+        self.posted = []
+        self.polls = 0
+
+    def scheduled_tasks(self):
+        self.polls += 1
+        out = []
+        for task in self.tasks:
+            state = "Running" if self.polls <= self.runs_for else "Idle"
+            out.append({**task, "State": state})
+        return out
+
+    def post(self, path, **kw):
+        self.posted.append(path)
+        return None
+
+
+def _no_sleep():
+    from unittest import mock
+
+    return mock.patch("stdjflib.jfapi.time.sleep")
+
+
+def _task_api(**kw):
+    """A real `Jellyfin` with only its two HTTP calls replaced, so the
+    methods under test are the shipped ones."""
+    from stdjflib.jfapi import Jellyfin
+
+    jf = Jellyfin("http://h")
+    stub = _TaskApi(**kw)
+    jf.scheduled_tasks = stub.scheduled_tasks
+    jf.post = stub.post
+    return jf, stub
+
+
+class TestScheduledTaskHelpers(unittest.TestCase):
+    """`Jellyfin.task`/`start_task`/`wait_for_task`, bound to real methods."""
+
+    def test_start_task_posts_to_the_tasks_id(self):
+        jf, stub = _task_api(tasks=[{"Key": "K", "Id": "abc"}])
+        self.assertTrue(jf.start_task("K"))
+        self.assertEqual(stub.posted, ["/ScheduledTasks/Running/abc"])
+
+    def test_a_missing_task_is_reported_not_posted(self):
+        """Absent is an answer: Live TV's tasks only exist once it is set up."""
+        jf, stub = _task_api(tasks=[{"Key": "Other", "Id": "abc"}])
+        self.assertFalse(jf.start_task("K"))
+        self.assertEqual(stub.posted, [])
+
+    def test_wait_polls_until_the_task_goes_idle(self):
+        jf, stub = _task_api(tasks=[{"Key": "K", "Id": "abc"}], runs_for=3)
+        with _no_sleep():
+            self.assertTrue(jf.wait_for_task("K", interval=0, settle=0))
+        self.assertEqual(stub.polls, 4)
+
+    def test_wait_gives_up_on_a_task_the_server_does_not_have(self):
+        jf, _ = _task_api(tasks=[])
+        with _no_sleep():
+            self.assertFalse(jf.wait_for_task("K", interval=0, settle=0))
+
+    def test_wait_for_scan_is_the_same_wait(self):
+        """One implementation, so a fix to the polling reaches both callers."""
+        from stdjflib import jfapi
+
+        jf, _ = _task_api(tasks=[{"Key": jfapi.SCAN_TASK, "Id": "abc"}])
+        seen = {}
+        jf.wait_for_task = lambda key, **kw: seen.setdefault("key", key)
+        jf.wait_for_scan()
+        self.assertEqual(seen["key"], jfapi.SCAN_TASK)
+
+
+class TestOptimizeDatabase(unittest.TestCase):
+    """The step that stops a freshly built server answering folder queries
+    with the planner statistics of an empty one."""
+
+    def test_it_runs_the_servers_own_task(self):
+        from stdjflib import jfapi, provision
+
+        jf, stub = _task_api(tasks=[{"Key": jfapi.OPTIMIZE_TASK, "Id": "opt"}])
+        with _no_sleep():
+            self.assertTrue(provision.optimize_database(
+                jf, say=lambda *_: None))
+        self.assertEqual(stub.posted, ["/ScheduledTasks/Running/opt"])
+
+    def test_a_server_without_the_task_is_survivable(self):
+        from stdjflib import provision
+
+        jf, stub = _task_api(tasks=[{"Key": "RefreshLibrary", "Id": "x"}])
+        said = []
+        with _no_sleep():
+            self.assertFalse(provision.optimize_database(jf, say=said.append))
+        self.assertEqual(stub.posted, [])
+        self.assertTrue(any("optimization task" in s for s in said))
+
+    def test_the_key_is_the_one_the_server_uses(self):
+        """`OptimizeDatabaseTask.Key`, not the class name and not a guess."""
+        from stdjflib import jfapi
+
+        self.assertEqual(jfapi.OPTIMIZE_TASK, "OptimizeDatabaseTask")

@@ -13,7 +13,7 @@ import os
 import time
 
 from . import boxsets, config, livetv
-from .jfapi import ApiError, Jellyfin
+from .jfapi import OPTIMIZE_TASK, ApiError, Jellyfin
 
 
 def _say(msg: str = "") -> None:
@@ -561,6 +561,32 @@ def disable_remote_providers(jf: Jellyfin) -> int:
     return len(options)
 
 
+def optimize_database(jf: Jellyfin, *, timeout: int = 600, say=_say) -> bool:
+    """Run the server's own VACUUM/ANALYZE, once the library is populated.
+
+    Jellyfin ANALYZEs right after migrations, which on a fresh server is
+    before anything has been scanned, so the statistics SQLite keeps say
+    BaseItems holds one row. Nothing corrects them until the six-hourly task
+    fires. Until it does, the planner costs a full scan of BaseItems at
+    nothing and plans the folder played/total count in the server's
+    `ItemCountService.GetPlayedAndTotalCountBatch` as two nested ones: any
+    query returning a Series, Season or BoxSet with user data attached then
+    takes ~4s flat, whatever the page size. Leaf-only queries are unaffected,
+    which is what makes it look like a client bug.
+
+    Cheap (~0.1s on the standard tier) and it has to happen after the scan,
+    so a server handed to a client is never left in that state.
+    """
+    if not jf.start_task(OPTIMIZE_TASK):
+        say("  ! no database optimization task; statistics left as they are")
+        return False
+    done = jf.wait_for_task(OPTIMIZE_TASK, timeout=timeout,
+                            interval=1.0, settle=1.0)
+    say("  planner statistics rebuilt" if done
+        else "  ! optimization did not finish in time")
+    return done
+
+
 def libraries_from_manifest(root: str) -> dict:
     """{folder: collection type} for what was actually built.
 
@@ -703,5 +729,10 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
         say("Item counts")
         for key, value in interesting:
             say(f"  {key:22} {value}")
+
+    # Last, because it is the state of the database as handed over that the
+    # statistics have to describe.
+    say("Optimizing the database")
+    result["optimized"] = optimize_database(jf, say=say)
 
     return result

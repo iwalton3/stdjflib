@@ -13,6 +13,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+#: Scheduled task keys, as the server spells them in its own `Key` property.
+SCAN_TASK = "RefreshLibrary"
+OPTIMIZE_TASK = "OptimizeDatabaseTask"
+
 CLIENT = "stdjflib"
 DEVICE = "provisioner"
 DEVICE_ID = "stdjflib-provisioner"
@@ -258,28 +262,50 @@ class Jellyfin:
     def scheduled_tasks(self) -> list:
         return self.get("/ScheduledTasks") or []
 
-    def wait_for_scan(self, timeout: int = 3600, interval: float = 3.0,
-                      on_progress=None) -> bool:
-        """Block until the library scan task stops running.
+    def task(self, key: str) -> dict | None:
+        """The scheduled task with this key, or None if there is no such task.
 
-        Polls the scheduled task rather than guessing, and gives the task a
-        moment to *start* first — asking immediately after triggering a
-        refresh reliably catches it Idle and returns straight away.
+        Absent is an answer rather than a failure: which tasks a server has
+        depends on what is configured on it and on its version.
         """
-        time.sleep(3)
+        return next((t for t in self.scheduled_tasks()
+                     if t.get("Key") == key), None)
+
+    def start_task(self, key: str) -> bool:
+        """Trigger a scheduled task. False if the server does not have it."""
+        task = self.task(key)
+        if task is None:
+            return False
+        self.post(f"/ScheduledTasks/Running/{task['Id']}", expect_json=False)
+        return True
+
+    def wait_for_task(self, key: str, timeout: int = 3600,
+                      interval: float = 3.0, settle: float = 3.0,
+                      on_progress=None) -> bool:
+        """Block until the named scheduled task stops running.
+
+        Polls the task rather than guessing, and gives it a moment to *start*
+        first — asking immediately after triggering one reliably catches it
+        Idle and returns straight away.
+        """
+        time.sleep(settle)
         deadline = time.time() + timeout
         while time.time() < deadline:
-            tasks = self.scheduled_tasks()
-            scan = next((t for t in tasks
-                         if t.get("Key") == "RefreshLibrary"), None)
-            if scan is None:
+            task = self.task(key)
+            if task is None:
                 return False
-            if scan.get("State") == "Idle":
+            if task.get("State") == "Idle":
                 return True
             if on_progress:
-                on_progress(scan.get("CurrentProgressPercentage") or 0.0)
+                on_progress(task.get("CurrentProgressPercentage") or 0.0)
             time.sleep(interval)
         return False
+
+    def wait_for_scan(self, timeout: int = 3600, interval: float = 3.0,
+                      on_progress=None) -> bool:
+        """Block until the library scan task stops running."""
+        return self.wait_for_task(SCAN_TASK, timeout=timeout,
+                                  interval=interval, on_progress=on_progress)
 
     def counts(self) -> dict:
         return self.get("/Items/Counts") or {}
