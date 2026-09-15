@@ -90,6 +90,82 @@ def find_web_client(source: str, extra: str | None = None) -> str | None:
     return None
 
 
+def server_arguments(state: str, web_dir: str | None,
+                     ffmpeg: str | None) -> list[str]:
+    """What the server is told, identically on the host and in a container.
+
+    Identical on purpose: the container mounts every one of these paths at
+    the place it has here, so one state directory works under either.
+    """
+    args = [
+        "--datadir", os.path.join(state, "data"),
+        "--configdir", os.path.join(state, "config"),
+        "--cachedir", os.path.join(state, "cache"),
+        "--logdir", os.path.join(state, "log"),
+        "--nonetchange",
+    ]
+    if web_dir:
+        args += ["--webdir", web_dir]
+    else:
+        args.append("--nowebclient")
+    if ffmpeg:
+        args += ["--ffmpeg", ffmpeg]
+    return args
+
+
+def write_network_config(state: str, port: int,
+                         addresses: tuple[str, ...]) -> int:
+    """Pin the port before first start, and the bind addresses every start.
+
+    Returns the port the server will listen on, which is the file's rather
+    than `port` once a server has written it.
+
+    The server writes `network.xml` on first run and then treats it as the
+    source of truth, so setting the port afterwards means restarting.
+
+    The addresses are rewritten into an existing file too, because that is
+    the only thing that decides them: Kestrel listens on
+    `NetworkManager.GetAllBindInterfaces`, which is `LocalNetworkAddresses`
+    or, when that is empty, every interface. A `Kestrel__*` environment
+    variable is never consulted. An admin can install a plugin, so an
+    existing state directory is corrected rather than left on the LAN.
+
+    In a container `addresses` must be empty and the publish decides who can
+    connect. Measured: bound to 127.0.0.1 inside the container's namespace,
+    every connection through a `-p 127.0.0.1:...` publish is reset.
+    """
+    path = os.path.join(state, "config", "network.xml")
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<NetworkConfiguration '
+                'xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+                'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n'
+                f"  <InternalHttpPort>{port}</InternalHttpPort>\n"
+                f"  <PublicHttpPort>{port}</PublicHttpPort>\n"
+                "  <EnableHttps>false</EnableHttps>\n"
+                "  <RequireHttps>false</RequireHttps>\n"
+                "  <AutoDiscovery>false</AutoDiscovery>\n"
+                "  <EnableUPnP>false</EnableUPnP>\n"
+                "  <EnableRemoteAccess>true</EnableRemoteAccess>\n"
+                "  <LocalNetworkAddresses />\n"
+                "</NetworkConfiguration>\n")
+
+    tree = ElementTree.parse(path)
+    element = tree.getroot().find("LocalNetworkAddresses")
+    if element is None:
+        element = ElementTree.SubElement(tree.getroot(), "LocalNetworkAddresses")
+    element.clear()
+    for address in addresses:
+        ElementTree.SubElement(element, "string").text = address
+    tree.write(path, encoding="utf-8", xml_declaration=True)
+
+    internal = tree.getroot().findtext("InternalHttpPort")
+    return int(internal) if internal and internal.strip().isdigit() else port
+
+
 class Instance:
     """A running server, and the directories it owns."""
 
@@ -117,22 +193,8 @@ class Instance:
         return os.path.join(self.state, "server.out")
 
     def argv(self) -> list[str]:
-        dotnet = find_dotnet()
-        argv = [
-            dotnet, self.dll,
-            "--datadir", os.path.join(self.state, "data"),
-            "--configdir", os.path.join(self.state, "config"),
-            "--cachedir", os.path.join(self.state, "cache"),
-            "--logdir", os.path.join(self.state, "log"),
-            "--nonetchange",
-        ]
-        if self.web_dir:
-            argv += ["--webdir", self.web_dir]
-        else:
-            argv.append("--nowebclient")
-        if self.ffmpeg:
-            argv += ["--ffmpeg", self.ffmpeg]
-        return argv
+        return [find_dotnet(), self.dll,
+                *server_arguments(self.state, self.web_dir, self.ffmpeg)]
 
     def start(self) -> None:
         for sub in ("data", "config", "cache", "log"):
@@ -146,46 +208,7 @@ class Instance:
             start_new_session=True)
 
     def _write_network_config(self) -> None:
-        """Pin the port before first start, and the bind addresses every start.
-
-        The server writes `network.xml` on first run and then treats it as the
-        source of truth, so setting the port afterwards means restarting.
-
-        The addresses are rewritten into an existing file too, because that
-        is the only thing that decides them: Kestrel listens on
-        `NetworkManager.GetAllBindInterfaces`, which is `LocalNetworkAddresses`
-        or, when that is empty, every interface. A `Kestrel__*` environment
-        variable is never consulted. An admin can install a plugin, so an
-        existing state directory is corrected rather than left on the LAN.
-        """
-        path = os.path.join(self.state, "config", "network.xml")
-        if not os.path.exists(path):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    '<?xml version="1.0" encoding="utf-8"?>\n'
-                    '<NetworkConfiguration '
-                    'xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
-                    'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n'
-                    f"  <InternalHttpPort>{self.port}</InternalHttpPort>\n"
-                    f"  <PublicHttpPort>{self.port}</PublicHttpPort>\n"
-                    "  <EnableHttps>false</EnableHttps>\n"
-                    "  <RequireHttps>false</RequireHttps>\n"
-                    "  <AutoDiscovery>false</AutoDiscovery>\n"
-                    "  <EnableUPnP>false</EnableUPnP>\n"
-                    "  <EnableRemoteAccess>true</EnableRemoteAccess>\n"
-                    "  <LocalNetworkAddresses />\n"
-                    "</NetworkConfiguration>\n")
-
-        tree = ElementTree.parse(path)
-        addresses = tree.getroot().find("LocalNetworkAddresses")
-        if addresses is None:
-            addresses = ElementTree.SubElement(tree.getroot(),
-                                               "LocalNetworkAddresses")
-        addresses.clear()
-        for address in self.listen:
-            ElementTree.SubElement(addresses, "string").text = address
-        tree.write(path, encoding="utf-8", xml_declaration=True)
+        write_network_config(self.state, self.port, self.listen)
 
     def alive(self) -> bool:
         return self.process is not None and self.process.poll() is None

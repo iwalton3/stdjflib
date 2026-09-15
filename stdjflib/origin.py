@@ -261,16 +261,26 @@ def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
-def describe_reachability(base_url: str, *, from_container: str | None = None):
+def describe_reachability(base_url: str, *, from_container: str | None = None,
+                          via_loopback: bool = False):
     """Whether a server will be able to fetch from `base_url`. `(ok, why)`.
 
     This is the check that stops a containerised run from scanning a library
     of items that resolve, look right, and never play — the same failure
     `livetv.py` describes, except that here the URL was written into the files
     at build time and cannot be corrected at startup.
+
+    `via_loopback` is a podman container with the origin's port forwarded to
+    host loopback: there a loopback URL is the one that works, and a library
+    built for the old `host.containers.internal` route is the one that fails.
     """
     host = base_url.split("://", 1)[-1].split(":", 1)[0].split("/", 1)[0]
     loopback = host in ("127.0.0.1", "localhost", "::1", "[::1]")
+    if via_loopback and not loopback:
+        return False, (
+            f"the stream fixtures name {base_url}, but the origin now listens "
+            f"on 127.0.0.1 and is forwarded into the container there. Rebuild "
+            f"without --stream-origin for the origin fixtures to play.")
     if from_container and loopback:
         return False, (
             f"the stream fixtures name {base_url}, and inside a container "

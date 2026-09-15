@@ -12,8 +12,11 @@ created successfully and then scan to zero items.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
+
+from . import jfserver
 
 RUNTIMES = ("podman", "docker")
 
@@ -76,15 +79,19 @@ class Container:
     def __init__(self, library: str, state: str, *, runtime: str = "podman",
                  image: str = DEFAULT_IMAGE, name: str = DEFAULT_NAME,
                  port: int = 8096, extra_args: tuple[str, ...] = (),
-                 listen: tuple[str, ...] = (), verbose: bool = False):
+                 listen: tuple[str, ...] = (),
+                 host_loopback_ports: tuple[int, ...] = (),
+                 verbose: bool = False):
         self.library = os.path.abspath(library)
         self.state = os.path.abspath(state)
         self.runtime = runtime
         self.image = image
         self.name = name
         self.port = port
+        self.container_port = 8096
         self.listen = ("127.0.0.1",
                        *(a for a in listen if a != "127.0.0.1"))
+        self.host_loopback_ports = tuple(host_loopback_ports)
         self.extra_args = tuple(extra_args)
         self.verbose = verbose
 
@@ -141,22 +148,48 @@ class Container:
 
     def remove(self) -> None:
         if self.exists():
-            self._run("rm", "-f", self.name, check=False)
+            # `-v` takes the anonymous volumes the image's VOLUME lines create
+            # for whatever is not bind-mounted over them — /config and /cache
+            # under `serve` — which would otherwise pile up two per run.
+            self._run("rm", "-f", "-v", self.name, check=False)
 
     def pull(self) -> None:
         self._run("pull", self.image, capture=not self.verbose)
 
     # -- lifecycle --------------------------------------------------------
 
-    def argv(self) -> list[str]:
-        args = ["run", "-d", "--name", self.name]
-        # A bare `-p PORT:8096` publishes on every interface.
-        for address in self.listen:
-            args += ["-p", f"{address}:{self.port}:8096"]
-        args += [
+    def _volumes(self) -> list[str]:
+        return [
             "-v", _mount(os.path.join(self.state, "config"), CONFIG_MOUNT),
             "-v", _mount(os.path.join(self.state, "cache"), CACHE_MOUNT),
             "-v", _mount(self.library, MEDIA_MOUNT, read_only=True),
+        ]
+
+    def _command(self) -> list[str]:
+        """Arguments after the image, for its entrypoint."""
+        return []
+
+    def _prepare_state(self) -> None:
+        for sub in ("config", "cache"):
+            os.makedirs(os.path.join(self.state, sub), exist_ok=True)
+
+    def argv(self) -> list[str]:
+        args = ["run", "-d", "--name", self.name]
+        if self.host_loopback_ports:
+            # pasta's -T forwards the container's own 127.0.0.1:PORT to the
+            # host's, so faketvsource and the origin can listen on loopback and
+            # URLs baked as 127.0.0.1 still work inside. Measured: without it
+            # the connection is refused. Docker has no equivalent.
+            if self.runtime != "podman":
+                raise ContainerError("forwarding host loopback into a "
+                                     "container needs podman's pasta")
+            args += ["--network", "pasta:" + ",".join(
+                f"-T,{port}" for port in self.host_loopback_ports)]
+        # A bare `-p PORT:8096` publishes on every interface.
+        for address in self.listen:
+            args += ["-p", f"{address}:{self.port}:{self.container_port}"]
+        args += self._volumes()
+        args += [
             # The image's own healthcheck curls localhost; nothing here uses
             # it, and on some hosts it spams the journal. Keep the run quiet.
             "--stop-timeout", "30",
@@ -171,11 +204,11 @@ class Container:
             pass
         args += list(self.extra_args)
         args.append(self.image)
+        args += self._command()
         return args
 
     def start(self, *, replace: bool = True) -> str:
-        for sub in ("config", "cache"):
-            os.makedirs(os.path.join(self.state, sub), exist_ok=True)
+        self._prepare_state()
         if replace:
             self.remove()
         elif self.exists():
@@ -211,18 +244,78 @@ class Container:
         """
         probe = [
             "run", "--rm",
-            "-v", _mount(self.library, MEDIA_MOUNT, read_only=True),
+            "-v", _mount(self.library, self.media_root, read_only=True),
             "--entrypoint", "/bin/sh", self.image,
-            "-c", f"ls {MEDIA_MOUNT} | head -20",
+            "-c", f"ls {shlex.quote(self.media_root)} | head -20",
         ]
         proc = self._run(*probe, check=False)
         listing = [line for line in (proc.stdout or "").splitlines() if line.strip()]
         if proc.returncode != 0:
             return False, (proc.stderr or proc.stdout or "").strip()[-400:]
         if not listing:
-            return False, (f"the container sees {MEDIA_MOUNT} as empty. "
+            return False, (f"the container sees {self.media_root} as empty. "
                            f"If {self.library} is on sshfs or another FUSE "
                            f"mount, the container may not be able to traverse "
                            f"it — build a library on local disk and point at "
                            f"that instead.")
         return True, ", ".join(listing[:8])
+
+
+class SourceBuiltServer(Container):
+    """A `jfbuild` publish, run in the official image in place of its server.
+
+    Every path is mounted where it is on the host — the state, the library,
+    the web bundle — and the server gets `jfserver.server_arguments` for them,
+    exactly as `serve --on-host` does. So one state directory serves both:
+    library paths, item ids (a hash of the path), recorded image paths and the
+    admin password mean the same on either side.
+
+    Only the server comes from the build. The runtime libraries and
+    jellyfin-ffmpeg are the image's, and its `JELLYFIN_FFMPEG` beats whatever
+    `encoding.xml` recorded from an `--on-host` run: `MediaEncoder.
+    SetFFmpegPath` takes a command line or environment path before the file.
+    """
+
+    def __init__(self, library: str, state: str, publish: str, *,
+                 web_dir: str | None = None, port: int = 8096, **kw):
+        kw.setdefault("name", f"stdjflib-serve-{port}")
+        super().__init__(library, state, port=port, **kw)
+        self.publish = os.path.abspath(publish)
+        self.web_dir = os.path.abspath(web_dir) if web_dir else None
+        self.container_port = port
+
+    @property
+    def media_root(self) -> str:
+        return self.library
+
+    def _volumes(self) -> list[str]:
+        volumes = [
+            "-v", _mount(self.state, self.state),
+            "-v", _mount(self.library, self.library, read_only=True),
+            # Over the image's own server; its entrypoint is /jellyfin/jellyfin.
+            "-v", _mount(self.publish, "/jellyfin", read_only=True),
+        ]
+        if self.web_dir:
+            volumes += ["-v", _mount(self.web_dir, self.web_dir, read_only=True)]
+        return volumes
+
+    def _command(self) -> list[str]:
+        return jfserver.server_arguments(self.state, self.web_dir, None)
+
+    def _prepare_state(self) -> None:
+        for sub in ("data", "config", "cache", "log"):
+            os.makedirs(os.path.join(self.state, sub), exist_ok=True)
+        self.container_port = jfserver.write_network_config(self.state,
+                                                            self.port, ())
+
+    @property
+    def log_path(self) -> str:
+        """The server's own log directory, mounted where it is on the host."""
+        return os.path.join(self.state, "log")
+
+    def log_tail(self, lines: int = 25) -> str:
+        return self.logs(lines)
+
+    def stop(self) -> None:
+        super().stop()
+        self.remove()

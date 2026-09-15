@@ -478,14 +478,25 @@ version would cost.
 `serve` compiles Jellyfin from a source checkout (`--source`, default
 `~/Desktop/jellyfin`), runs it against a disposable state directory, completes
 the first-run wizard, creates a library per folder, creates the test accounts,
-triggers a scan and waits for it. Roughly 30 seconds to build and a few minutes
+triggers a scan and waits for it. Roughly 45 seconds to build and a few minutes
 to scan 4,700 items. `provision` does everything except the running, against a
 server you already have.
 
-Nothing is written into the Jellyfin checkout — the build goes to a separate
-`--artifacts-path`. That is not just tidiness: a checkout that was ever built
-as root has root-owned `obj/` directories, and an in-tree build then dies with
-"Permission denied" on a path that does not explain itself. Deleting the state
+**Both the build and the server run in rootless podman.** The checkout is
+built in the .NET SDK image with the same isolation as the web client below —
+read-only source, no capabilities — because NuGet packages run build steps as
+whoever builds. The result is mounted over the server inside the official
+`jellyfin/jellyfin` image (`--image` to pin one), so the runtime and
+jellyfin-ffmpeg come from there. Anything that goes wrong in the server stays
+in a user namespace that can read the library but not write it. With no podman
+`serve` stops and says so; `--on-host` builds with `dotnet` and runs the server
+directly on this machine instead, as before, and the two share one state
+directory, because everything is mounted at the path it has on the host.
+
+Nothing is written into the Jellyfin checkout. The container build copies it
+out first; `--on-host` builds to a separate `--artifacts-path`, because a
+checkout that was ever built as root has root-owned `obj/` directories and an
+in-tree build dies on them with "Permission denied". Deleting the state
 directory gives a factory-fresh server, which is the state most worth being
 able to reach on demand.
 
@@ -503,9 +514,9 @@ finishes, and also written to `servers/<port>.json` under the same temp
 directory for test harnesses to read. A server set up with the old fixed
 password gets it swapped on its next run. Jellyfin, faketvsource and the
 stream origin listen on `127.0.0.1` only; `--listen ADDR` adds an address for
-Jellyfin, such as `192.168.122.1` for a libvirt VM. Under `container`,
-faketvsource and the origin still listen everywhere, because the container
-reaches the host by its address rather than by loopback.
+Jellyfin, such as `192.168.122.1` for a libvirt VM. Under podman the
+container is given those two ports on its own loopback, forwarded to the
+host's; only a Docker `container` needs them listening everywhere.
 
 ### The browser UI, built where npm cannot reach you
 

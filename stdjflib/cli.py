@@ -11,8 +11,8 @@ import signal
 import sys
 import time
 
-from . import (build, catalog, config, container, fetch, ff, jfserver,
-               livetv, origin, provision, recipes, verify, web)
+from . import (build, catalog, config, container, fetch, ff, jfbuild,
+               jfserver, livetv, origin, provision, recipes, verify, web)
 from .jfapi import Jellyfin
 
 DEFAULT_ROOT = os.environ.get("STDJFLIB_ROOT", "")
@@ -81,8 +81,10 @@ def _parser() -> argparse.ArgumentParser:
                    help=(f"base URL the local-origin .strm fixtures should "
                          f"name (default: {origin.default_base_url()}). It is "
                          f"written into the files, so set it here if Jellyfin "
-                         f"will not be on this machine — a container wants "
-                         f"http://host.containers.internal:{origin.DEFAULT_PORT}."))
+                         f"will not be on this machine. Podman containers "
+                         f"reach the default through forwarded loopback; a "
+                         f"Docker one wants http://host.docker.internal:"
+                         f"{origin.DEFAULT_PORT}."))
 
     a = common(sub.add_parser(
         "artwork",
@@ -173,6 +175,15 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--listen", **_LISTEN)
     s.add_argument("--no-build", action="store_true",
                    help="use the existing build instead of compiling")
+    s.add_argument("--on-host", action="store_true",
+                   help="build with dotnet and run the server directly on "
+                        "this machine, as you, instead of in rootless podman. "
+                        "NuGet's build steps and the server itself then run "
+                        "with your home directory in reach.")
+    s.add_argument("--image", default=container.DEFAULT_IMAGE,
+                   help="image the source build runs in (not with --on-host): "
+                        "its runtime libraries and jellyfin-ffmpeg, with the "
+                        "server from --source mounted over its own")
     s.add_argument("--artifacts", default=None,
                    help="build output directory (default: alongside --state). "
                         "Never inside the Jellyfin checkout.")
@@ -537,8 +548,19 @@ def _start_faketv(args, state: str, public_host: str | None,
     return fake, fake.public_url
 
 
+def _loopback_ports(args, root: str) -> tuple[int, ...]:
+    """Host ports a podman container needs forwarded to reach what runs here."""
+    ports = []
+    if getattr(args, "live_tv", False):
+        ports.append(args.faketv_port)
+    base = build.read_manifest(root).get("stream_origin")
+    if base and not getattr(args, "no_stream_origin", False):
+        ports.append(origin.port_of(base))
+    return tuple(ports)
+
+
 def _start_origin(args, root: str, *, from_container: str | None = None,
-                  bind: str = "0.0.0.0"):
+                  bind: str = "0.0.0.0", via_loopback: bool = False):
     """Serve the local `.strm` origin, if this library has one.
 
     Returns the running server or None. Never fatal: a library built before
@@ -555,7 +577,8 @@ def _start_origin(args, root: str, *, from_container: str | None = None,
     if not files:
         return None
 
-    ok, why = origin.describe_reachability(base, from_container=from_container)
+    ok, why = origin.describe_reachability(base, from_container=from_container,
+                                           via_loopback=via_loopback)
     if not ok:
         print(f"  ! {why}", flush=True)
     if origin.port_in_use(server.port):
@@ -655,6 +678,12 @@ def _serve(args) -> int:
     state = os.path.abspath(args.state or config.runtime_dir(root, "jellyfin"))
     artifacts = os.path.abspath(args.artifacts or state + "-build")
 
+    if not args.on_host and not web.engine():
+        print("serve builds and runs Jellyfin in rootless podman, and there is "
+              "no podman on PATH. Install it, or pass --on-host to build and "
+              "run the server on this machine as you.", file=sys.stderr)
+        return 1
+
     if args.fresh and os.path.isdir(state):
         print(f"Removing {state}")
         shutil.rmtree(state)
@@ -672,20 +701,9 @@ def _serve(args) -> int:
                   f"Stop it, or pass --port.", file=sys.stderr)
             return 1
 
-    dll = jfserver.dll_path(artifacts)
-    if args.no_build:
-        if not os.path.exists(dll):
-            print(f"No build at {dll}; drop --no-build to compile it.",
-                  file=sys.stderr)
-            return 1
-    else:
-        print(f"Building Jellyfin from {args.source}")
-        print(f"  output -> {artifacts}  (nothing is written into the checkout)")
-        try:
-            dll = jfserver.build(args.source, artifacts, verbose=args.verbose)
-        except RuntimeError as exc:
-            print(f"\n{exc}", file=sys.stderr)
-            return 1
+    server_build = _build_server(args, artifacts)
+    if server_build is None:
+        return 1
 
     # Before the server starts, because the bundle is an argument to it. The
     # build is cached on the jellyfin-web commit, so this is a no-op on every
@@ -695,23 +713,46 @@ def _serve(args) -> int:
                                             or config.runtime_dir(root, "jellyfin-web")),
                             enabled=not args.no_web, verbose=args.verbose)
     found = jfserver.find_web_client(args.source, built)
-    instance = jfserver.Instance(dll, state, port=args.port, web_dir=found,
-                                 ffmpeg=shutil.which("ffmpeg"),
-                                 listen=tuple(args.listen),
-                                 verbose=args.verbose)
+    if args.on_host:
+        instance = jfserver.Instance(server_build, state, port=args.port,
+                                     web_dir=found,
+                                     ffmpeg=shutil.which("ffmpeg"),
+                                     listen=tuple(args.listen),
+                                     verbose=args.verbose)
+    else:
+        instance = container.SourceBuiltServer(
+            root, state, server_build, web_dir=found, image=args.image,
+            port=args.port, listen=tuple(args.listen),
+            host_loopback_ports=_loopback_ports(args, root),
+            verbose=args.verbose)
     # Before the server starts: a fresh state's wizard uses this, so it has to
     # be on disk before anything can depend on it.
     password, password_path = _admin_password(args, state)
     print(f"Starting the server on {instance.url}")
     if len(instance.listen) > 1:
         print(f"  also listening on {', '.join(instance.listen[1:])}")
+    where = ("this machine (--on-host)" if args.on_host
+             else f"rootless podman, {args.image}")
+    print(f"  in    {where}")
     print(f"  state {state}")
     print(f"  web   {found or 'not built, running --nowebclient'}")
     print(f"        {why}")
     if not found:
         print("        (the API is all a client needs; the browser UI is for "
               "looking at the library yourself)")
-    instance.start()
+    try:
+        if not args.on_host:
+            # Same reason as `container`: a library the container cannot read
+            # scans to nothing and looks like a Jellyfin fault.
+            ok, detail = instance.check_library_visible()
+            if not ok:
+                print(f"\nThe container cannot read the library.\n  {detail}",
+                      file=sys.stderr)
+                return 1
+        instance.start()
+    except container.ContainerError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 1
 
     fake = None
     origin_server = None
@@ -719,7 +760,8 @@ def _serve(args) -> int:
         # Both processes are on this machine, so loopback is what the server
         # should use — and all either of them needs to listen on.
         fake, live_tv_url = _start_faketv(args, state, None, bind="127.0.0.1")
-        origin_server = _start_origin(args, root, bind="127.0.0.1")
+        origin_server = _start_origin(args, root, bind="127.0.0.1",
+                                      via_loopback=not args.on_host)
         jf = Jellyfin(instance.url)
         try:
             provision.provision(jf, root, still_alive=instance.alive,
@@ -756,6 +798,51 @@ def _serve(args) -> int:
         if fake:
             fake.stop()
         instance.stop()
+
+
+def _build_server(args, artifacts: str) -> str | None:
+    """The jellyfin.dll for --on-host, the publish directory otherwise.
+
+    None once it has said why there is nothing to run.
+    """
+    if args.on_host:
+        dll = jfserver.dll_path(artifacts)
+        if args.no_build:
+            if not os.path.exists(dll):
+                print(f"No build at {dll}; drop --no-build to compile it.",
+                      file=sys.stderr)
+                return None
+            return dll
+        print(f"Building Jellyfin from {args.source} on this machine")
+        print(f"  output -> {artifacts}  (nothing is written into the checkout)")
+        try:
+            return jfserver.build(args.source, artifacts, verbose=args.verbose)
+        except RuntimeError as exc:
+            print(f"\n{exc}", file=sys.stderr)
+            return None
+
+    publish = jfbuild.publish_dir(artifacts)
+    if args.no_build:
+        if not os.path.exists(os.path.join(publish, "jellyfin")):
+            print(f"No build at {publish}; drop --no-build to compile it.",
+                  file=sys.stderr)
+            return None
+        return publish
+    if not jfserver.looks_like_jellyfin(args.source):
+        print(f"{args.source} does not look like a Jellyfin checkout "
+              f"(no Jellyfin.Server/Jellyfin.Server.csproj)", file=sys.stderr)
+        return None
+    if jfbuild.is_current(artifacts, args.source):
+        print(f"Jellyfin build is current "
+              f"({web.revision(args.source)[:10]}, {publish})")
+        return publish
+    print(f"Building Jellyfin from {args.source}")
+    print(f"  output -> {artifacts}")
+    try:
+        return jfbuild.build(args.source, artifacts, verbose=args.verbose)
+    except jfbuild.BuildFailed as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return None
 
 
 def _print_connection(url: str, password: str, published: str | None) -> None:
@@ -810,6 +897,8 @@ def _container_run(args) -> int:
                               name=args.name, port=args.port,
                               extra_args=tuple(args.extra_args),
                               listen=tuple(args.listen),
+                              host_loopback_ports=(_loopback_ports(args, root)
+                                                   if runtime == "podman" else ()),
                               verbose=args.verbose)
     password, password_path = _admin_password(args, state)
     # Flushed, because stderr is unbuffered and stdout is not when piped —
@@ -843,17 +932,22 @@ def _container_run(args) -> int:
     fake = None
     origin_server = None
     try:
-        # faketvsource runs on the host; inside the container, 127.0.0.1 is the
-        # container itself. Podman and Docker each publish a different name for
-        # "the host", and neither resolves outside a container.
-        fake, live_tv_url = _start_faketv(
-            args, state, livetv.HOST_FROM_CONTAINER.get(runtime))
-        # The origin has the same problem and cannot be fixed the same way:
-        # its URL is already inside the `.strm` files. So this serves it and
-        # says so when the address in those files is one the container cannot
-        # reach, rather than letting the scan produce items that never play.
-        origin_server = _start_origin(
-            args, root, from_container=livetv.HOST_FROM_CONTAINER.get(runtime))
+        if runtime == "podman":
+            # Loopback is forwarded into the container (`host_loopback_ports`),
+            # so both listen on 127.0.0.1 and the URLs baked into the `.strm`
+            # files work unchanged.
+            fake, live_tv_url = _start_faketv(args, state, None,
+                                              bind="127.0.0.1")
+            origin_server = _start_origin(args, root, bind="127.0.0.1",
+                                          via_loopback=True)
+        else:
+            # Docker: inside the container 127.0.0.1 is the container itself,
+            # so faketvsource is told the host's name, and the origin's URL is
+            # already in the `.strm` files and can only be warned about.
+            fake, live_tv_url = _start_faketv(
+                args, state, livetv.HOST_FROM_CONTAINER.get(runtime))
+            origin_server = _start_origin(
+                args, root, from_container=livetv.HOST_FROM_CONTAINER.get(runtime))
         jf = Jellyfin(box.url)
         try:
             # The server must be told its own path to the media, not ours.

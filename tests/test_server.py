@@ -295,6 +295,22 @@ class TestContainer(unittest.TestCase):
         self.assertEqual(published, ["127.0.0.1:9000:8096",
                                      "192.168.122.1:9000:8096"])
 
+    def test_host_loopback_ports_are_forwarded_with_pasta(self):
+        argv = self._box(host_loopback_ports=(8409, 8410)).argv()
+        self.assertEqual(argv[argv.index("--network") + 1],
+                         "pasta:-T,8409,-T,8410")
+
+    def test_no_network_option_without_ports(self):
+        self.assertNotIn("--network", self._box().argv())
+
+    def test_docker_cannot_forward_loopback(self):
+        from stdjflib import container
+
+        box = container.Container("/lib", "/state", runtime="docker",
+                                  host_loopback_ports=(8410,))
+        with self.assertRaises(container.ContainerError):
+            box.argv()
+
     def test_extra_args_land_before_the_image(self):
         """Anything after the image name is passed to the entrypoint instead."""
         from stdjflib import container
@@ -438,6 +454,13 @@ class TestBindAddresses(unittest.TestCase):
         self._write()
         self.assertEqual(self._addresses(), ["127.0.0.1"])
 
+    def test_it_reports_the_port_the_file_pins(self):
+        """Once written, the file's port is the one the server listens on."""
+        self.assertEqual(jfserver.write_network_config(self.dir.name, 8097, ()),
+                         8097)
+        self.assertEqual(jfserver.write_network_config(self.dir.name, 9999, ()),
+                         8097)
+
     def test_no_kestrel_environment_variable(self):
         """Never consulted by Jellyfin, so setting one only misleads."""
         import inspect
@@ -549,6 +572,149 @@ class TestAdminPassword(unittest.TestCase):
                 self.assertEqual(args.listen, ["192.168.122.1"])
                 self.assertIsNone(
                     cli._parser().parse_args([command, "/lib"]).admin_password)
+
+
+class TestSourceBuiltServer(unittest.TestCase):
+    """`serve`'s default: a source publish run in the official image."""
+
+    def setUp(self):
+        from stdjflib import container
+
+        self.container = container
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.state = os.path.join(self.dir.name, "state")
+
+    def _box(self, **kw):
+        return self.container.SourceBuiltServer(
+            "/srv/lib", self.state, "/build/publish", runtime="podman", **kw)
+
+    @staticmethod
+    def _volumes(argv):
+        return [argv[i + 1] for i, a in enumerate(argv) if a == "-v"]
+
+    def test_every_path_is_mounted_where_it_is_on_the_host(self):
+        """So one state directory means the same thing here and --on-host:
+        library paths, and item ids, which are a hash of the path."""
+        volumes = self._volumes(self._box(web_dir="/web/dist").argv())
+        self.assertIn(f"{self.state}:{self.state}", volumes)
+        self.assertIn("/srv/lib:/srv/lib:ro", volumes)
+        self.assertIn("/web/dist:/web/dist:ro", volumes)
+        self.assertFalse([v for v in volumes
+                          if v.split(":")[1] in ("/media", "/config", "/cache")])
+        self.assertEqual(self._box().media_root, "/srv/lib")
+
+    def test_the_build_replaces_the_images_server_read_only(self):
+        self.assertIn("/build/publish:/jellyfin:ro",
+                      self._volumes(self._box().argv()))
+
+    def test_the_server_gets_the_same_arguments_as_on_the_host(self):
+        box = self._box(web_dir="/web/dist")
+        argv = box.argv()
+        self.assertEqual(argv[argv.index(box.image) + 1:],
+                         jfserver.server_arguments(self.state, "/web/dist", None))
+
+    def test_the_images_ffmpeg_is_used(self):
+        """--ffmpeg would name a host path that does not exist in the image."""
+        self.assertNotIn("--ffmpeg", self._box().argv())
+
+    def test_the_server_binds_everything_inside_the_container(self):
+        """Bound to 127.0.0.1 in the container, the publish resets every
+        connection; measured. Exposure is the publish's job there."""
+        from xml.etree import ElementTree
+
+        jfserver.write_network_config(self.state, 8096, ("127.0.0.1",))
+        self._box()._prepare_state()
+        root = ElementTree.parse(
+            os.path.join(self.state, "config", "network.xml")).getroot()
+        self.assertEqual(list(root.find("LocalNetworkAddresses")), [])
+
+    def test_an_existing_state_keeps_its_port_inside(self):
+        jfserver.write_network_config(self.state, 8096, ())
+        box = self._box(port=9000)
+        box._prepare_state()
+        self.assertIn("127.0.0.1:9000:8096", box.argv())
+
+    def test_it_offers_everything_serve_uses_from_an_on_host_instance(self):
+        """`_serve` drives either one through the same code after startup."""
+        import inspect
+        import re
+
+        from stdjflib import cli
+
+        used = set(re.findall(r"\binstance\.(\w+)", inspect.getsource(cli._serve)))
+        box = self._box()
+        missing = sorted(name for name in used if not hasattr(box, name))
+        self.assertEqual(missing, [])
+
+    def test_stopping_removes_the_container(self):
+        box = self._box()
+        with mock.patch.object(box, "_run") as run, \
+             mock.patch.object(box, "running", return_value=True), \
+             mock.patch.object(box, "exists", return_value=True):
+            box.stop()
+        verbs = [c.args[0] for c in run.call_args_list]
+        self.assertEqual(verbs, ["stop", "rm"])
+
+
+class TestServeModes(unittest.TestCase):
+    def setUp(self):
+        from stdjflib import cli
+
+        self.cli = cli
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        patcher = mock.patch.object(tempfile, "tempdir", self.dir.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_running_on_the_host_is_opt_in(self):
+        parse = self.cli._parser().parse_args
+        self.assertFalse(parse(["serve", "/lib"]).on_host)
+        self.assertTrue(parse(["serve", "/lib", "--on-host"]).on_host)
+
+    def test_no_podman_refuses_rather_than_falling_back(self):
+        import contextlib
+        import io
+
+        args = self.cli._parser().parse_args(["serve", self.dir.name])
+        err = io.StringIO()
+        with mock.patch("stdjflib.web.engine", return_value=None), \
+             mock.patch("stdjflib.jfserver.build") as on_host_build, \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(self.cli._serve(args), 1)
+        on_host_build.assert_not_called()
+        self.assertIn("--on-host", err.getvalue())
+
+    def test_loopback_ports_follow_what_will_run(self):
+        from stdjflib import build
+
+        manifest = os.path.join(self.dir.name, config.MANIFEST)
+        os.makedirs(os.path.dirname(manifest), exist_ok=True)
+        with open(manifest, "w", encoding="utf-8") as fh:
+            json.dump({"stream_origin": "http://127.0.0.1:8410"}, fh)
+        self.assertEqual(build.read_manifest(self.dir.name)["stream_origin"],
+                         "http://127.0.0.1:8410")
+        parse = self.cli._parser().parse_args
+        self.assertEqual(self.cli._loopback_ports(
+            parse(["serve", self.dir.name, "--live-tv"]), self.dir.name),
+            (8409, 8410))
+        self.assertEqual(self.cli._loopback_ports(
+            parse(["serve", self.dir.name, "--no-stream-origin"]), self.dir.name),
+            ())
+
+
+class TestOriginReachability(unittest.TestCase):
+    def test_forwarded_loopback_wants_a_loopback_url(self):
+        from stdjflib import origin
+
+        ok, _ = origin.describe_reachability("http://127.0.0.1:8410",
+                                             via_loopback=True)
+        self.assertTrue(ok)
+        ok, why = origin.describe_reachability(
+            "http://host.containers.internal:8410", via_loopback=True)
+        self.assertFalse(ok)
+        self.assertIn("--stream-origin", why)
 
 
 class _RecordingApi:

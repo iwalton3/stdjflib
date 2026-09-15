@@ -53,10 +53,11 @@ filter or muxer problem.
 | `stdjflib/build.py` | orchestration, manifest, ATTRIBUTION, library README |
 | `stdjflib/verify.py` | re-probe everything and compare against the recipes |
 | `stdjflib/jfapi.py` | the Jellyfin API client |
-| `stdjflib/jfserver.py` | building and running a server from source |
+| `stdjflib/jfserver.py` | building and running a server on this machine (`serve --on-host`), and the arguments and `network.xml` both modes share |
+| `stdjflib/jfbuild.py` | building the server in a container, so dotnet never runs here |
 | `stdjflib/web.py` | building jellyfin-web in a container, so npm never runs here |
 | `stdjflib/provision.py` | library options, the test accounts, setup |
-| `stdjflib/container.py` | running the official image under podman/docker |
+| `stdjflib/container.py` | running the official image under podman/docker, and a source build inside it |
 | `stdjflib/livetv.py` | optional faketvsource tuner and XMLTV guide |
 | `stdjflib/cli.py` | argument parsing and the subcommands |
 
@@ -658,6 +659,46 @@ an edited checkout looks exactly like an edit that did nothing. A `dist/`
 already in the checkout is still used when there is no container build, but
 loses to one: its provenance is an npm run nobody here can see.
 
+**dotnet does not run on this machine either, and `serve` runs in a container
+unless told `--on-host`.** `dotnet publish` restores a few hundred NuGet
+packages whose MSBuild targets run as whoever builds — the npm argument again.
+`jfbuild` builds in `mcr.microsoft.com/dotnet/sdk:<global.json's major>` under
+`web.py`'s isolation, and with no podman `serve` refuses rather than falling
+back; running on the host is something the user asks for. Cold, it is about 45
+seconds and a 2.2 GB NuGet cache kept inside the output mount.
+
+What it makes is a self-contained publish, not an image. `SourceBuiltServer`
+mounts it read-only over `/jellyfin` in the official image, whose entrypoint
+is that directory's `jellyfin`, so the runtime libraries and jellyfin-ffmpeg
+are the image's. The state, the library and the web bundle are mounted at
+**the paths they have on the host**, and the server gets the same
+`server_arguments` as `--on-host`. That is what lets one state directory serve
+both: library paths, item ids (a hash of the path) and recorded image paths
+mean the same thing on either side. `--datadir` and friends beat the image's
+`JELLYFIN_*_DIR` (`StartupHelpers.CreateApplicationPaths`), and the image's
+`JELLYFIN_FFMPEG` beats a host path an `--on-host` run left in `encoding.xml`
+(`MediaEncoder.SetFFmpegPath`) — measured, the display path comes back as
+`/usr/lib/jellyfin-ffmpeg/ffmpeg`.
+
+**A podman container reaches the host's loopback through pasta, so faketvsource
+and the origin listen on 127.0.0.1 for it too.** `--network pasta:-T,PORT`
+forwards the container's own `127.0.0.1:PORT` to the host's; measured, the
+same connection is refused without it. So under podman both `serve` and
+`container` forward those two ports, the `.strm` files' baked `127.0.0.1`
+URLs work unchanged, and a library built with the old
+`--stream-origin http://host.containers.internal:…` is the one that fails —
+`origin.describe_reachability(via_loopback=True)` says so. Docker has no
+pasta and keeps `host.docker.internal`.
+
+Two things the build container turns up that read as tooling faults:
+
+- **tar fails with "Cannot change ownership to uid 0, gid 65534".** Rootless
+  podman maps you to root and an unmapped group to 65534, and tar as root
+  restores owners — which `--cap-drop=ALL` forbids. `--no-same-owner`.
+- **`obj/` and `bin/` from an `--on-host` build are excluded from the copy.**
+  Restoring over another machine's `project.assets.json` fails without naming
+  it.
+
 **Nothing may depend on wall-clock time or `hash()`.** Dates derive from
 `config.EPOCH`; anything that needs a stable pseudo-random value derives it
 from the item's key with SHA-256. Python salts string hashing per process, so
@@ -723,10 +764,11 @@ user namespace with the library read-only, and stop it when idle.
 **What Kestrel listens on is `LocalNetworkAddresses` in `network.xml`, and
 nothing else.** Empty means every interface. The `JELLYFIN_Kestrel__Http__Url`
 this tool used to set was never read, so every `serve` was on the LAN.
-`_write_network_config` now rewrites that element on *every* start, including
+`write_network_config` now rewrites that element on *every* start, including
 into a file the server wrote, and `--listen` adds addresses to `127.0.0.1`.
-faketvsource and the origin listen on loopback under `serve`; under `container`
-they cannot, because the container reaches the host by its address.
+Inside a container it writes the list **empty** instead: measured, a server
+bound to 127.0.0.1 in its own namespace resets every connection that arrives
+through a `-p 127.0.0.1:…` publish, so there the publish decides exposure.
 
 **The licence gate is two-sided.** `ALLOWED_LICENCES` is the catalog's claim;
 `archive_licence()` is what the item says right now. Both have to pass. Do not
@@ -871,8 +913,9 @@ two fixtures point at those instead. Three things about it are load-bearing:
   thing a stream *target* must not be.
 - **`--stream-origin` is a build flag, not a startup one.** faketvsource is
   told at startup how the server will reach it; a `.strm` was written earlier
-  and cannot be told anything, so a container or a remote server needs the
-  library **rebuilt** with the right base URL.
+  and cannot be told anything, so a Docker container or a remote server needs
+  the library **rebuilt** with the right base URL. A podman container does
+  not: it reaches the default through forwarded loopback (below).
   `origin.describe_reachability` is what says so before a scan turns it into
   items that resolve and never play, and `cli._start_origin` prints it.
 
@@ -993,7 +1036,8 @@ the default user record; without it the POST has nothing to rename.
 **Never build inside the Jellyfin checkout.** `dotnet build` writes `obj/`, and
 a checkout that was ever built as root has root-owned ones (42 in the tree this
 was written against). It fails with "Permission denied" and a temp-file path
-that explains nothing. `--artifacts-path` keeps every output elsewhere.
+that explains nothing. `--artifacts-path` keeps every output elsewhere. That is `--on-host` only now;
+the container build copies the checkout out before it touches it.
 
 **The container's media path is not the host's.** Inside the container the
 library lives at `/media`, and `provision(media_root=...)` must be told so.
