@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from stdjflib import config, jfapi, jfserver, provision
 
@@ -131,7 +132,16 @@ class TestAccounts(unittest.TestCase):
         """provision() signs in as ACCOUNTS[0]; a non-admin there breaks setup."""
         first = provision.ACCOUNTS[0]
         self.assertTrue(first["policy"].get("IsAdministrator"))
-        self.assertTrue(first["password"])
+        self.assertEqual(first["password"], provision.GENERATED)
+
+    def test_no_administrator_has_a_password_anyone_can_read(self):
+        """An admin can install a plugin, which is code execution on the host,
+        and anything in this table is public. So an administrator's password
+        is generated per server, never written here."""
+        for account in provision.ACCOUNTS:
+            if account["policy"].get("IsAdministrator"):
+                with self.subTest(account["name"]):
+                    self.assertEqual(account["password"], provision.GENERATED)
 
     def test_the_admin_policy_only_grants(self):
         """ACCOUNTS[0]'s policy is applied to the account we are signed in as.
@@ -273,9 +283,17 @@ class TestContainer(unittest.TestCase):
         self.assertEqual(box.media_root, container.MEDIA_MOUNT)
         self.assertNotEqual(box.media_root, box.library)
 
-    def test_port_mapping_is_published(self):
+    def test_port_is_published_on_loopback_only(self):
+        """A bare `9000:8096` publishes on every interface."""
         argv = self._box(port=9000).argv()
-        self.assertIn("9000:8096", argv)
+        published = [argv[i + 1] for i, a in enumerate(argv) if a == "-p"]
+        self.assertEqual(published, ["127.0.0.1:9000:8096"])
+
+    def test_listen_adds_addresses_and_keeps_loopback(self):
+        argv = self._box(port=9000, listen=("192.168.122.1", "127.0.0.1")).argv()
+        published = [argv[i + 1] for i, a in enumerate(argv) if a == "-p"]
+        self.assertEqual(published, ["127.0.0.1:9000:8096",
+                                     "192.168.122.1:9000:8096"])
 
     def test_extra_args_land_before_the_image(self):
         """Anything after the image name is passed to the entrypoint instead."""
@@ -356,6 +374,181 @@ class TestLiveTv(unittest.TestCase):
                 self.assertIn(runtime, livetv.HOST_FROM_CONTAINER)
         self.assertNotEqual(livetv.HOST_FROM_CONTAINER["podman"],
                             livetv.HOST_FROM_CONTAINER["docker"])
+
+    def test_bind_is_passed_only_when_asked(self):
+        """faketvsource's own default is every interface, which a container
+        needs and a local server does not."""
+        self.assertNotIn("--host", self._fake().argv())
+        argv = self._fake(bind="127.0.0.1").argv()
+        self.assertEqual(argv[argv.index("--host") + 1], "127.0.0.1")
+
+
+# What a 12.0 server writes on first start, trimmed.
+_SERVER_NETWORK_XML = """<?xml version="1.0" encoding="utf-8"?>
+<NetworkConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <InternalHttpPort>8096</InternalHttpPort>
+  <EnableRemoteAccess>true</EnableRemoteAccess>
+  <LocalNetworkAddresses />
+  <VirtualInterfaceNames>
+    <string>veth</string>
+  </VirtualInterfaceNames>
+</NetworkConfiguration>"""
+
+
+class TestBindAddresses(unittest.TestCase):
+    """`LocalNetworkAddresses` is the only thing that decides what Kestrel
+    listens on; empty means every interface."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "config", "network.xml")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _addresses(self):
+        from xml.etree import ElementTree
+
+        root = ElementTree.parse(self.path).getroot()
+        return [s.text for s in root.find("LocalNetworkAddresses")]
+
+    def _write(self, **kw):
+        jfserver.Instance("/x/jellyfin.dll", self.dir.name,
+                          **kw)._write_network_config()
+
+    def test_a_fresh_state_listens_on_loopback(self):
+        self._write()
+        self.assertEqual(self._addresses(), ["127.0.0.1"])
+
+    def test_an_existing_file_is_corrected_and_otherwise_kept(self):
+        """The server wrote this with every interface; a state directory like
+        that must not keep listening on the LAN."""
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(_SERVER_NETWORK_XML)
+        self._write(listen=("192.168.122.1",))
+        self.assertEqual(self._addresses(), ["127.0.0.1", "192.168.122.1"])
+        with open(self.path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("<string>veth</string>", text)
+        self.assertIn("<InternalHttpPort>8096</InternalHttpPort>", text)
+
+    def test_narrowing_again_drops_the_extra_address(self):
+        self._write(listen=("192.168.122.1",))
+        self._write()
+        self.assertEqual(self._addresses(), ["127.0.0.1"])
+
+    def test_no_kestrel_environment_variable(self):
+        """Never consulted by Jellyfin, so setting one only misleads."""
+        import inspect
+
+        self.assertNotIn("Kestrel", inspect.getsource(jfserver.Instance.start))
+
+
+class _PasswordApi:
+    """Accepts exactly one password for the admin, like a server would."""
+
+    def __init__(self, current, fail_status=401):
+        self.current = current
+        self.fail_status = fail_status
+        self.logins = []
+        self.changes = []
+
+    def login(self, username, password):
+        self.logins.append(password)
+        if password != self.current:
+            raise jfapi.ApiError("POST", "/Users/AuthenticateByName",
+                                 self.fail_status, "")
+
+    def change_own_password(self, current, new):
+        if current != self.current:
+            raise jfapi.ApiError("POST", "/Users/Password", 403, "")
+        self.current = new
+        self.changes.append(new)
+
+
+class TestAdminPassword(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        patcher = mock.patch.object(tempfile, "tempdir", self.dir.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_generated_once_then_reused(self):
+        path = provision.admin_password_file(os.path.join(self.dir.name, "s"))
+        first = provision.load_admin_password(path)
+        self.assertEqual(provision.load_admin_password(path), first)
+        self.assertGreaterEqual(len(first), 20)
+        self.assertNotEqual(first, provision.DEFAULT_PASSWORD)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_each_server_state_gets_its_own(self):
+        one = provision.load_admin_password(
+            provision.admin_password_file(os.path.join(self.dir.name, "a")))
+        two = provision.load_admin_password(
+            provision.admin_password_file(os.path.join(self.dir.name, "b")))
+        self.assertNotEqual(one, two)
+
+    def test_a_saved_override_is_what_loads_next(self):
+        path = provision.admin_password_file(os.path.join(self.dir.name, "s"))
+        provision.load_admin_password(path)
+        provision.save_admin_password(path, "chosen")
+        self.assertEqual(provision.load_admin_password(path), "chosen")
+
+    def test_a_local_server_is_published_by_port(self):
+        path = provision.publish_connection("http://127.0.0.1:8097", "secret")
+        self.assertEqual(path, config.connection_file(8097))
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["admin"], provision.ACCOUNTS[0]["name"])
+        self.assertEqual(data["admin_password"], "secret")
+        self.assertEqual(data["password"], provision.DEFAULT_PASSWORD)
+        self.assertIn("qa-nopassword", data["no_password"])
+
+    def test_a_remote_server_is_not_published(self):
+        """Keyed by port: a remote 8096 would overwrite the local 8096."""
+        self.assertIsNone(
+            provision.publish_connection("http://192.168.1.5:8096", "secret"))
+
+    def test_the_saved_password_signs_in_without_changing_anything(self):
+        api = _PasswordApi("new")
+        provision.sign_in_admin(api, "qa-admin", "new", say=lambda *_: None)
+        self.assertEqual(api.changes, [])
+
+    def test_the_old_fixed_password_is_replaced(self):
+        api = _PasswordApi(provision.DEFAULT_PASSWORD)
+        provision.sign_in_admin(api, "qa-admin", "new", say=lambda *_: None)
+        self.assertEqual(api.current, "new")
+        self.assertEqual(api.logins[-1], "new")
+
+    def test_neither_password_is_an_error_that_says_what_to_do(self):
+        api = _PasswordApi("someone-elses")
+        with self.assertRaisesRegex(RuntimeError, "--admin-password"):
+            provision.sign_in_admin(api, "qa-admin", "new",
+                                    say=lambda *_: None)
+        self.assertEqual(api.changes, [])
+
+    def test_anything_but_a_refusal_is_not_retried(self):
+        api = _PasswordApi("someone-elses", fail_status=500)
+        with self.assertRaises(jfapi.ApiError):
+            provision.sign_in_admin(api, "qa-admin", "new",
+                                    say=lambda *_: None)
+        self.assertEqual(api.logins, ["new"])
+
+    def test_the_cli_takes_an_admin_password_and_listen_addresses(self):
+        from stdjflib import cli
+
+        for command in ("serve", "container"):
+            with self.subTest(command):
+                args = cli._parser().parse_args(
+                    [command, "/lib", "--admin-password", "x",
+                     "--listen", "192.168.122.1"])
+                self.assertEqual(args.admin_password, "x")
+                self.assertEqual(args.listen, ["192.168.122.1"])
+                self.assertIsNone(
+                    cli._parser().parse_args([command, "/lib"]).admin_password)
 
 
 class _RecordingApi:

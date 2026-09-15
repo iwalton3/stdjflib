@@ -158,6 +158,12 @@ class Jellyfin:
         self.user_id = result["User"]["Id"]
         return result
 
+    def change_own_password(self, current: str, new: str) -> None:
+        """Same route on 10.11 and 12.0. Revokes every other token the user has."""
+        self.post("/Users/Password", params={"userId": self.user_id},
+                  body={"CurrentPw": current, "NewPw": new},
+                  expect_json=False)
+
     # -- libraries --------------------------------------------------------
 
     def virtual_folders(self) -> list:

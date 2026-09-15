@@ -76,13 +76,15 @@ class FakeTv:
 
     def __init__(self, source: str, state: str, *, port: int = DEFAULT_PORT,
                  seed: str = DEFAULT_SEED, tuner_count: int = 0,
-                 public_host: str | None = None, verbose: bool = False):
+                 public_host: str | None = None, bind: str | None = None,
+                 verbose: bool = False):
         self.source = source
         self.state = state
         self.port = port
         self.seed = seed
         self.tuner_count = tuner_count
         self.public_host = public_host
+        self.bind = bind
         self.verbose = verbose
         self.process: subprocess.Popen | None = None
         self.log_handle = None
@@ -106,6 +108,8 @@ class FakeTv:
         argv = [sys.executable, os.path.join(self.source, "faketv.py"),
                 "--port", str(self.port), "--seed", self.seed,
                 "--tuner-count", str(self.tuner_count)]
+        if self.bind:
+            argv += ["--host", self.bind]       # its own default is 0.0.0.0
         if self.public_host:
             # faketvsource builds stream URLs from the Host header unless told
             # otherwise, and a container's Host header is not reachable from

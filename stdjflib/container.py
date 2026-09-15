@@ -76,13 +76,15 @@ class Container:
     def __init__(self, library: str, state: str, *, runtime: str = "podman",
                  image: str = DEFAULT_IMAGE, name: str = DEFAULT_NAME,
                  port: int = 8096, extra_args: tuple[str, ...] = (),
-                 verbose: bool = False):
+                 listen: tuple[str, ...] = (), verbose: bool = False):
         self.library = os.path.abspath(library)
         self.state = os.path.abspath(state)
         self.runtime = runtime
         self.image = image
         self.name = name
         self.port = port
+        self.listen = ("127.0.0.1",
+                       *(a for a in listen if a != "127.0.0.1"))
         self.extra_args = tuple(extra_args)
         self.verbose = verbose
 
@@ -147,9 +149,11 @@ class Container:
     # -- lifecycle --------------------------------------------------------
 
     def argv(self) -> list[str]:
-        args = [
-            "run", "-d", "--name", self.name,
-            "-p", f"{self.port}:8096",
+        args = ["run", "-d", "--name", self.name]
+        # A bare `-p PORT:8096` publishes on every interface.
+        for address in self.listen:
+            args += ["-p", f"{address}:{self.port}:8096"]
+        args += [
             "-v", _mount(os.path.join(self.state, "config"), CONFIG_MOUNT),
             "-v", _mount(os.path.join(self.state, "cache"), CACHE_MOUNT),
             "-v", _mount(self.library, MEDIA_MOUNT, read_only=True),

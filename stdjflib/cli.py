@@ -17,6 +17,13 @@ from .jfapi import Jellyfin
 
 DEFAULT_ROOT = os.environ.get("STDJFLIB_ROOT", "")
 
+_LISTEN = dict(
+    action="append", default=[], metavar="ADDR",
+    help="also listen on ADDR; 127.0.0.1 always is. Repeatable. For a local "
+         "VM, the host's address on its bridge (192.168.122.1 under libvirt). "
+         "Only for networks you trust: the admin account can install "
+         "plugins, which is code execution on this machine.")
+
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -114,8 +121,11 @@ def _parser() -> argparse.ArgumentParser:
         sp.add_argument("root", nargs="?" if DEFAULT_ROOT else None,
                         default=DEFAULT_ROOT or None,
                         help="the built library (or set STDJFLIB_ROOT)")
-        sp.add_argument("--password", default=provision.DEFAULT_PASSWORD,
-                        help="password for the QA accounts")
+        sp.add_argument("--admin-password", default=None,
+                        help=f"password for {provision.ACCOUNTS[0]['name']} "
+                             f"(default: generated once per server state and "
+                             f"kept there). The other accounts use "
+                             f"`{provision.DEFAULT_PASSWORD}`.")
         sp.add_argument("--no-scan", action="store_true",
                         help="do not trigger a library scan")
         sp.add_argument("--replace-libraries", action="store_true",
@@ -160,6 +170,7 @@ def _parser() -> argparse.ArgumentParser:
                         "network mount, which SQLite does not survive). "
                         "Delete it for a fresh server.")
     s.add_argument("--port", type=int, default=jfserver.DEFAULT_PORT)
+    s.add_argument("--listen", **_LISTEN)
     s.add_argument("--no-build", action="store_true",
                    help="use the existing build instead of compiling")
     s.add_argument("--artifacts", default=None,
@@ -198,6 +209,7 @@ def _parser() -> argparse.ArgumentParser:
     ct.add_argument("--image", default=container.DEFAULT_IMAGE)
     ct.add_argument("--name", default=container.DEFAULT_NAME)
     ct.add_argument("--port", type=int, default=8096)
+    ct.add_argument("--listen", **_LISTEN)
     ct.add_argument("--state", default=None,
                     help="host directory for the server's config and cache "
                          "(default: a per-library directory under the system "
@@ -495,10 +507,12 @@ def _stop_on_signals():
                 signal.signal(signum, old)
 
 
-def _start_faketv(args, state: str, public_host: str | None):
+def _start_faketv(args, state: str, public_host: str | None,
+                  bind: str | None = None):
     """Start faketvsource, or explain why it cannot be started.
 
-    Returns (instance, url_for_the_server) or (None, None).
+    Returns (instance, url_for_the_server) or (None, None). `bind` None keeps
+    faketvsource's own all-interfaces default, which a container needs.
     """
     if not getattr(args, "live_tv", False):
         return None, None
@@ -512,7 +526,8 @@ def _start_faketv(args, state: str, public_host: str | None):
 
     fake = livetv.FakeTv(source, state, port=args.faketv_port,
                          tuner_count=args.tuner_count,
-                         public_host=public_host, verbose=args.verbose)
+                         public_host=public_host, bind=bind,
+                         verbose=args.verbose)
     print(f"Starting faketvsource from {source}", flush=True)
     fake.start()
     channels = fake.wait_until_up()
@@ -522,7 +537,8 @@ def _start_faketv(args, state: str, public_host: str | None):
     return fake, fake.public_url
 
 
-def _start_origin(args, root: str, *, from_container: str | None = None):
+def _start_origin(args, root: str, *, from_container: str | None = None,
+                  bind: str = "0.0.0.0"):
     """Serve the local `.strm` origin, if this library has one.
 
     Returns the running server or None. Never fatal: a library built before
@@ -534,7 +550,7 @@ def _start_origin(args, root: str, *, from_container: str | None = None):
     base = build.read_manifest(root).get("stream_origin")
     if not base:
         return None
-    server = origin.Origin(root, port=origin.port_of(base))
+    server = origin.Origin(root, port=origin.port_of(base), bind=bind)
     files = server.files()
     if not files:
         return None
@@ -555,9 +571,23 @@ def _start_origin(args, root: str, *, from_container: str | None = None):
     return server
 
 
+def _admin_password(args, state: str) -> tuple[str, str]:
+    """(password, the file that keeps it) for the server behind `state`."""
+    path = provision.admin_password_file(state)
+    return args.admin_password or provision.load_admin_password(path), path
+
+
+def _handover(args, url: str, password: str, path: str) -> None:
+    """After provisioning has signed in with `password`, and not before."""
+    if args.admin_password:
+        # So the next run without the flag signs in with the same one.
+        provision.save_admin_password(path, password)
+    published = provision.publish_connection(url, password)
+    _print_connection(url, password, published)
+
+
 def _provision_kwargs(args) -> dict:
     return {
-        "password": args.password,
         "chapter_images": args.chapter_images,
         "trickplay": args.trickplay,
         "replace": args.replace_libraries,
@@ -584,10 +614,15 @@ def _provision_run(args) -> int:
         # a tuner that saves fine and never plays.
         fake, url = _start_faketv(args, state, args.live_tv_host)
         origin_server = _start_origin(args, root)
+        # No state directory of its own, so the library's runtime dir keeps
+        # the password. A server set up some other way needs --admin-password.
+        password, path = _admin_password(
+            args, config.runtime_dir(root, "provision"))
         jf = Jellyfin(args.server)
         provision.provision(jf, root, media_root=args.media_root,
-                            live_tv_url=url, **_provision_kwargs(args))
-        _print_connection(args.server, args.password)
+                            live_tv_url=url, admin_password=password,
+                            **_provision_kwargs(args))
+        _handover(args, args.server, password, path)
         if fake:
             print(f"\nfaketvsource is running as long as this command is.")
             print("  Ctrl-C to stop it.")
@@ -662,8 +697,14 @@ def _serve(args) -> int:
     found = jfserver.find_web_client(args.source, built)
     instance = jfserver.Instance(dll, state, port=args.port, web_dir=found,
                                  ffmpeg=shutil.which("ffmpeg"),
+                                 listen=tuple(args.listen),
                                  verbose=args.verbose)
+    # Before the server starts: a fresh state's wizard uses this, so it has to
+    # be on disk before anything can depend on it.
+    password, password_path = _admin_password(args, state)
     print(f"Starting the server on {instance.url}")
+    if len(instance.listen) > 1:
+        print(f"  also listening on {', '.join(instance.listen[1:])}")
     print(f"  state {state}")
     print(f"  web   {found or 'not built, running --nowebclient'}")
     print(f"        {why}")
@@ -676,13 +717,14 @@ def _serve(args) -> int:
     origin_server = None
     try:
         # Both processes are on this machine, so loopback is what the server
-        # should use.
-        fake, live_tv_url = _start_faketv(args, state, None)
-        origin_server = _start_origin(args, root)
+        # should use — and all either of them needs to listen on.
+        fake, live_tv_url = _start_faketv(args, state, None, bind="127.0.0.1")
+        origin_server = _start_origin(args, root, bind="127.0.0.1")
         jf = Jellyfin(instance.url)
         try:
             provision.provision(jf, root, still_alive=instance.alive,
                                 live_tv_url=live_tv_url,
+                                admin_password=password,
                                 **_provision_kwargs(args))
         except Exception:
             if not instance.alive():
@@ -690,7 +732,7 @@ def _serve(args) -> int:
                       file=sys.stderr)
                 print(instance.log_tail(), file=sys.stderr)
             raise
-        _print_connection(instance.url, args.password)
+        _handover(args, instance.url, password, password_path)
 
         if args.stop_after_setup:
             print("\nStopping the server (--stop-after-setup).")
@@ -716,10 +758,12 @@ def _serve(args) -> int:
         instance.stop()
 
 
-def _print_connection(url: str, password: str) -> None:
+def _print_connection(url: str, password: str, published: str | None) -> None:
     print()
     print(f"  Server    {url}")
     print(f"  Sign in   {provision.ACCOUNTS[0]['name']} / {password}")
+    if published:
+        print(f"            (also in {published})")
     print(f"  Accounts  {len(provision.ACCOUNTS)} — `stdjflib accounts` "
           f"explains what each is for")
 
@@ -728,6 +772,10 @@ def cmd_accounts(_args) -> int:
     print(f"{len(provision.ACCOUNTS)} test accounts, created by "
           f"`stdjflib serve` / `stdjflib provision`.")
     print(f"Default password: {provision.DEFAULT_PASSWORD}")
+    print(f"The administrator's is generated per server, printed when it is "
+          f"set up, and published in "
+          f"{os.path.dirname(config.connection_file(0))}/<port>.json for a "
+          f"server on this machine.")
     print()
     for account in provision.ACCOUNTS:
         password = account["password"] or "(none)"
@@ -761,7 +809,9 @@ def _container_run(args) -> int:
     box = container.Container(root, state, runtime=runtime, image=args.image,
                               name=args.name, port=args.port,
                               extra_args=tuple(args.extra_args),
+                              listen=tuple(args.listen),
                               verbose=args.verbose)
+    password, password_path = _admin_password(args, state)
     # Flushed, because stderr is unbuffered and stdout is not when piped —
     # without this a runtime error appears above the header that explains it.
     print(f"Jellyfin in {runtime}", flush=True)
@@ -810,6 +860,7 @@ def _container_run(args) -> int:
             provision.provision(jf, root, media_root=box.media_root,
                                 still_alive=box.alive,
                                 live_tv_url=live_tv_url,
+                                admin_password=password,
                                 **_provision_kwargs(args))
         except Exception:
             if not box.alive():
@@ -817,7 +868,7 @@ def _container_run(args) -> int:
                       file=sys.stderr)
                 print(box.logs(), file=sys.stderr)
             raise
-        _print_connection(box.url, args.password)
+        _handover(args, box.url, password, password_path)
 
         if args.keep_running:
             print(f"\nContainer {box.name} left running.")

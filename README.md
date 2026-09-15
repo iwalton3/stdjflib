@@ -496,6 +496,17 @@ library often sits on a network mount, and neither SQLite nor `dotnet build`
 tolerates one; the instances are disposable in any case, which is what
 `--fresh` is for. A reboot costs a rebuild and a factory-fresh server.
 
+**It listens on loopback, and the admin password is generated.** `qa-admin`
+can install plugins, which is code execution on the machine running the
+server, so its password is random per server state, printed once setup
+finishes, and also written to `servers/<port>.json` under the same temp
+directory for test harnesses to read. A server set up with the old fixed
+password gets it swapped on its next run. Jellyfin, faketvsource and the
+stream origin listen on `127.0.0.1` only; `--listen ADDR` adds an address for
+Jellyfin, such as `192.168.122.1` for a libvirt VM. Under `container`,
+faketvsource and the origin still listen everywhere, because the container
+reaches the host by its address rather than by loopback.
+
 ### The browser UI, built where npm cannot reach you
 
 `serve` also builds jellyfin-web, so there is something to look at and not
@@ -546,9 +557,11 @@ read-only at `/media`, then provisions it exactly as `serve` does. Podman and
 Docker take the same arguments for all of this, so `--runtime` only chooses the
 binary; Docker generally needs root on a stock install, podman does not.
 
-Between this and `serve` you get both major versions for free — the image is
-Jellyfin 10.11 stable, a source build of `master` is 12.0, and the provisioning
-works unchanged against both.
+Between this and `serve` you can test both major versions, but not by default
+any more: `latest` became 12.0 in September 2026, the same as a source build.
+Pin 10.11 with `--image docker.io/jellyfin/jellyfin:10.11.11`. The provisioning
+works unchanged against both, which is also why nothing warns you when the two
+servers turn out to be the same version.
 
 **The server's path is not your path.** Inside the container the library is at
 `/media`, and that is what gets sent when the libraries are created. Getting
@@ -609,7 +622,8 @@ Two things are handled that otherwise fail quietly:
 ### The test accounts
 
 Twelve, each reaching a client path that is otherwise tedious to set up by
-hand. Password `stdjflib` throughout, except where the point is not having one.
+hand. Password `stdjflib` throughout, except `qa-admin`, whose password is
+generated per server (see above), and where the point is not having one.
 
 | Account | What it makes reachable |
 | --- | --- |

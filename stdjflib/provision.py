@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
+import urllib.parse
 
 from . import boxsets, config, livetv
 from .jfapi import OPTIMIZE_TASK, ApiError, Jellyfin
@@ -35,6 +37,92 @@ ITEM_TYPES = (
 )
 
 DEFAULT_PASSWORD = "stdjflib"
+
+# The administrator's password is never a constant. An admin can install a
+# plugin, which is code execution on the host, and Jellyfin sends
+# `Access-Control-Allow-Origin: *` and checks no Host header — so a known one
+# lets any web page in a browser on this machine, DNS rebinding included,
+# sign in and do it. Binding to loopback does not stop that; a secret does.
+GENERATED = "(generated per server)"
+
+
+def admin_password_file(state: str) -> str:
+    """Inside the server's state, so `--fresh` replaces it with the database."""
+    return os.path.join(state, "admin-password")
+
+
+def load_admin_password(path: str) -> str:
+    """The saved password, or a new one saved before anything uses it."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            saved = fh.read().strip()
+        if saved:
+            return saved
+    except FileNotFoundError:
+        pass
+    password = secrets.token_urlsafe(18)
+    save_admin_password(path, password)
+    return password
+
+
+def save_admin_password(path: str, password: str) -> None:
+    _write_private(path, password + "\n")
+
+
+def _write_private(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # O_CREAT's mode applies only to a new file; an older one keeps its own.
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def publish_connection(url: str, admin_password: str) -> str | None:
+    """Write how to sign in to a server on this machine; return the path.
+
+    None for any other host: the file is keyed by port, and a remote server
+    sharing a local one's port would overwrite the wrong entry.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.hostname not in ("127.0.0.1", "localhost", "::1") or not parts.port:
+        return None
+    path = config.connection_file(parts.port)
+    _write_private(path, json.dumps({
+        "server": url,
+        "admin": ACCOUNTS[0]["name"],
+        "admin_password": admin_password,
+        "password": DEFAULT_PASSWORD,
+        "no_password": [a["name"] for a in ACCOUNTS if a["password"] is None],
+    }, indent=2))
+    return path
+
+
+def sign_in_admin(jf: Jellyfin, admin: str, password: str, say=_say) -> None:
+    """Sign in, replacing the old fixed password on a server that still has it.
+
+    A state directory set up before passwords were generated has
+    `DEFAULT_PASSWORD` on its admin, and would otherwise either fail here or
+    be left signable-into by anyone who has read this file.
+    """
+    try:
+        jf.login(admin, password)
+        return
+    except ApiError as exc:
+        if exc.status != 401 or password == DEFAULT_PASSWORD:
+            raise
+    try:
+        jf.login(admin, DEFAULT_PASSWORD)
+    except ApiError as exc:
+        if exc.status != 401:
+            raise
+        raise RuntimeError(
+            f"cannot sign in as {admin}: the server has neither its saved "
+            f"password nor the old fixed one. It was set up some other way — "
+            f"pass --admin-password, or --fresh for a new server.") from None
+    jf.change_own_password(DEFAULT_PASSWORD, password)
+    jf.login(admin, password)
+    say(f"  replaced {admin}'s old fixed password with a generated one")
 
 # Every provider that talks to the internet, as the server names them (which is
 # not what it names the plugins — the "TMDb" plugin registers "TheMovieDb").
@@ -84,7 +172,7 @@ SERVER_METADATA_TYPES = (
 ACCOUNTS = [
     {
         "name": "qa-admin",
-        "password": DEFAULT_PASSWORD,
+        "password": GENERATED,
         "why": ("Administrator, created by the first-run wizard. Everything "
                 "allowed: dashboard, scheduled tasks, library management, "
                 "recordings, deletion."),
@@ -605,7 +693,7 @@ def libraries_from_manifest(root: str) -> dict:
             if os.path.isdir(os.path.join(root, name))}
 
 
-def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
+def provision(jf: Jellyfin, root: str, *, admin_password: str,
               server_name: str = "stdjflib QA",
               chapter_images: bool = False, trickplay: bool = False,
               replace: bool = False, scan: bool = True,
@@ -621,12 +709,12 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
     if jf.needs_setup():
         say("Running the first-time setup wizard")
         jf.run_startup_wizard(server_name=server_name, username=admin,
-                              password=password)
+                              password=admin_password)
         say(f"  administrator: {admin}")
     else:
         say("Server is already set up")
 
-    jf.login(admin, password)
+    sign_in_admin(jf, admin, admin_password, say=say)
 
     count = disable_remote_providers(jf)
     say(f"Internet metadata off for {count} item types, server-wide")
@@ -658,10 +746,13 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
     created = []
     for account in ACCOUNTS:
         name = account["name"]
+        password = account["password"]
+        if password == GENERATED:
+            password = admin_password
         user = have.get(name)
         if user is None:
             try:
-                user = jf.create_user(name, account["password"])
+                user = jf.create_user(name, password)
             except ApiError as exc:
                 say(f"  ! {name}: {exc}")
                 continue
@@ -674,7 +765,7 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
         jf.set_policy(user["Id"], policy)
         pw = account["password"] or "(no password)"
         say(f"  {name:16} {pw:12} {account['why'].splitlines()[0]}")
-        created.append({"name": name, "password": account["password"],
+        created.append({"name": name, "password": password,
                         "id": user["Id"], "why": account["why"]})
 
     # We just rewrote the policy of the account we are signed in as. Nothing in
@@ -686,9 +777,9 @@ def provision(jf: Jellyfin, root: str, *, password: str = DEFAULT_PASSWORD,
         jf.get("/System/Info")
     except ApiError:
         say("  (admin session did not survive its own policy; signing in again)")
-        jf.login(admin, password)
+        jf.login(admin, admin_password)
 
-    result = {"server": jf.base, "admin": admin, "password": password,
+    result = {"server": jf.base, "admin": admin, "password": admin_password,
               "libraries": wanted, "accounts": created}
 
     if live_tv_url:

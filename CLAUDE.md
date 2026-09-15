@@ -695,6 +695,34 @@ sshfs here — and SQLite over sshfs corrupts while `dotnet build` over it is
 unusable. Only `.stdjflib/cache/`, the manifest and ATTRIBUTION stay next to
 the library, because those are worth keeping and a rebuild needs them.
 
+**The admin password is generated, never a constant, and loopback does not
+make that optional.** An administrator can install a plugin, which is code
+execution on this machine; Jellyfin sends `Access-Control-Allow-Origin: *` and
+checks no `Host` header, so with a password anyone can read, a web page open in
+a browser here can sign in and do it, DNS rebinding included. Only the secret
+stops that. It lives in `<state>/admin-password`, so `--fresh` replaces it
+along with the database, and is copied to `config.connection_file(port)` for
+test harnesses. A state set up before this still has `stdjflib` on its admin,
+and `provision.sign_in_admin` swaps it — measured against a source build and
+the image. `test_no_administrator_has_a_password_anyone_can_read` holds the
+table to it. No other account can reach plugins, packages, server config or
+tuner hosts; all of those are `RequiresElevation`.
+
+The secret does not cover what needs no sign-in, and some of that runs
+ffmpeg: `/Videos/{id}/stream`, `/Audio/{id}/stream`, the legacy HLS segments,
+subtitle streams, attachments and every image route are anonymous on 12.0,
+and an item's id is a hash of its path — which this repo makes deterministic.
+So a page can still start a transcode on a known item without signing in, and
+loopback does not stop a browser doing it. Read from source, not measured.
+
+**What Kestrel listens on is `LocalNetworkAddresses` in `network.xml`, and
+nothing else.** Empty means every interface. The `JELLYFIN_Kestrel__Http__Url`
+this tool used to set was never read, so every `serve` was on the LAN.
+`_write_network_config` now rewrites that element on *every* start, including
+into a file the server wrote, and `--listen` adds addresses to `127.0.0.1`.
+faketvsource and the origin listen on loopback under `serve`; under `container`
+they cannot, because the container reaches the host by its address.
+
 **The licence gate is two-sided.** `ALLOWED_LICENCES` is the catalog's claim;
 `archive_licence()` is what the item says right now. Both have to pass. Do not
 add an NC or ND licence to the allowed set — those cannot be redistributed
@@ -918,6 +946,15 @@ source build (12.0) and the official container image (10.11). Each fails
 *silently* — the call succeeds and the
 setting simply has no effect.
 
+**`jellyfin/jellyfin:latest` is 12.0 now, so `container` no longer reaches
+10.11 by default.** The image pulled 2026-09-08 carries the `12.0` label and
+reports 12.0 from `/System/Info/Public`. Everything in this file credited to
+"the container image (10.11)" was measured while `latest` was still 10.11,
+and a "12.0 against 10.11" comparison started with the default image is 12.0
+against itself — silently, because provisioning works unchanged on both. For
+10.11, pin it: `--image docker.io/jellyfin/jellyfin:10.11.11` (the newest
+10.11 tag in the registry as of 2026-09-14, and in `../jellyfin`).
+
 **The auth token goes inside the `Authorization` header.** `X-Emby-Token` is
 still read by `AuthorizationContext`, but only as a fallback when the
 Authorization header carries no token — and on 12.0 a request with
@@ -981,7 +1018,7 @@ Nothing in `LibraryOptions` or the server configuration turns it on or off:
 that exists is the one already being set — a library added as **tvshows** gets
 episode grouping and one added as anything else does not. The version gate is
 real though: episode grouping is commit `d5bb7756f1`, which is in `v12.0-rc*`
-and in no 10.11 tag, so on the container image the same eight files are eight
+and in no 10.11 tag, so on a 10.11 image the same eight files are eight
 episodes. Movie versions work on both. `versions-show` says so in its plot,
 because a fixture that silently means two different things on two servers is
 worse than no fixture.

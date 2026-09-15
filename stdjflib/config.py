@@ -111,11 +111,27 @@ def runtime_dir(root: str, name: str) -> str:
     """
     root = os.path.abspath(root)
     tag = hashlib.sha256(root.encode("utf-8", "surrogateescape")).hexdigest()[:8]
+    return os.path.join(runtime_base(),
+                        f"{os.path.basename(root) or 'library'}-{tag}", name)
+
+
+def runtime_base() -> str:
     # /tmp is shared, so the per-user directory is made narrow before anything
-    # is written into it — otherwise another user could get there first.
+    # is written into it — otherwise another user could get there first. It
+    # also holds admin passwords now, so the mode is load-bearing twice over.
     base = os.path.join(tempfile.gettempdir(), f"stdjflib-{os.getuid()}")
     os.makedirs(base, mode=0o700, exist_ok=True)
-    return os.path.join(base, f"{os.path.basename(root) or 'library'}-{tag}", name)
+    return base
+
+
+def connection_file(port: int) -> str:
+    """Where a server on this machine's `port` publishes how to sign in.
+
+    Keyed by port because that is what a test harness already has: it knows
+    the URL it was pointed at, not which library or state directory is behind
+    it. The password's authority is the state directory; this is a copy.
+    """
+    return os.path.join(runtime_base(), "servers", f"{port}.json")
 
 
 # Bumped when a change makes previously built output stale. `verify` warns when

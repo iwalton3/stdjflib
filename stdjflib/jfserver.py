@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import time
+from xml.etree import ElementTree
 
 DEFAULT_PORT = 8096
 
@@ -94,10 +95,13 @@ class Instance:
 
     def __init__(self, dll: str, state_dir: str, *, port: int = DEFAULT_PORT,
                  web_dir: str | None = None, ffmpeg: str | None = None,
-                 verbose: bool = False):
+                 listen: tuple[str, ...] = (), verbose: bool = False):
         self.dll = dll
         self.state = state_dir
         self.port = port
+        # Loopback always: provisioning talks to 127.0.0.1.
+        self.listen = ("127.0.0.1",
+                       *(a for a in listen if a != "127.0.0.1"))
         self.web_dir = web_dir
         self.ffmpeg = ffmpeg
         self.verbose = verbose
@@ -134,41 +138,54 @@ class Instance:
         for sub in ("data", "config", "cache", "log"):
             os.makedirs(os.path.join(self.state, sub), exist_ok=True)
         self._write_network_config()
-
-        env = dict(os.environ)
-        # Jellyfin reads the bind URL from this rather than a CLI flag.
-        env["JELLYFIN_Kestrel__Http__Url"] = f"http://0.0.0.0:{self.port}"
         # Its own first-run detection also keys off the data directory, which
         # is why a fresh state dir is a fresh server.
         self.log_handle = open(self.log_path, "ab")
         self.process = subprocess.Popen(
             self.argv(), stdout=self.log_handle, stderr=subprocess.STDOUT,
-            env=env, start_new_session=True)
+            start_new_session=True)
 
     def _write_network_config(self) -> None:
-        """Pin the port before first start.
+        """Pin the port before first start, and the bind addresses every start.
 
         The server writes `network.xml` on first run and then treats it as the
         source of truth, so setting the port afterwards means restarting.
+
+        The addresses are rewritten into an existing file too, because that
+        is the only thing that decides them: Kestrel listens on
+        `NetworkManager.GetAllBindInterfaces`, which is `LocalNetworkAddresses`
+        or, when that is empty, every interface. A `Kestrel__*` environment
+        variable is never consulted. An admin can install a plugin, so an
+        existing state directory is corrected rather than left on the LAN.
         """
         path = os.path.join(self.state, "config", "network.xml")
-        if os.path.exists(path):
-            return
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(
-                '<?xml version="1.0" encoding="utf-8"?>\n'
-                '<NetworkConfiguration '
-                'xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
-                'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n'
-                f"  <InternalHttpPort>{self.port}</InternalHttpPort>\n"
-                f"  <PublicHttpPort>{self.port}</PublicHttpPort>\n"
-                "  <EnableHttps>false</EnableHttps>\n"
-                "  <RequireHttps>false</RequireHttps>\n"
-                "  <AutoDiscovery>false</AutoDiscovery>\n"
-                "  <EnableUPnP>false</EnableUPnP>\n"
-                "  <EnableRemoteAccess>true</EnableRemoteAccess>\n"
-                "</NetworkConfiguration>\n")
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    '<?xml version="1.0" encoding="utf-8"?>\n'
+                    '<NetworkConfiguration '
+                    'xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+                    'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n'
+                    f"  <InternalHttpPort>{self.port}</InternalHttpPort>\n"
+                    f"  <PublicHttpPort>{self.port}</PublicHttpPort>\n"
+                    "  <EnableHttps>false</EnableHttps>\n"
+                    "  <RequireHttps>false</RequireHttps>\n"
+                    "  <AutoDiscovery>false</AutoDiscovery>\n"
+                    "  <EnableUPnP>false</EnableUPnP>\n"
+                    "  <EnableRemoteAccess>true</EnableRemoteAccess>\n"
+                    "  <LocalNetworkAddresses />\n"
+                    "</NetworkConfiguration>\n")
+
+        tree = ElementTree.parse(path)
+        addresses = tree.getroot().find("LocalNetworkAddresses")
+        if addresses is None:
+            addresses = ElementTree.SubElement(tree.getroot(),
+                                               "LocalNetworkAddresses")
+        addresses.clear()
+        for address in self.listen:
+            ElementTree.SubElement(addresses, "string").text = address
+        tree.write(path, encoding="utf-8", xml_declaration=True)
 
     def alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
