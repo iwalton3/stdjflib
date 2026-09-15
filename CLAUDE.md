@@ -713,7 +713,12 @@ ffmpeg: `/Videos/{id}/stream`, `/Audio/{id}/stream`, the legacy HLS segments,
 subtitle streams, attachments and every image route are anonymous on 12.0,
 and an item's id is a hash of its path — which this repo makes deterministic.
 So a page can still start a transcode on a known item without signing in, and
-loopback does not stop a browser doing it. Read from source, not measured.
+loopback does not stop a browser doing it. The routes are read from source;
+the browser half is measured: Firefox ESR 140 delivers a public page's `<img>`
+and `no-cors` fetch to `127.0.0.1` (arriving `Sec-Fetch-Site: cross-site`, no
+`Origin`), where Chromium and a phone browser block them. Accepted rather than
+proxied: run the server in rootless podman, where such an exploit lands in a
+user namespace with the library read-only, and stop it when idle.
 
 **What Kestrel listens on is `LocalNetworkAddresses` in `network.xml`, and
 nothing else.** Empty means every interface. The `JELLYFIN_Kestrel__Http__Url`
