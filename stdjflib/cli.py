@@ -12,7 +12,8 @@ import sys
 import time
 
 from . import (build, catalog, config, container, fetch, ff, jfbuild,
-               jfserver, livetv, origin, provision, recipes, verify, web)
+               jfserver, livetv, missing, origin, provision, recipes, verify,
+               web)
 from .jfapi import Jellyfin
 
 DEFAULT_ROOT = os.environ.get("STDJFLIB_ROOT", "")
@@ -165,6 +166,14 @@ def _parser() -> argparse.ArgumentParser:
         "serve", help="build and run Jellyfin from source, then set it up"))
     s.add_argument("--source", default=os.path.expanduser("~/Desktop/jellyfin"),
                    help="path to a Jellyfin source checkout")
+    s.add_argument("--missing-episodes", dest="missing_episodes",
+                   action="store_true", default=True,
+                   help="give one season a missing and an unaired episode "
+                        "after the scan, so clients can be tested against "
+                        "them (default).")
+    s.add_argument("--no-missing-episodes", dest="missing_episodes",
+                   action="store_false",
+                   help="leave the library with no virtual episodes.")
     s.add_argument("--state", default=None,
                    help="where the server keeps its data (default: a "
                         "per-library directory under the system temp dir, "
@@ -594,6 +603,38 @@ def _start_origin(args, root: str, *, from_container: str | None = None,
     return server
 
 
+def _inject_missing_episodes(state: str) -> None:
+    """Give one season a missing episode and an unaired one.
+
+    **After provisioning**, because it copies a real episode's row and there
+    are none until the scan has run. Written straight into the database, which
+    is the only route there is -- the API cannot create a virtual item and the
+    only thing in the server that does is the TMDb provider, which this tool
+    deliberately disables. See `stdjflib/missing.py`.
+
+    Never fatal: a library with no television in it has nowhere to put these,
+    and a schema that has moved is worth a loud line rather than a failed
+    serve of an otherwise working server.
+    """
+    path = missing.database_path(state)
+    try:
+        result = missing.inject(path)
+    except missing.SchemaMismatch as exc:
+        print(f"  ! no missing-episode fixture: {exc}")
+        return
+    except Exception as exc:                       # pragma: no cover - rare
+        print(f"  ! missing-episode fixture failed: {exc}")
+        return
+    if not result["season_id"]:
+        print("  no season to hang a missing episode off")
+        return
+    made = len(result["created"])
+    print(f"Missing-episode fixture in season {result['season_id']}"
+          f" ({'created' if made else 'already there'})")
+    for name, item_id in sorted(result["episodes"].items()):
+        print(f"  {name:18} {item_id}")
+
+
 def _admin_password(args, state: str) -> tuple[str, str]:
     """(password, the file that keeps it) for the server behind `state`."""
     path = provision.admin_password_file(state)
@@ -774,6 +815,8 @@ def _serve(args) -> int:
                       file=sys.stderr)
                 print(instance.log_tail(), file=sys.stderr)
             raise
+        if getattr(args, "missing_episodes", False):
+            _inject_missing_episodes(state)
         _handover(args, instance.url, password, password_path)
 
         if args.stop_after_setup:
