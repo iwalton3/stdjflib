@@ -526,6 +526,60 @@ def apply_folder_overviews(jf: Jellyfin, server_root: str,
     return done
 
 
+def apply_season_overviews(jf: Jellyfin, say=print) -> int:
+    """Give every season without a description one, after the scan.
+
+    **The NFO cannot reach all of them.** `libraries._season_nfo` writes one
+    into every season *folder*, which is the right source for a fresh scan --
+    but a flat or absolutely-numbered show has no season folder at all, and
+    Jellyfin synthesises its season from the episode filenames. There is
+    nowhere to put a file for those, so the API is the only route, exactly as
+    it is for a `Folder` (see :func:`apply_folder_overviews`).
+
+    It is also the only route to a server that has **already scanned** the
+    library: `lockdata` locks the NFO out on a re-scan, so adding the files
+    changes nothing for an existing state and everything for a fresh one.
+
+    Only where the Overview is empty, so a season that got one from its NFO
+    keeps the file's wording and this does not become a second source of
+    truth for the same field. Verified rather than assumed, like its sibling:
+    `set_overview` reads the value back.
+    """
+    user_id = (jf.get("/Users/Me") or {}).get("Id")
+    if not user_id:
+        say("  ! not signed in; no season descriptions applied")
+        return 0
+    result = jf.get("/Items", params={
+        "userId": user_id, "recursive": "true",
+        "includeItemTypes": "Season", "fields": "Overview",
+    }) or {}
+    seasons = result.get("Items") or []
+    missing = [s for s in seasons if not (s.get("Overview") or "").strip()]
+    if not seasons:
+        say("  ! no seasons found; none described")
+        return 0
+    if not missing:
+        return 0
+    say("Season descriptions (%d of %d had none)" % (len(missing),
+                                                    len(seasons)))
+    done = 0
+    for season in missing:
+        name = season.get("Name") or "Season"
+        series = season.get("SeriesName") or "this show"
+        text = f"{name} of {series}."
+        try:
+            ok = jf.set_overview(season["Id"], text)
+        except ApiError as exc:
+            say(f"  ! {series} / {name}: {exc}")
+            continue
+        if ok:
+            done += 1
+            say(f"  + {series} / {name}")
+        else:
+            say(f"  ! {series} / {name}: the description did not stick")
+    return done
+
+
 def create_api_collections(jf: Jellyfin, root: str, server_root: str,
                            say=print) -> dict:
     """Create the collections that cannot be built on disk.
@@ -814,6 +868,10 @@ def provision(jf: Jellyfin, root: str, *, admin_password: str,
         # it has an id to write a description onto.
         result["folder_overviews"] = apply_folder_overviews(
             jf, server_root, say=say)
+        # After the scan for the same reason, and after the folders because
+        # the two are the same kind of write: a season that has no folder of
+        # its own can only be described through the API.
+        result["season_overviews"] = apply_season_overviews(jf, say=say)
         counts = jf.counts()
         result["counts"] = counts
         interesting = [(k, v) for k, v in sorted(counts.items()) if v]

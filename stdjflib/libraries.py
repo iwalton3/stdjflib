@@ -1103,6 +1103,27 @@ EPISODE_TITLES = [
 ]
 
 
+def _season_nfo(season_folder: str, season_no: int, show_key: str,
+                show_title: str, show: dict) -> None:
+    """One season's `season.nfo`, wherever the season has a folder.
+
+    The same label rule as the artwork beside it -- season 0 is "Specials" --
+    because the two are read by the same client on the same screen and a
+    season called "Season 0" under a poster saying "Specials" is a fixture
+    that tests the wrong thing.
+
+    The year advances with the season, as the shipped "seasons" show already
+    did: a library where every season of a show shares one year cannot
+    exercise a client that sorts or labels by it.
+    """
+    label = "Specials" if season_no == 0 else f"Season {season_no}"
+    nfo.season(os.path.join(season_folder, "season.nfo"),
+               key=f"{show_key}-s{season_no}", title=label,
+               number=season_no,
+               plot=f"{label} of {show_title}.",
+               year=show["year"] + max(season_no - 1, 0))
+
+
 def _season_artwork(series_folder: str, season_folder: str | None,
                     season_no: int, show_key: str, show_title: str, cfg, *,
                     in_series_folder: bool) -> None:
@@ -1239,11 +1260,10 @@ def build_shows(root: str, cfg) -> list[dict]:
         if style == "seasons":
             for season_no, count in show["seasons"]:
                 sdir = os.path.join(folder, f"Season {season_no:02d}")
-                if not cfg.dry_run:
-                    nfo.season(os.path.join(sdir, "season.nfo"), key=f"{key}-s{season_no}",
-                               title=f"Season {season_no}", number=season_no,
-                               plot=f"Season {season_no} of {title}.",
-                               year=show["year"] + season_no - 1)
+                # The NFO is written by the `season_art` loop below, which
+                # every style feeds -- see `_season_nfo`. Written here as well
+                # it would be two writers for one file, and the other styles
+                # would still have none.
                 # Both spellings Jellyfin accepts, one per season. Season
                 # one is `season01-poster.jpg` up in the series folder, which
                 # is where the resolver looks first; season two is
@@ -1397,6 +1417,19 @@ def build_shows(root: str, cfg) -> list[dict]:
             for season_no, sdir, in_series in season_art:
                 _season_artwork(folder, sdir, season_no, key, title, cfg,
                                 in_series_folder=in_series)
+                # The description, in the same loop and for the same reason
+                # the artwork is here: every style appends to `season_art`, so
+                # this is the one place that sees every season. Written per
+                # style instead, only the "seasons" show had one -- five of the
+                # eight shows have a season FOLDER and no `season.nfo`, so the
+                # server sent no Overview for any of their seasons and a client
+                # drawing one could not be tested against them.
+                #
+                # `sdir is None` is a season with no folder of its own (flat,
+                # absolutely numbered): there is nowhere to put an NFO, and
+                # `provision.apply_season_overviews` is what reaches those.
+                if sdir is not None:
+                    _season_nfo(sdir, season_no, key, title, show)
 
         made.append({"library": "Shows", "key": key, "path": folder})
 
