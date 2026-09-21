@@ -26,6 +26,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from stdjflib import missing, nfo
 
@@ -253,6 +254,53 @@ class DatabasePathTest(unittest.TestCase):
         path = self._make(os.path.join("config", "data", "jellyfin.db"))
 
         self.assertEqual(path, missing.database_path(self.state))
+
+    def test_the_serve_layout_is_one_deeper(self):
+        """`serve` passes `--datadir <state>/data` and Jellyfin puts its own
+        `data` directory under that, so the database is at
+        `<state>/data/data/jellyfin.db`."""
+        path = self._make(os.path.join("data", "data", "jellyfin.db"))
+
+        self.assertEqual(path, missing.database_path(self.state))
+
+    def _real(self, relative):
+        path = self._make(relative)
+        conn = sqlite3.connect(path)
+        conn.executescript(SCHEMA)
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_an_empty_decoy_beside_it_does_not_win(self):
+        """**Measured on a live 12.0 `serve` state:** it has an EMPTY
+        `data/jellyfin.db` as well as the real one two directories down, and
+        taking the first path that exists picked the empty one -- whose missing
+        `BaseItems` then read as "the schema moved", a wrong-file error wearing
+        a schema-drift message on the one route this module has.
+
+        What fixes *that* case is the candidate ORDER, and this test would pass
+        on the order alone."""
+        decoy = self._make(os.path.join("data", "jellyfin.db"))
+        real = self._real(os.path.join("data", "data", "jellyfin.db"))
+
+        self.assertEqual(real, missing.database_path(self.state))
+        self.assertFalse(missing.is_items_database(decoy))
+
+    def test_a_decoy_the_order_does_not_save_us_from(self):
+        """The test the one above cannot be: with the decoy at the *earlier*
+        candidate, only reading the contents finds the real database.
+
+        Written after the mutation for the check above survived -- it passed
+        with the content probe removed, because the order already answered it.
+        A future layout puts a file where this one puts the decoy, and order is
+        then the wrong instrument."""
+        decoy = self._make(os.path.join("decoy", "jellyfin.db"))
+        real = self._real(os.path.join("real", "jellyfin.db"))
+        with mock.patch.object(missing, "DB_CANDIDATES",
+                               (os.path.join("decoy", "jellyfin.db"),
+                                os.path.join("real", "jellyfin.db"))):
+            self.assertEqual(real, missing.database_path(self.state))
+        self.assertTrue(os.path.exists(decoy))
 
     def test_neither_names_a_path_rather_than_nothing(self):
         """So the caller's error message says where it looked."""

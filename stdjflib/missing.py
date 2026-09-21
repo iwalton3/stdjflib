@@ -60,11 +60,15 @@ import os
 import sqlite3
 import uuid
 
-#: Where a server keeps its database inside its state directory, in the two
-#: layouts this tool produces: ``serve --on-host`` passes ``--datadir
-#: <state>/data``, and the container mounts ``<state>/config`` at ``/config``
-#: with the data directory under it.
-DB_CANDIDATES = (os.path.join("data", "jellyfin.db"),
+#: Where a server keeps its database inside its state directory, in the
+#: layouts this tool produces. ``serve`` passes ``--datadir <state>/data`` and
+#: Jellyfin then puts its own ``data`` directory *under* that, which is why
+#: there are three and not two -- and why :func:`database_path` probes the
+#: contents rather than taking the first path that exists: **a `serve` state
+#: has an empty `data/jellyfin.db` beside the real one**, and a plain
+#: existence check picks the decoy every time (measured on a live 12.0 state).
+DB_CANDIDATES = (os.path.join("data", "data", "jellyfin.db"),
+                 os.path.join("data", "jellyfin.db"),
                  os.path.join("config", "data", "jellyfin.db"))
 
 #: The columns this module writes or reads by name. Checked before anything is
@@ -90,18 +94,41 @@ class SchemaMismatch(RuntimeError):
     """The database is not the one this module was written against."""
 
 
+def is_items_database(path: str) -> bool:
+    """Whether this file is a Jellyfin database with items in it.
+
+    The question :func:`database_path` has to ask, because "the file exists" is
+    not the same question: a `serve` state carries an empty
+    ``data/jellyfin.db`` beside the real one two directories down, and taking
+    the first path that exists picks the empty one -- which then fails the
+    schema check and reads as "the schema moved" rather than "wrong file".
+    """
+    try:
+        with sqlite3.connect("file:%s?mode=ro" % path, uri=True) as conn:
+            return bool(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                " AND name = 'BaseItems'").fetchone())
+    except sqlite3.Error:
+        return False
+
+
 def database_path(state_dir: str) -> str:
     """The server database under a state directory.
 
-    Probed rather than assumed, because the two run modes put it in different
-    places (:data:`DB_CANDIDATES`). Falls back to the on-host layout when
-    neither exists, so the error a caller gets names a path rather than None.
+    Probed rather than assumed: the run modes put it in different places
+    (:data:`DB_CANDIDATES`), and one of those places also holds an empty file
+    of the same name. Falls back to the first candidate that merely exists,
+    and then to the first candidate at all, so the error a caller gets names a
+    path rather than None.
     """
-    for relative in DB_CANDIDATES:
-        candidate = os.path.join(state_dir, relative)
-        if os.path.exists(candidate):
+    present = [os.path.join(state_dir, relative)
+               for relative in DB_CANDIDATES
+               if os.path.exists(os.path.join(state_dir, relative))]
+    for candidate in present:
+        if is_items_database(candidate):
             return candidate
-    return os.path.join(state_dir, DB_CANDIDATES[0])
+    return present[0] if present else os.path.join(state_dir,
+                                                   DB_CANDIDATES[0])
 
 
 def connect(db_path: str) -> sqlite3.Connection:
