@@ -454,6 +454,50 @@ class TestBindAddresses(unittest.TestCase):
         self._write()
         self.assertEqual(self._addresses(), ["127.0.0.1"])
 
+    def _discovery(self):
+        from xml.etree import ElementTree
+
+        return ElementTree.parse(self.path).getroot().findtext("AutoDiscovery")
+
+    def test_discovery_is_off_unless_asked_for(self):
+        """A QA server that answers `who is JellyfinServer?` shows up in every
+        Jellyfin client on the network, so silence is the default."""
+        self._write()
+
+        self.assertEqual("false", self._discovery())
+
+    def test_the_flag_turns_it_on(self):
+        self._write(autodiscovery=True)
+
+        self.assertEqual("true", self._discovery())
+
+    def test_an_existing_file_is_corrected_in_both_directions(self):
+        """The addresses are rewritten every start because the file is the
+        only thing that decides them; discovery is the same kind of setting
+        and the same reasoning applies -- a state directory written before
+        this flag existed, or by an admin through the web UI, must not go on
+        answering broadcasts because of what it used to say."""
+        self._write(autodiscovery=True)
+        self.assertEqual("true", self._discovery())
+
+        self._write()
+
+        self.assertEqual("false", self._discovery(),
+                         "an existing file kept advertising itself")
+
+    def test_a_server_written_file_with_no_element_gains_one(self):
+        """The server writes its own network.xml, and an older one may carry
+        no AutoDiscovery element at all."""
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(_SERVER_NETWORK_XML.replace(
+                "<AutoDiscovery>true</AutoDiscovery>", "")
+                .replace("<AutoDiscovery>false</AutoDiscovery>", ""))
+
+        self._write()
+
+        self.assertEqual("false", self._discovery())
+
     def test_it_reports_the_port_the_file_pins(self):
         """Once written, the file's port is the one the server listens on."""
         self.assertEqual(jfserver.write_network_config(self.dir.name, 8097, ()),

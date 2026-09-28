@@ -139,6 +139,13 @@ def _parser() -> argparse.ArgumentParser:
                         help="generate trickplay tiles during the scan (very slow)")
         sp.add_argument("--server-name", default="stdjflib QA",
                         help="the name the server reports")
+        sp.add_argument("--autodiscovery", action="store_true",
+                        help="answer `who is JellyfinServer?` on UDP 7359, so "
+                             "a client's own server discovery can be tested "
+                             "against this server. OFF by default: it makes "
+                             "the QA server appear in every Jellyfin client "
+                             "on the network. Needs --on-host; the container "
+                             "publishes no UDP port.")
         sp.add_argument("-v", "--verbose", action="store_true",
                         help="show the build output")
         sp.add_argument("--no-stream-origin", action="store_true",
@@ -759,13 +766,21 @@ def _serve(args) -> int:
                                      web_dir=found,
                                      ffmpeg=shutil.which("ffmpeg"),
                                      listen=tuple(args.listen),
-                                     verbose=args.verbose)
+                                     verbose=args.verbose,
+                                     autodiscovery=args.autodiscovery)
     else:
         instance = container.SourceBuiltServer(
             root, state, server_build, web_dir=found, image=args.image,
             port=args.port, listen=tuple(args.listen),
             host_loopback_ports=_loopback_ports(args, root),
             verbose=args.verbose)
+    if getattr(args, "autodiscovery", False) and not args.on_host:
+        # Rather than leaving a flag that reads as accepted and does nothing:
+        # discovery is UDP 7359 and the container publishes TCP only, so the
+        # broadcast never reaches the server however its config is written.
+        print("--autodiscovery needs --on-host: the container publishes no "
+              "UDP port, so nothing would answer the broadcast.")
+        return 2
     # Before the server starts: a fresh state's wizard uses this, so it has to
     # be on disk before anything can depend on it.
     password, password_path = _admin_password(args, state)

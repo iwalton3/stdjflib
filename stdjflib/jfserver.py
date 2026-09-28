@@ -114,7 +114,8 @@ def server_arguments(state: str, web_dir: str | None,
 
 
 def write_network_config(state: str, port: int,
-                         addresses: tuple[str, ...]) -> int:
+                         addresses: tuple[str, ...],
+                         autodiscovery: bool = False) -> int:
     """Pin the port before first start, and the bind addresses every start.
 
     Returns the port the server will listen on, which is the file's rather
@@ -129,6 +130,13 @@ def write_network_config(state: str, port: int,
     or, when that is empty, every interface. A `Kestrel__*` environment
     variable is never consulted. An admin can install a plugin, so an
     existing state directory is corrected rather than left on the LAN.
+
+    `autodiscovery` is off by default and rewritten every start for the same
+    reason the addresses are: a QA server that answers `who is
+    JellyfinServer?` on UDP 7359 appears in every Jellyfin client on the
+    network, so it stays quiet unless a test asks for it. Turning it on is
+    what makes the clients' own discovery testable against a server we
+    control instead of against whatever else is on the LAN.
 
     In a container `addresses` must be empty and the publish decides who can
     connect. Measured: bound to 127.0.0.1 inside the container's namespace,
@@ -154,6 +162,13 @@ def write_network_config(state: str, port: int,
                 "</NetworkConfiguration>\n")
 
     tree = ElementTree.parse(path)
+    # Rewritten rather than left alone, like the addresses above: the file
+    # created before this flag existed says whatever it said, and the point
+    # of the flag is that the caller decides.
+    discovery = tree.getroot().find("AutoDiscovery")
+    if discovery is None:
+        discovery = ElementTree.SubElement(tree.getroot(), "AutoDiscovery")
+    discovery.text = "true" if autodiscovery else "false"
     element = tree.getroot().find("LocalNetworkAddresses")
     if element is None:
         element = ElementTree.SubElement(tree.getroot(), "LocalNetworkAddresses")
@@ -171,7 +186,8 @@ class Instance:
 
     def __init__(self, dll: str, state_dir: str, *, port: int = DEFAULT_PORT,
                  web_dir: str | None = None, ffmpeg: str | None = None,
-                 listen: tuple[str, ...] = (), verbose: bool = False):
+                 listen: tuple[str, ...] = (), verbose: bool = False,
+                 autodiscovery: bool = False):
         self.dll = dll
         self.state = state_dir
         self.port = port
@@ -181,6 +197,7 @@ class Instance:
         self.web_dir = web_dir
         self.ffmpeg = ffmpeg
         self.verbose = verbose
+        self.autodiscovery = autodiscovery
         self.process: subprocess.Popen | None = None
         self.log_handle = None
 
@@ -208,7 +225,8 @@ class Instance:
             start_new_session=True)
 
     def _write_network_config(self) -> None:
-        write_network_config(self.state, self.port, self.listen)
+        write_network_config(self.state, self.port, self.listen,
+                             self.autodiscovery)
 
     def alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
