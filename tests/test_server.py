@@ -924,3 +924,39 @@ class TestOptimizeDatabase(unittest.TestCase):
         from stdjflib import jfapi
 
         self.assertEqual(jfapi.OPTIMIZE_TASK, "OptimizeDatabaseTask")
+
+
+class TestStatusLinesArePrintedWhenPrinted(unittest.TestCase):
+    """Piped into `tee`, `serve`'s last status lines sat in Python's block
+    buffer for as long as it kept running: the log ended mid-provisioning
+    while the server was up and handed over, which read as a hang."""
+
+    def test_a_piped_line_arrives_without_a_flush(self):
+        import io
+        import select
+        from stdjflib import cli
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        stream = io.TextIOWrapper(io.FileIO(w, "w"), encoding="utf-8")
+        self.addCleanup(stream.close)
+        self.assertFalse(stream.line_buffering, "the premise: a pipe buffers")
+        cli._line_buffered(stream)
+        stream.write("Server log: /x\n")
+        ready, _, _ = select.select([r], [], [], 1.0)
+        self.assertTrue(ready, "the line was still in the buffer")
+        self.assertEqual(os.read(r, 100), b"Server log: /x\n")
+
+    def test_main_does_it_before_anything_prints(self):
+        from stdjflib import cli
+        with mock.patch.object(cli, "_line_buffered") as lb, \
+                mock.patch.object(cli, "cmd_list", return_value=0):
+            cli.main(["list"])
+        lb.assert_called_once()
+
+    def test_a_stream_that_cannot_is_left_alone(self):
+        """No `reconfigure` at all, and a closed stream, which raises."""
+        import io
+        from stdjflib import cli
+        closed = io.TextIOWrapper(io.BytesIO())
+        closed.close()
+        cli._line_buffered(object(), closed)        # must not raise

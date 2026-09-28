@@ -467,7 +467,28 @@ def cmd_verify(args) -> int:
     return 1
 
 
+def _line_buffered(*streams) -> None:
+    """Make each stream flush at every newline.
+
+    Piped (`serve ... | tee log`), Python block-buffers stdout, so a status
+    line is written when a buffer fills rather than when it is printed:
+    `serve` finished provisioning and published its connection, and the log
+    still ended at "Optimizing the database" a quarter of an hour later --
+    indistinguishable from a hang. Set once here rather than `flush=True` at
+    each print, which is the per-site version of this that had missed some.
+    """
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(line_buffering=True)
+        except (ValueError, OSError):
+            pass            # detached or closed: nothing to buffer
+
+
 def main(argv=None) -> int:
+    _line_buffered(sys.stdout, sys.stderr)
     args = _parser().parse_args(argv)
     handler = {
         "build": cmd_build, "verify": cmd_verify, "list": cmd_list,
