@@ -349,3 +349,35 @@ class SeasonDescriptionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NothingIsLeftOpenTest(unittest.TestCase):
+    """`with sqlite3.connect(...)` commits or rolls back and does NOT close:
+    `serve` held two handles on the live server's database for the rest of
+    its life, one from the probe and one from the injection."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = _library(os.path.join(self.dir, "jellyfin.db"))
+
+    def _open_on_db(self):
+        fds = "/proc/self/fd"
+        if not os.path.isdir(fds):
+            self.skipTest("needs /proc to see open files")
+        count = 0
+        for fd in os.listdir(fds):
+            try:
+                target = os.readlink(os.path.join(fds, fd))
+            except OSError:
+                continue
+            if target.startswith(self.db):
+                count += 1
+        return count
+
+    def test_the_probe_closes_what_it_opens(self):
+        self.assertTrue(missing.is_items_database(self.db))
+        self.assertEqual(0, self._open_on_db())
+
+    def test_the_injection_closes_what_it_opens(self):
+        missing.inject(self.db)
+        self.assertEqual(0, self._open_on_db())

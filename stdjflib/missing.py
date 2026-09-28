@@ -55,6 +55,7 @@ episodes on 12.0.0 and 5 → 7 on 10.11.11, two Virtual in each case, the same
 insert on both.
 """
 
+import contextlib
 import datetime
 import os
 import sqlite3
@@ -104,7 +105,9 @@ def is_items_database(path: str) -> bool:
     schema check and reads as "the schema moved" rather than "wrong file".
     """
     try:
-        with sqlite3.connect("file:%s?mode=ro" % path, uri=True) as conn:
+        # closing(): a connection's own `with` commits and does not close.
+        with contextlib.closing(sqlite3.connect("file:%s?mode=ro" % path,
+                                                uri=True)) as conn:
             return bool(conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table'"
                 " AND name = 'BaseItems'").fetchone())
@@ -263,7 +266,7 @@ def inject(db_path: str, *, season_id: str | None = None,
     episodes in it, which is what a books-only build looks like.
     """
     now = now or datetime.datetime.now()
-    with connect(db_path) as conn:
+    with contextlib.closing(connect(db_path)) as conn:
         check_schema(conn)
         if season_id is None:
             chosen = choose_season(conn)
