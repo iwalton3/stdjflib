@@ -632,7 +632,7 @@ Two things are handled that otherwise fail quietly:
 
 ### The test accounts
 
-Twelve, each reaching a client path that is otherwise tedious to set up by
+Thirteen, each reaching a client path that is otherwise tedious to set up by
 hand. Password `stdjflib` throughout, except `qa-admin`, whose password is
 generated per server (see above), and where the point is not having one.
 
@@ -649,6 +649,7 @@ generated per server (see above), and where the point is not having one.
 | `qa-nosyncplay` | SyncPlay refused |
 | `qa-onesession` | one session; a second login must evict the first |
 | `qa-hidden` | not in the public user list, but can still sign in by name |
+| `qa-showmissing` | missing and unaired episodes shown (`DisplayMissingEpisodes`, off for everyone else): the only account whose season listings include the `--missing-episodes` fixture |
 | `qa-disabled` | authentication must fail cleanly, not hang |
 
 ### Two things that fail silently

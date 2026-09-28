@@ -186,6 +186,52 @@ class TestAccounts(unittest.TestCase):
         for folder in restricted["folders"]:
             self.assertIn(folder, config.LIBRARIES)
 
+    #: What UserManager.UpdateConfigurationAsync reads from the object it is
+    #: given (12.0). The server ignores any other key, so a typo in an
+    #: account's configuration would be silently dropped.
+    USER_CONFIGURATION = {
+        "SubtitleMode", "HidePlayedInLatest", "EnableLocalPassword",
+        "PlayDefaultAudioTrack", "DisplayCollectionsView",
+        "DisplayMissingEpisodes", "AudioLanguagePreference",
+        "RememberAudioSelections", "EnableNextEpisodeAutoPlay",
+        "RememberSubtitleSelections", "SubtitleLanguagePreference",
+        "CastReceiverId", "OrderedViews", "GroupedFolders", "MyMediaExcludes",
+        "LatestItemsExcludes"}
+
+    def test_configurations_only_use_real_fields(self):
+        for account in provision.ACCOUNTS:
+            for key in account.get("configuration", {}):
+                with self.subTest(f"{account['name']}.{key}"):
+                    self.assertIn(key, self.USER_CONFIGURATION)
+
+    def test_one_account_sees_missing_episodes_and_only_one(self):
+        """The --missing-episodes fixture is invisible in a season listing
+        unless the user has DisplayMissingEpisodes on, which is off by
+        default -- so without this account no client could list it."""
+        showing = [a["name"] for a in provision.ACCOUNTS
+                   if a.get("configuration", {}).get("DisplayMissingEpisodes")]
+        self.assertEqual(["qa-showmissing"], showing)
+
+    def test_a_configuration_keeps_what_it_does_not_name(self):
+        """UpdateConfigurationAsync assigns every field it is given, so a
+        partial post would reset the rest to defaults."""
+        posted = []
+
+        class Api:
+            def get(self, path):
+                return {"Configuration": {"SubtitleMode": "Smart",
+                                          "AudioLanguagePreference": "jpn",
+                                          "DisplayMissingEpisodes": False}}
+
+            def set_user_config(self, user_id, config):
+                posted.append((user_id, config))
+
+        provision._apply_configuration(Api(), "u1",
+                                       {"DisplayMissingEpisodes": True})
+        self.assertEqual([("u1", {"SubtitleMode": "Smart",
+                                  "AudioLanguagePreference": "jpn",
+                                  "DisplayMissingEpisodes": True})], posted)
+
     def test_the_interesting_states_are_covered(self):
         names = {a["name"] for a in provision.ACCOUNTS}
         for required in ("qa-admin", "qa-user", "qa-disabled", "qa-hidden",

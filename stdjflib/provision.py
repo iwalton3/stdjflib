@@ -296,6 +296,19 @@ ACCOUNTS = [
         "policy": {"IsHidden": True},
     },
     {
+        "name": "qa-showmissing",
+        "password": DEFAULT_PASSWORD,
+        "why": ("Shows missing and unaired episodes. `DisplayMissingEpisodes` "
+                "is a per-user setting, off by default and off for every "
+                "other account, and the server applies it to season "
+                "listings: this is the only account that sees the "
+                "`--missing-episodes` fixture where a client lists a season."),
+        "policy": {},
+        # Configuration, not policy: a user preference, set through its own
+        # endpoint (see _apply_configuration).
+        "configuration": {"DisplayMissingEpisodes": True},
+    },
+    {
         "name": "qa-disabled",
         "password": DEFAULT_PASSWORD,
         "why": ("Disabled. Authentication must fail cleanly with a message, "
@@ -303,6 +316,20 @@ ACCOUNTS = [
         "policy": {"IsDisabled": True},
     },
 ]
+
+
+def _apply_configuration(jf: Jellyfin, user_id: str, wanted: dict) -> None:
+    """Set some of a user's configuration, keeping the rest.
+
+    Read, merge, write back: `UserManager.UpdateConfigurationAsync` assigns
+    EVERY field from the object it is given, so posting only the keys we
+    want would reset the user's audio and subtitle preferences, ordered
+    views and the rest to their defaults.
+    """
+    current = dict((jf.get(f"/Users/{user_id}") or {}).get("Configuration")
+                   or {})
+    current.update(wanted)
+    jf.set_user_config(user_id, current)
 
 
 def library_options(*, chapter_images: bool = False,
@@ -817,6 +844,8 @@ def provision(jf: Jellyfin, root: str, *, admin_password: str,
                                         for f in account["folders"]
                                         if f in folder_ids]
         jf.set_policy(user["Id"], policy)
+        if account.get("configuration"):
+            _apply_configuration(jf, user["Id"], account["configuration"])
         pw = account["password"] or "(no password)"
         say(f"  {name:16} {pw:12} {account['why'].splitlines()[0]}")
         created.append({"name": name, "password": password,
